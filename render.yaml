@@ -1,0 +1,34 @@
+# Single-process deployment: trading loop + dashboard run together.
+# Web service so we get a public URL for the dashboard AND a persistent disk
+# for the SQLite journal.
+
+services:
+  - type: web
+    name: kalshi-edge-bot
+    runtime: python
+    plan: starter           # required for persistent disk; ~$7/mo
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.main
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: MODE
+        value: paper         # FLIP TO 'live' ONLY AFTER 2 WEEKS OF PAPER TRADING
+      - key: KALSHI_ENV
+        value: demo          # FLIP TO 'prod' WHEN READY
+      - key: DATA_DIR
+        value: /var/data     # must match the disk mountPath below
+      - key: DASHBOARD_HOST
+        value: 0.0.0.0
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      # Secrets — set these in the Render dashboard, NOT here.
+      - key: KALSHI_API_KEY_ID
+        sync: false
+      - key: KALSHI_API_PRIVATE_KEY
+        sync: false
+    disk:
+      name: kalshi-data
+      mountPath: /var/data
+      sizeGB: 1

@@ -1,0 +1,46 @@
+# All knobs in one place. Do not edit while a position is open.
+
+bankroll_usd: 2000
+
+scanner:
+  loop_interval_seconds: 30
+  price_min: 0.20            # only trade markets between 20¢ and 80¢
+  price_max: 0.80
+  max_spread_cents: 4        # ≤ 4¢ between bid and ask
+  min_liquidity_usd: 200     # at least $200 of resting size on the touched side
+  max_minutes_to_expiry: 4320  # 3 days
+  min_minutes_to_expiry: 30
+
+decision:
+  min_edge: 0.06             # 6 percentage points minimum
+  kelly_fraction: 0.25       # fraction of full Kelly to size by
+
+risk:
+  max_position_size_usd: 40
+  max_concurrent_positions: 15
+  max_open_exposure_pct: 0.40   # 40% of bankroll
+  max_daily_loss_usd: 100
+  max_consecutive_losses: 3
+  cooldown_minutes_after_kill: 60
+
+execution:
+  take_profit_pct: 0.20      # exit at +20% on the position
+  stop_loss_pct: 0.12        # exit at -12% on the position
+  time_exit_minutes: 90      # if neither hit, kill the position after 90 min
+  order_type: limit          # never market orders
+  scale_in_chunks: 2         # split each entry into 2 child orders
+
+# Per-category enables. Start with weather only.
+models:
+  weather:
+    enabled: true
+    horizon_hours: 24
+  econ:
+    enabled: false
+    sources: ["bls", "bea"]
+  sports:
+    enabled: false           # efficient market — leave off until you have edge
+  crypto:
+    enabled: false
+  politics:
+    enabled: false
