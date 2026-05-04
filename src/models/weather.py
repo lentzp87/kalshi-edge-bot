@@ -283,15 +283,18 @@ _PREWARM_DELAY_SEC = 1.5         # spacing between sequential city fetches
 _BACKGROUND_REFRESH_SEC = 25 * 60  # how often to refresh the cache
 
 
-async def prewarm_forecasts(target_date: date | None = None) -> dict:
-    """Sequentially fetch a forecast for every city in CITY_BY_SERIES.
+async def prewarm_forecasts(target_dates: list[date] | None = None) -> dict:
+    """Sequentially fetch a forecast for every city in CITY_BY_SERIES, for
+    each of `target_dates`. Defaults to today + next 2 days, since most
+    Kalshi weather markets resolve tomorrow or day-after.
 
     Spaced out by ~1.5 sec each so we stay well under any per-second
-    rate limit. Total wall-clock: ~30 sec for ~20 unique coords.
-    Returns {"success": N, "total": M}.
+    rate limit.
     """
-    if target_date is None:
-        target_date = date.today()
+    from datetime import timedelta
+    if target_dates is None:
+        today = date.today()
+        target_dates = [today, today + timedelta(days=1), today + timedelta(days=2)]
 
     seen: set[tuple[float, float]] = set()
     cities: list[tuple[float, float, str]] = []
@@ -302,19 +305,23 @@ async def prewarm_forecasts(target_date: date | None = None) -> dict:
         seen.add(coord)
         cities.append((lat, lon, name))
 
-    log.info("weather.prewarm.start", cities=len(cities), date=target_date.isoformat())
+    total = len(cities) * len(target_dates)
+    log.info("weather.prewarm.start", cities=len(cities),
+             dates=[d.isoformat() for d in target_dates], total_calls=total)
     success = 0
-    for lat, lon, name in cities:
-        try:
-            r = await _fetch_ensemble_temps(lat=lat, lon=lon, target_date=target_date)
-            if r:
-                success += 1
-        except Exception as e:
-            log.warning("weather.prewarm.city_failed", city=name, err=str(e)[:80])
-        await asyncio.sleep(_PREWARM_DELAY_SEC)
+    for d in target_dates:
+        for lat, lon, name in cities:
+            try:
+                r = await _fetch_ensemble_temps(lat=lat, lon=lon, target_date=d)
+                if r:
+                    success += 1
+            except Exception as e:
+                log.warning("weather.prewarm.city_failed", city=name,
+                            date=d.isoformat(), err=str(e)[:80])
+            await asyncio.sleep(_PREWARM_DELAY_SEC)
 
-    log.info("weather.prewarm.done", success=success, total=len(cities))
-    return {"success": success, "total": len(cities)}
+    log.info("weather.prewarm.done", success=success, total=total)
+    return {"success": success, "total": total}
 
 
 async def background_refresh_loop() -> None:
@@ -368,33 +375,42 @@ class WeatherModel:
         event_ticker: str = market.raw.get("event_ticker", "")
         series = event_ticker.split("-", 1)[0] if event_ticker else ""
         if not series:
+            log.debug("weather.skip.no_series", ticker=market.ticker)
             return None
 
         # Pull city
         city = _city_from_series_ticker(series)
         if city is None:
+            log.info("weather.skip.no_city", series=series, ticker=market.ticker)
             return None
         lat, lon, city_name = city
 
         # Parse strike
         strike = _parse_strike_from_yes_subtitle(market.raw.get("yes_sub_title", ""))
         if strike is None:
+            log.info("weather.skip.no_strike", ticker=market.ticker,
+                     yes_sub=market.raw.get("yes_sub_title", "")[:40])
             return None
 
         # Determine target date — prefer the market's own resolution time
         target_date = self._target_date_for(market)
         if target_date is None:
+            log.info("weather.skip.no_date", ticker=market.ticker)
             return None
 
         # Fetch ensemble forecast
         forecast = await _fetch_ensemble_temps(lat=lat, lon=lon, target_date=target_date)
         if forecast is None:
+            log.info("weather.skip.no_forecast", city=city_name,
+                     date=target_date.isoformat(), ticker=market.ticker)
             return None
         highs, lows = forecast
 
         # Pick high-vs-low series based on the ticker
         members = highs if _is_high_market(series) else lows
         if not members:
+            log.info("weather.skip.no_members", city=city_name,
+                     metric="high" if _is_high_market(series) else "low")
             return None
 
         # Empirical probability + clip extremes (never bet 100%)
