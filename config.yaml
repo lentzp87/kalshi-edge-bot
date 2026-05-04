@@ -4,18 +4,21 @@ bankroll_usd: 2000
 
 scanner:
   loop_interval_seconds: 30
-  max_pages_per_scan: 50     # ~10k markets / scan, takes a few minutes
+  max_pages_per_scan: 200    # ~40k markets - covers full Kalshi universe
   price_min: 0.10            # 10¢-90¢ band (Kalshi has many tail markets)
   price_max: 0.90
-  max_spread_cents: 4        # ≤ 4¢ between bid and ask
-  min_liquidity_usd: 200     # at least $200 of resting size on the touched side
+  max_spread_cents: 10       # Kalshi markets often have 5-10¢ spreads
+  min_liquidity_usd: 25      # Kalshi has many micro-markets; $25 keeps us out of dead ones
   max_minutes_to_expiry: 4320  # 3 days
   min_minutes_to_expiry: 30
   # Optional: if set, skip the broad pagination and only fetch these
   # series directly. Use Kalshi series_ticker prefixes. Empty = scan all.
+  # Categorization is now done dynamically via Kalshi's /series catalog
+  # (loaded at startup). Leave empty for broad scan — every market gets
+  # its real category, and markets without an enabled model are skipped
+  # automatically downstream. Only set this if you want to limit which
+  # series the bot fetches at the API level (e.g. for very low-latency).
   series_tickers: []
-  # E.g. for sports + weather only:
-  # series_tickers: ["KXATPMATCH", "KXNFL", "KXNBA", "KXMLB", "KXHIGH", "KXLOW", "KXRAIN"]
 
 decision:
   min_edge: 0.06             # 6 percentage points minimum

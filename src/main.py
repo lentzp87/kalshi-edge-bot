@@ -103,6 +103,11 @@ async def amain() -> None:
     log.info("bot.start", mode=env.mode, kalshi_env=env.kalshi_env, bankroll=cfg.bankroll_usd)
 
     client = KalshiClient()
+    # Pull Kalshi's full series catalog ONCE at startup so every market
+    # we see can be categorized by Kalshi's own taxonomy ("Sports",
+    # "Climate and Weather", etc.) — replaces the brittle ticker-prefix guesses.
+    await client.load_series_categories()
+
     journal = Journal()
     risk = RiskEngine()
     scanner = Scanner(client)

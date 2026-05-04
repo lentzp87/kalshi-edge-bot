@@ -73,6 +73,10 @@ class KalshiClient:
         self.key_id = env.kalshi_api_key_id
         self._private_key = self._load_private_key(env)
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=15.0)
+        # Populated by load_series_categories() at startup; maps each
+        # Kalshi series_ticker (e.g. "KXWTAMATCH") to its real category
+        # ("Sports", "Climate and Weather", etc.) per Kalshi's own taxonomy.
+        self.series_categories: dict[str, str] = {}
 
     @staticmethod
     def _load_private_key(env) -> Any:
@@ -163,8 +167,41 @@ class KalshiClient:
             "GET", f"/trade-api/v2/markets/{ticker}/orderbook"
         )
 
-    @staticmethod
-    def _parse_market(m: dict) -> Market:
+    async def list_series(self) -> list[dict]:
+        """Fetch the full series catalog. Public endpoint, no auth needed."""
+        data = await self._request("GET", "/trade-api/v2/series")
+        return data.get("series", [])
+
+    async def load_series_categories(self) -> int:
+        """Populate self.series_categories from Kalshi's series catalog.
+
+        Call once at startup. Returns the number of series loaded.
+        """
+        try:
+            series = await self.list_series()
+        except Exception as e:
+            log.exception("kalshi.load_series_failed", err=str(e))
+            return 0
+        self.series_categories = {
+            s["ticker"]: s.get("category", "Unknown")
+            for s in series if s.get("ticker")
+        }
+        log.info("kalshi.series_loaded", count=len(self.series_categories))
+        return len(self.series_categories)
+
+    def category_for_event(self, event_ticker: str) -> str:
+        """Look up category for a market's event_ticker.
+
+        Kalshi event tickers look like 'KXWTAMATCH-26MAY04TOWSRA' — the part
+        before the first '-' is the series_ticker, which we map via the
+        catalog loaded at startup.
+        """
+        if not event_ticker:
+            return "Unknown"
+        series = event_ticker.split("-", 1)[0]
+        return self.series_categories.get(series) or _category_from_event_ticker(event_ticker)
+
+    def _parse_market(self, m: dict) -> Market:
         """Parse a Kalshi market into our normalized Market dataclass.
 
         Kalshi's current schema uses dollar-denominated price fields with the
@@ -181,10 +218,9 @@ class KalshiClient:
         return Market(
             ticker=m["ticker"],
             title=m.get("title", ""),
-            # Kalshi no longer returns `category` per market.
-            # Best heuristic: the prefix of `event_ticker` (e.g. KXATPMATCH-...)
-            # identifies the series; we map that to a category in models/__init__.
-            category=_category_from_event_ticker(m.get("event_ticker", "")),
+            # Kalshi no longer returns `category` per market — we derive it
+            # via the series_ticker prefix using the catalog loaded at startup.
+            category=self.category_for_event(m.get("event_ticker", "")),
             yes_bid=dollars_or_legacy("yes_bid_dollars", "yes_bid"),
             yes_ask=dollars_or_legacy("yes_ask_dollars", "yes_ask"),
             last_price=dollars_or_legacy("last_price_dollars", "last_price"),
