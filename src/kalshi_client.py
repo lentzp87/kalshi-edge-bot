@@ -36,7 +36,9 @@ log = structlog.get_logger(__name__)
 
 BASE_URLS = {
     "demo": "https://demo-api.kalshi.co",
-    "prod": "https://api.elections.kalshi.com",  # update if Kalshi changes this
+    # Per docs.kalshi.com: trading-api.kalshi.com is the canonical prod URL.
+    # api.elections.kalshi.com is the legacy URL that still serves the same API.
+    "prod": "https://trading-api.kalshi.com",
 }
 
 
@@ -123,6 +125,14 @@ class KalshiClient:
         headers = self._sign(method, path)
         headers.update(kwargs.pop("headers", {}))
         r = await self._client.request(method, path, headers=headers, **kwargs)
+        if r.status_code >= 400:
+            log.error(
+                "kalshi.http_error",
+                method=method,
+                path=path,
+                status=r.status_code,
+                body=r.text[:500],
+            )
         r.raise_for_status()
         return r.json()
 
@@ -139,7 +149,17 @@ class KalshiClient:
         if cursor:
             params["cursor"] = cursor
         data = await self._request("GET", "/trade-api/v2/markets", params=params)
-        markets = [self._parse_market(m) for m in data.get("markets", [])]
+        raw_markets = data.get("markets", [])
+        # Diagnostic: log response shape so we can see what Kalshi actually sent
+        log.info(
+            "kalshi.list_markets",
+            base_url=self.base_url,
+            status_filter=status,
+            response_keys=list(data.keys()),
+            num_markets=len(raw_markets),
+            first_market_keys=list(raw_markets[0].keys()) if raw_markets else None,
+        )
+        markets = [self._parse_market(m) for m in raw_markets]
         return markets, data.get("cursor")
 
     async def get_orderbook(self, ticker: str) -> dict:
