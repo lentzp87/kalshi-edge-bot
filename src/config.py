@@ -13,13 +13,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class ScannerConfig(BaseModel):
     loop_interval_seconds: int = 30
-    max_pages_per_scan: int = 3
+    max_pages_per_scan: int = 50
     price_min: float = 0.20
     price_max: float = 0.80
     max_spread_cents: int = 4
     min_liquidity_usd: float = 200
     max_minutes_to_expiry: int = 4320
     min_minutes_to_expiry: int = 30
+    series_tickers: list[str] = Field(default_factory=list)
 
 
 class DecisionConfig(BaseModel):

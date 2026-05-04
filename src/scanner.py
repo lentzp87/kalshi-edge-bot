@@ -31,6 +31,37 @@ class Scanner:
             "expiry_too_far": 0,
             "expiry_unparseable": 0,
         }
+        # If specific series are configured, scan only those (fast + targeted).
+        # Otherwise walk the full catalog up to max_pages_per_scan.
+        if self.cfg.series_tickers:
+            for series in self.cfg.series_tickers:
+                async for m in self._stream_series(series):
+                    yield m
+        else:
+            async for m in self._stream_all():
+                yield m
+
+    async def _stream_series(self, series_ticker: str) -> AsyncIterator[Market]:
+        cursor: str | None = None
+        page = 0
+        while True:
+            page += 1
+            markets, cursor = await self.client.list_markets(
+                cursor=cursor, series_ticker=series_ticker
+            )
+            log.info("scanner.series_page", series=series_ticker, page=page, fetched=len(markets))
+            for m in markets:
+                self.rejection_counts["total_seen"] += 1
+                if self._is_tradeable(m):
+                    yield m
+            if not cursor:
+                break
+            if page >= self.cfg.max_pages_per_scan:
+                log.info("scanner.page_cap_hit", series=series_ticker, page=page,
+                         cap=self.cfg.max_pages_per_scan)
+                break
+
+    async def _stream_all(self) -> AsyncIterator[Market]:
         cursor: str | None = None
         page = 0
         while True:

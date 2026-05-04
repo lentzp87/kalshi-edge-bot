@@ -144,10 +144,13 @@ class KalshiClient:
         status: str = "open",
         limit: int = 200,
         cursor: str | None = None,
+        series_ticker: str | None = None,
     ) -> tuple[list[Market], str | None]:
         params: dict[str, Any] = {"status": status, "limit": limit}
         if cursor:
             params["cursor"] = cursor
+        if series_ticker:
+            params["series_ticker"] = series_ticker
         data = await self._request("GET", "/trade-api/v2/markets", params=params)
         raw_markets = data.get("markets", [])
         # Quiet per-page log — just the count, no field-name dump.
