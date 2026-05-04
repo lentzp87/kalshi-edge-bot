@@ -28,7 +28,15 @@ log = structlog.get_logger(__name__)
 
 
 async def loop_once(scanner: Scanner, executor: Executor, journal: Journal) -> None:
+    scanned = 0
+    by_category: dict[str, int] = {}
+    opinions = 0
+    signals = 0
+
     async for market in scanner.stream_tradeable_markets():
+        scanned += 1
+        by_category[market.category] = by_category.get(market.category, 0) + 1
+
         model = model_for_category(market.category)
         if not model or not getattr(model, "enabled", True):
             continue
@@ -36,13 +44,23 @@ async def loop_once(scanner: Scanner, executor: Executor, journal: Journal) -> N
         if not est:
             continue
 
+        opinions += 1
         edge = est.p_yes - market.mid
         journal.log_signal(market, model_p=est.p_yes, edge=edge,
                            confidence=est.confidence, reason=est.reason)
 
         signal = evaluate(market, est)
         if signal:
+            signals += 1
             await executor.submit(signal, market)
+
+    log.info(
+        "loop.summary",
+        scanned=scanned,
+        by_category=by_category,
+        opinions=opinions,
+        signals=signals,
+    )
 
 
 async def trading_loop(scanner: Scanner, executor: Executor, journal: Journal) -> None:
