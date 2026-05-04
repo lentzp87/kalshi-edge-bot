@@ -169,20 +169,66 @@ class KalshiClient:
 
     @staticmethod
     def _parse_market(m: dict) -> Market:
-        # Kalshi returns prices in cents (int). Normalize to dollars.
-        cents_or_zero = lambda k: (m.get(k) or 0) / 100
+        """Parse a Kalshi market into our normalized Market dataclass.
+
+        Kalshi's current schema uses dollar-denominated price fields with the
+        `_dollars` suffix (already 0.0-1.0) and float-typed sizes with `_fp`.
+        We fall back to legacy cents-based field names for any older response
+        shape, so this works on both demo and prod.
+        """
+        def dollars_or_legacy(dollar_key: str, legacy_cents_key: str) -> float:
+            v = m.get(dollar_key)
+            if v is not None:
+                return float(v)
+            return (m.get(legacy_cents_key) or 0) / 100
+
         return Market(
             ticker=m["ticker"],
             title=m.get("title", ""),
-            category=m.get("category", "Unknown"),
-            yes_bid=cents_or_zero("yes_bid"),
-            yes_ask=cents_or_zero("yes_ask"),
-            last_price=cents_or_zero("last_price"),
-            volume=m.get("volume", 0),
-            open_interest=m.get("open_interest", 0),
-            close_time_iso=m.get("close_time", ""),
+            # Kalshi no longer returns `category` per market.
+            # Best heuristic: the prefix of `event_ticker` (e.g. KXATPMATCH-...)
+            # identifies the series; we map that to a category in models/__init__.
+            category=_category_from_event_ticker(m.get("event_ticker", "")),
+            yes_bid=dollars_or_legacy("yes_bid_dollars", "yes_bid"),
+            yes_ask=dollars_or_legacy("yes_ask_dollars", "yes_ask"),
+            last_price=dollars_or_legacy("last_price_dollars", "last_price"),
+            volume=int(m.get("volume_24h_fp") or m.get("volume_fp") or m.get("volume") or 0),
+            open_interest=int(m.get("open_interest_fp") or m.get("open_interest") or 0),
+            close_time_iso=m.get("close_time", "") or m.get("expiration_time", ""),
             raw=m,
         )
+
+
+def _category_from_event_ticker(event_ticker: str) -> str:
+    """Map Kalshi event-ticker prefixes to broad categories.
+
+    This is a best-effort categorization so the model registry can route
+    markets to the right model. Extend as you discover more series.
+    """
+    et = event_ticker.upper()
+    if not et:
+        return "Unknown"
+    # Sports — Kalshi sports series start with KX + league code
+    if any(et.startswith(p) for p in ("KXATP", "KXNFL", "KXNBA", "KXMLB", "KXNHL",
+                                      "KXUFC", "KXBOX", "KXPGA", "KXTEN", "KXSOC",
+                                      "KXNCAA", "KXWTA", "KXFIFA")):
+        return "Sports"
+    # Weather — temp / rain / snow series
+    if any(et.startswith(p) for p in ("KXHIGH", "KXLOW", "KXRAIN", "KXSNOW",
+                                      "KXTEMP", "KXHOT", "KXCOLD", "KXHURR")):
+        return "Weather"
+    # Crypto
+    if any(et.startswith(p) for p in ("KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXCRYPTO")):
+        return "Crypto"
+    # Economics / Fed / inflation
+    if any(et.startswith(p) for p in ("KXFED", "KXCPI", "KXJOBS", "KXGDP",
+                                      "KXNFP", "KXUNRATE", "KXPCE")):
+        return "Economics"
+    # Politics
+    if any(et.startswith(p) for p in ("KXPRES", "KXSEN", "KXHOUSE", "KXGOV",
+                                      "KXELECT", "KXSCOTUS", "KXIMP")):
+        return "Politics"
+    return "Unknown"
 
     # ---------- portfolio + orders ----------
 

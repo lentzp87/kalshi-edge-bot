@@ -37,8 +37,10 @@ class Scanner:
         if m.spread_cents > self.cfg.max_spread_cents:
             return False
 
-        # Liquidity proxy: open interest * average price approximates dollar size on book
-        approx_liq_usd = m.open_interest * m.mid
+        # Liquidity: prefer Kalshi's direct `liquidity_dollars` if present;
+        # fall back to (open_interest * mid) as a proxy for older payloads.
+        liq_dollars = m.raw.get("liquidity_dollars")
+        approx_liq_usd = float(liq_dollars) if liq_dollars is not None else m.open_interest * m.mid
         if approx_liq_usd < self.cfg.min_liquidity_usd:
             return False
 
