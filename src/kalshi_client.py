@@ -150,15 +150,8 @@ class KalshiClient:
             params["cursor"] = cursor
         data = await self._request("GET", "/trade-api/v2/markets", params=params)
         raw_markets = data.get("markets", [])
-        # Diagnostic: log response shape so we can see what Kalshi actually sent
-        log.info(
-            "kalshi.list_markets",
-            base_url=self.base_url,
-            status_filter=status,
-            response_keys=list(data.keys()),
-            num_markets=len(raw_markets),
-            first_market_keys=list(raw_markets[0].keys()) if raw_markets else None,
-        )
+        # Quiet per-page log — just the count, no field-name dump.
+        log.debug("kalshi.list_markets.page", num_markets=len(raw_markets))
         markets = [self._parse_market(m) for m in raw_markets]
         return markets, data.get("cursor")
 
