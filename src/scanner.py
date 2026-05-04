@@ -89,11 +89,15 @@ class Scanner:
             self.rejection_counts["spread"] += 1
             return False
 
-        # Liquidity: prefer Kalshi's direct `liquidity_dollars` if present;
-        # fall back to (open_interest * mid) as a proxy for older payloads.
-        liq_dollars = m.raw.get("liquidity_dollars")
-        approx_liq_usd = float(liq_dollars) if liq_dollars is not None else m.open_interest * m.mid
-        if approx_liq_usd < self.cfg.min_liquidity_usd:
+        # Liquidity: compute from order-book depth (Kalshi's liquidity_dollars
+        # field returns 0 even for markets with real resting orders, so we
+        # ignore it). Approximate dollar liquidity = bid_size*bid + ask_size*ask.
+        bid_size = float(m.raw.get("yes_bid_size_fp") or 0)
+        ask_size = float(m.raw.get("yes_ask_size_fp") or 0)
+        # Kalshi contracts settle at $1, so size is in contracts. Dollar value
+        # of resting orders is roughly: bid_size * bid_price + ask_size * ask_price.
+        liq_usd = (bid_size * m.yes_bid) + (ask_size * m.yes_ask)
+        if liq_usd < self.cfg.min_liquidity_usd:
             self.rejection_counts["liquidity"] += 1
             return False
 

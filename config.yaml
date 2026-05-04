@@ -7,8 +7,8 @@ scanner:
   max_pages_per_scan: 200    # ~40k markets - covers full Kalshi universe
   price_min: 0.10            # 10¢-90¢ band (Kalshi has many tail markets)
   price_max: 0.90
-  max_spread_cents: 10       # Kalshi markets often have 5-10¢ spreads
-  min_liquidity_usd: 25      # Kalshi has many micro-markets; $25 keeps us out of dead ones
+  max_spread_cents: 25       # Kalshi sports/event markets routinely have 15-25¢ spreads
+  min_liquidity_usd: 25      # uses yes_bid_size_fp + yes_ask_size_fp (Kalshi's liquidity_dollars is broken)
   max_minutes_to_expiry: 4320  # 3 days
   min_minutes_to_expiry: 30
   # Optional: if set, skip the broad pagination and only fetch these
