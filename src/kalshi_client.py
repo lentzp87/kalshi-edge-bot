@@ -36,9 +36,9 @@ log = structlog.get_logger(__name__)
 
 BASE_URLS = {
     "demo": "https://demo-api.kalshi.co",
-    # Per docs.kalshi.com: trading-api.kalshi.com is the canonical prod URL.
-    # api.elections.kalshi.com is the legacy URL that still serves the same API.
-    "prod": "https://trading-api.kalshi.com",
+    # Confirmed by Kalshi's own redirect message: trading-api.kalshi.com
+    # returns 401 "API has been moved to https://api.elections.kalshi.com/".
+    "prod": "https://api.elections.kalshi.com",
 }
 
 
