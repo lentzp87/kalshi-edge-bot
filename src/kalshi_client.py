@@ -192,8 +192,8 @@ class KalshiClient:
             yes_bid=dollars_or_legacy("yes_bid_dollars", "yes_bid"),
             yes_ask=dollars_or_legacy("yes_ask_dollars", "yes_ask"),
             last_price=dollars_or_legacy("last_price_dollars", "last_price"),
-            volume=int(m.get("volume_24h_fp") or m.get("volume_fp") or m.get("volume") or 0),
-            open_interest=int(m.get("open_interest_fp") or m.get("open_interest") or 0),
+            volume=int(float(m.get("volume_24h_fp") or m.get("volume_fp") or m.get("volume") or 0)),
+            open_interest=int(float(m.get("open_interest_fp") or m.get("open_interest") or 0)),
             close_time_iso=m.get("close_time", "") or m.get("expiration_time", ""),
             raw=m,
         )
