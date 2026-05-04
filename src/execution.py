@@ -120,24 +120,58 @@ class Executor:
 
     @staticmethod
     def _mid_from_orderbook(ob: dict, side: str) -> float:
-        # Kalshi orderbook returns yes/no bid+ask in cents. Defensive parsing.
+        """Compute the YES-equivalent mid price from Kalshi's orderbook payload.
+
+        Kalshi returns the book under `orderbook_fp` with `yes_dollars` and
+        `no_dollars` arrays. Each entry is `[price_str, size_str]` and the
+        prices are ALREADY IN DOLLARS (0.01-0.99). The arrays are sorted
+        ascending by price, so the LAST entry of each side is the best bid
+        on that side. To get the YES ask, look at the best NO bid and
+        invert (buying NO at p == selling YES at 1-p).
+        """
         try:
-            yes_bid = ob.get("orderbook", {}).get("yes", [[None]])[-1][0] or 0
-            yes_ask = ob.get("orderbook", {}).get("yes", [[None]])[0][0] or 0
-            return ((yes_bid + yes_ask) / 2) / 100 if side == "yes" else 1 - ((yes_bid + yes_ask) / 2) / 100
+            book = ob.get("orderbook_fp") or ob.get("orderbook") or {}
+            yes_book = book.get("yes_dollars") or book.get("yes") or []
+            no_book = book.get("no_dollars") or book.get("no") or []
+
+            yes_bid = float(yes_book[-1][0]) if yes_book else 0.0
+            no_bid = float(no_book[-1][0]) if no_book else 0.0
+            # Best YES ask is implied from best NO bid: 1 - no_bid
+            yes_ask = (1.0 - no_bid) if no_bid > 0 else 0.0
+
+            if yes_bid > 0 and yes_ask > 0:
+                yes_mid = (yes_bid + yes_ask) / 2
+            elif yes_bid > 0:
+                yes_mid = yes_bid
+            elif yes_ask > 0:
+                yes_mid = yes_ask
+            else:
+                yes_mid = 0.5  # empty book — neutral fallback
+
+            return yes_mid if side == "yes" else (1.0 - yes_mid)
         except Exception:
+            log.exception("exec.orderbook_parse_error")
             return 0.5
 
     async def _exit(self, ticker: str, exit_price: float, *, reason: str) -> None:
         pos = self.open.pop(ticker, None)
         if not pos:
             return
+        # P&L per contract is the price move in dollars. Contracts settle at
+        # $1, so dollar P&L = (price_move) * contracts. NO extra * 100.
         pnl_per_contract = (exit_price - pos.fill_price) if pos.signal.side == "yes" \
             else (pos.fill_price - exit_price)
-        pnl_usd = pnl_per_contract * pos.contracts * 100  # contracts settle at $1
+        pnl_usd = pnl_per_contract * pos.contracts
         # Approximate Kalshi fee (verify against current schedule).
         fees_usd = 0.07 * pos.contracts
         pnl_usd -= fees_usd
+        # Sanity clamp: a long position can never lose more than its size.
+        # Catches any residual unit-conversion bug before it trips the
+        # daily-loss kill switch on imaginary losses.
+        if pnl_usd < -pos.signal.size_usd:
+            log.warning("exec.pnl_clamped_to_size",
+                        ticker=ticker, raw_pnl=pnl_usd, size=pos.signal.size_usd)
+            pnl_usd = -pos.signal.size_usd
 
         self.risk.record_close(size_usd=pos.signal.size_usd, realized_pnl_usd=pnl_usd)
         self.journal.log_close(

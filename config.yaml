@@ -56,6 +56,7 @@ scanner:
 decision:
   min_edge: 0.06             # 6 percentage points minimum
   kelly_fraction: 0.25       # fraction of full Kelly to size by
+  min_entry_price: 0.55      # only enter when our side is priced >= 55c (favored)
 
 risk:
   max_position_size_usd: 40

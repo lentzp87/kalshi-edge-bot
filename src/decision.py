@@ -58,6 +58,15 @@ def evaluate(market: Market, est: ProbabilityEstimate) -> TradeSignal | None:
     edge = edge_yes if side == "yes" else edge_no
     target_price = market.yes_ask if side == "yes" else (1 - market.yes_bid)
 
+    # Skip low-priced entries — they're long-tail bets with bad risk/reward.
+    # We want to be the favored side: only enter when the market thinks our
+    # outcome is at least min_entry_price likely.
+    if target_price < cfg.decision.min_entry_price:
+        log.debug("decision.skip.low_price",
+                  ticker=market.ticker, side=side, price=target_price,
+                  min=cfg.decision.min_entry_price)
+        return None
+
     size_usd = _kelly_size(cfg.bankroll_usd, edge * est.confidence, target_price)
     size_usd = min(size_usd, cfg.risk.max_position_size_usd)
     if size_usd < 5:  # don't bother with sub-$5 fills

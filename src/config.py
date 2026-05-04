@@ -27,6 +27,7 @@ class ScannerConfig(BaseModel):
 class DecisionConfig(BaseModel):
     min_edge: float = 0.06
     kelly_fraction: float = 0.25
+    min_entry_price: float = 0.55
 
 
 class RiskConfig(BaseModel):
