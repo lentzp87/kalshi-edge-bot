@@ -60,6 +60,7 @@ async def loop_once(scanner: Scanner, executor: Executor, journal: Journal) -> N
         by_category=by_category,
         opinions=opinions,
         signals=signals,
+        rejections=scanner.rejection_counts,
     )
 
 
