@@ -21,6 +21,7 @@ class ScannerConfig(BaseModel):
     max_minutes_to_expiry: int = 4320
     min_minutes_to_expiry: int = 30
     series_tickers: list[str] = Field(default_factory=list)
+    allowed_categories: list[str] = Field(default_factory=list)
 
 
 class DecisionConfig(BaseModel):

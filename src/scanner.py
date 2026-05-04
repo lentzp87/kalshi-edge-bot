@@ -24,6 +24,7 @@ class Scanner:
         # Reset counters for this scan
         self.rejection_counts = {
             "total_seen": 0,
+            "wrong_category": 0,
             "price_band": 0,
             "spread": 0,
             "liquidity": 0,
@@ -79,6 +80,11 @@ class Scanner:
                 break
 
     def _is_tradeable(self, m: Market) -> bool:
+        # Category whitelist (cheapest filter — do it first)
+        if self.cfg.allowed_categories and m.category not in self.cfg.allowed_categories:
+            self.rejection_counts["wrong_category"] += 1
+            return False
+
         # Price band — skip extreme tails where reward/risk is bad
         if not (self.cfg.price_min <= m.mid <= self.cfg.price_max):
             self.rejection_counts["price_band"] += 1

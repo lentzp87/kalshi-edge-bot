@@ -9,16 +9,49 @@ scanner:
   price_max: 0.90
   max_spread_cents: 25       # Kalshi sports/event markets routinely have 15-25¢ spreads
   min_liquidity_usd: 25      # uses yes_bid_size_fp + yes_ask_size_fp (Kalshi's liquidity_dollars is broken)
-  max_minutes_to_expiry: 4320  # 3 days
-  min_minutes_to_expiry: 30
+  # Same-day focus: only markets that resolve within the next 24 hours.
+  # Resolution time = `expected_expiration_time` (game time / day-end), NOT
+  # `close_time` (when trading stops, which can be weeks later for playoffs).
+  max_minutes_to_expiry: 1440   # 24 hours
+  min_minutes_to_expiry: 5      # skip markets resolving in <5 min (no time to react)
+  # Only scan markets in these Kalshi categories; everything else gets dropped
+  # at the scanner. Empty list = scan every category.
+  allowed_categories:
+    - Sports
+    - Climate and Weather
   # Optional: if set, skip the broad pagination and only fetch these
   # series directly. Use Kalshi series_ticker prefixes. Empty = scan all.
-  # Categorization is now done dynamically via Kalshi's /series catalog
-  # (loaded at startup). Leave empty for broad scan — every market gets
-  # its real category, and markets without an enabled model are skipped
-  # automatically downstream. Only set this if you want to limit which
-  # series the bot fetches at the API level (e.g. for very low-latency).
-  series_tickers: []
+  # Targeted scan: fetch ONLY these specific Kalshi series instead of
+  # walking the full 40k+ market catalog. Each call returns ~10-20 markets
+  # so total scan = ~250 markets in seconds, vs 40k in minutes.
+  # All major US daily weather cities (matches the WeatherModel city map):
+  series_tickers:
+    # HIGH temperature series
+    - KXHIGHTDAL    # Dallas
+    - KXHIGHAUS     # Austin
+    - KXHIGHTHOU    # Houston
+    - KXHIGHTSATX   # San Antonio
+    - KXHIGHTNOLA   # New Orleans
+    - KXHIGHMIA     # Miami
+    - KXHIGHCHI     # Chicago
+    - KXHIGHLAX     # Los Angeles
+    - KXHIGHTLV     # Las Vegas
+    - KXHIGHUS      # National
+    # LOW temperature series
+    - KXLOWNY       # New York
+    - KXLOWTDAL     # Dallas
+    - KXLOWTLAX     # Los Angeles
+    - KXLOWTSATX    # San Antonio
+    - KXLOWTNOLA    # New Orleans
+    - KXLOWTMIA     # Miami
+    - KXLOWTOKC     # Oklahoma City
+    - KXLOWTLV      # Las Vegas
+    - KXLOWTATL     # Atlanta
+    - KXLOWTDC      # Washington DC
+    - KXLOWTPHIL    # Philadelphia
+    - KXLOWTPHX     # Phoenix
+    - KXLOWDEN      # Denver
+    - KXLOWLAX      # Los Angeles (alt)
 
 decision:
   min_edge: 0.06             # 6 percentage points minimum

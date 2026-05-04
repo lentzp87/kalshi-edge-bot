@@ -252,7 +252,15 @@ class KalshiClient:
             last_price=dollars_or_legacy("last_price_dollars", "last_price"),
             volume=int(float(m.get("volume_24h_fp") or m.get("volume_fp") or m.get("volume") or 0)),
             open_interest=int(float(m.get("open_interest_fp") or m.get("open_interest") or 0)),
-            close_time_iso=m.get("close_time", "") or m.get("expiration_time", ""),
+            # Use the actual *resolution* time (when the event happens / market
+            # settles), not close_time which is when *trading* stops — those
+            # can differ by weeks for sports playoff markets.
+            close_time_iso=(
+                m.get("expected_expiration_time")
+                or m.get("occurrence_datetime")
+                or m.get("expiration_time")
+                or m.get("close_time", "")
+            ),
             raw=m,
         )
 
