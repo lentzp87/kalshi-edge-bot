@@ -51,10 +51,11 @@ CITY_BY_SERIES: dict[str, tuple[float, float, str]] = {
     # New York
     "NY":     (40.7128,  -74.0060, "New York"),
     "NYC":    (40.7128,  -74.0060, "New York"),
-    # Major US cities
+    # Major US cities (covers all 64 daily series found in catalog)
     "DAL":    (32.7767,  -96.7970, "Dallas"),
     "AUS":    (30.2672,  -97.7431, "Austin"),
     "HOU":    (29.7604,  -95.3698, "Houston"),
+    "OU":     (29.7604,  -95.3698, "Houston"),     # KXHIGHOU edge case
     "SATX":   (29.4241,  -98.4936, "San Antonio"),
     "OKC":    (35.4676,  -97.5164, "Oklahoma City"),
     "NOLA":   (29.9511,  -90.0715, "New Orleans"),
@@ -69,24 +70,44 @@ CITY_BY_SERIES: dict[str, tuple[float, float, str]] = {
     "DC":     (38.9072,  -77.0369, "Washington DC"),
     "SEA":    (47.6062, -122.3321, "Seattle"),
     "DV":     (36.5054, -117.0794, "Death Valley"),
+    "BOS":    (42.3601,  -71.0589, "Boston"),
+    "MIN":    (44.9778,  -93.2650, "Minneapolis"),
+    "SFO":    (37.7749, -122.4194, "San Francisco"),
+    "US":     (38.9072,  -77.0369, "US National (DC proxy)"),  # KXHIGHUS national series
 }
 
 
 def _city_from_series_ticker(series_ticker: str) -> tuple[float, float, str] | None:
     """Pull the city code off a Kalshi weather series ticker.
 
-    Examples:
-        KXHIGHTDAL  -> ("DAL", Dallas)
-        KXLOWNY     -> ("NY", New York)
-        KXLOWTLAX   -> ("LAX", Los Angeles)
-        KXDVHIGH    -> ("DV", Death Valley)
-        RAINSEA     -> not handled here (rain, not temp)
+    Handles both placement conventions Kalshi uses:
+      - Suffix:  KXHIGHTDAL, KXLOWNY, KXLOWTLAX  (city at end)
+      - Middle:  KXDVHIGH, KXHOUHIGH, KXDENHIGH  (city before METRIC)
+
+    Strips known prefix/suffix tokens (KX, HIGH, LOW, T) and tries to
+    match what's left against our CITY_BY_SERIES map. Falls back to a
+    plain endswith() match to keep older shorter codes working.
     """
     s = series_ticker.upper()
-    # Try longest city codes first so SATX doesn't get mis-matched to AT
+
+    # Strategy 1: strip standard prefix/suffix tokens and see if what
+    # remains is a known city code.
+    metric_tokens = ["KXHIGHT", "KXLOWT", "KXHIGH", "KXLOW", "KX", "HIGH", "LOW", "T"]
+    candidate = s
+    for tok in metric_tokens:
+        if candidate.startswith(tok):
+            candidate = candidate[len(tok):]
+            break
+    for tok in metric_tokens:
+        if candidate.endswith(tok):
+            candidate = candidate[:-len(tok)]
+            break
+    if candidate in CITY_BY_SERIES:
+        return CITY_BY_SERIES[candidate]
+
+    # Strategy 2: longest-suffix match against the original (handles
+    # variants we haven't anticipated).
     for code in sorted(CITY_BY_SERIES.keys(), key=len, reverse=True):
-        # Code must appear as the suffix or surrounded by letters that are
-        # part of the prefix scheme (KXHIGHT, KXLOW, KXHIGH, KXLOWT, etc.)
         if s.endswith(code):
             return CITY_BY_SERIES[code]
     return None

@@ -201,6 +201,8 @@ class KalshiClient:
     async def load_series_categories(self) -> int:
         """Populate self.series_categories from Kalshi's series catalog.
 
+        Also stashes the raw series list on `self._series_raw` so other
+        helpers (like discover_series) can filter by frequency, etc.
         Call once at startup. Returns the number of series loaded.
         """
         try:
@@ -208,12 +210,52 @@ class KalshiClient:
         except Exception as e:
             log.exception("kalshi.load_series_failed", err=str(e))
             return 0
+        self._series_raw = series
         self.series_categories = {
             s["ticker"]: s.get("category", "Unknown")
             for s in series if s.get("ticker")
         }
         log.info("kalshi.series_loaded", count=len(self.series_categories))
         return len(self.series_categories)
+
+    def discover_series(
+        self,
+        *,
+        categories: list[str] | None = None,
+        frequencies: list[str] | None = None,
+        exclude_prefixes: list[str] | None = None,
+    ) -> list[str]:
+        """Filter the loaded series catalog and return matching tickers.
+
+        Call AFTER load_series_categories(). Examples:
+
+            # All daily weather series:
+            client.discover_series(
+                categories=["Climate and Weather"],
+                frequencies=["daily"],
+                exclude_prefixes=["RAIN", "KXRAIN"],  # if your model is temp-only
+            )
+
+        Returns a list of ticker strings.
+        """
+        raw = getattr(self, "_series_raw", None) or []
+        cats = set(categories) if categories else None
+        freqs = set(frequencies) if frequencies else None
+        excludes = list(exclude_prefixes or [])
+
+        out: list[str] = []
+        for s in raw:
+            ticker = s.get("ticker")
+            if not ticker:
+                continue
+            if cats and s.get("category") not in cats:
+                continue
+            if freqs and s.get("frequency") not in freqs:
+                continue
+            if any(ticker.upper().startswith(p.upper()) for p in excludes):
+                continue
+            out.append(ticker)
+        return out
 
     def category_for_event(self, event_ticker: str) -> str:
         """Look up category for a market's event_ticker.
