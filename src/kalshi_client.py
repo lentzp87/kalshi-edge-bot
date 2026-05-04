@@ -56,14 +56,40 @@ class Market:
     raw: dict             # original payload, for model code
 
     @property
+    def effective_yes_bid(self) -> float:
+        """Best YES-equivalent bid: max of (direct yes_bid, 1 - no_ask).
+
+        On Kalshi, buying NO at price p is the same as selling YES at price (1-p).
+        So if nobody is directly bidding YES but somebody is asking NO, the implied
+        YES bid is (1 - no_ask). This unifies the two sides of the book.
+        """
+        no_ask = float(self.raw.get("no_ask_dollars") or 0)
+        implied_from_no = (1.0 - no_ask) if no_ask > 0 else 0.0
+        return max(self.yes_bid or 0.0, implied_from_no)
+
+    @property
+    def effective_yes_ask(self) -> float:
+        """Best YES-equivalent ask: min of (direct yes_ask, 1 - no_bid)."""
+        no_bid = float(self.raw.get("no_bid_dollars") or 0)
+        implied_from_no = (1.0 - no_bid) if no_bid > 0 else 0.0
+        candidates = [v for v in (self.yes_ask or 0.0, implied_from_no) if v > 0]
+        return min(candidates) if candidates else 0.0
+
+    @property
     def mid(self) -> float:
-        if self.yes_bid and self.yes_ask:
-            return (self.yes_bid + self.yes_ask) / 2
+        bid = self.effective_yes_bid
+        ask = self.effective_yes_ask
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2
         return self.last_price
 
     @property
     def spread_cents(self) -> int:
-        return int(round((self.yes_ask - self.yes_bid) * 100))
+        bid = self.effective_yes_bid
+        ask = self.effective_yes_ask
+        if bid > 0 and ask > 0:
+            return int(round((ask - bid) * 100))
+        return 100  # treat one-sided book as huge spread = reject
 
 
 class KalshiClient:
