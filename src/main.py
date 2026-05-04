@@ -108,6 +108,14 @@ async def amain() -> None:
     # "Climate and Weather", etc.) — replaces the brittle ticker-prefix guesses.
     await client.load_series_categories()
 
+    # Pre-warm the weather forecast cache so the trading loop never has
+    # to call Open-Meteo (avoids 429 rate-limits on cloud datacenter IPs).
+    # Then keep it fresh in the background every 25 min.
+    if cfg.models.weather.enabled:
+        from .models.weather import prewarm_forecasts, background_refresh_loop
+        await prewarm_forecasts()
+        asyncio.create_task(background_refresh_loop())
+
     journal = Journal()
     risk = RiskEngine()
     scanner = Scanner(client)

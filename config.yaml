@@ -23,10 +23,12 @@ scanner:
   # series directly. Use Kalshi series_ticker prefixes. Empty = scan all.
   # Targeted scan: fetch ONLY these specific Kalshi series instead of
   # walking the full 40k+ market catalog. Each call returns ~10-20 markets
-  # so total scan = ~250 markets in seconds, vs 40k in minutes.
-  # All major US daily weather cities (matches the WeatherModel city map):
+  # so total scan completes in 2-5 seconds.
+  # Tickers below were each verified live via the Kalshi API to return
+  # active markets (curl /markets?series_ticker=X). Inactive tickers
+  # removed; will be re-verified when needed.
   series_tickers:
-    # HIGH temperature series
+    # HIGH temperature - verified active
     - KXHIGHTDAL    # Dallas
     - KXHIGHAUS     # Austin
     - KXHIGHTHOU    # Houston
@@ -34,24 +36,22 @@ scanner:
     - KXHIGHTNOLA   # New Orleans
     - KXHIGHMIA     # Miami
     - KXHIGHCHI     # Chicago
-    - KXHIGHLAX     # Los Angeles
     - KXHIGHTLV     # Las Vegas
     - KXHIGHUS      # National
-    # LOW temperature series
-    - KXLOWNY       # New York
+    - KXHIGHTPHX    # Phoenix
+    - KXHIGHNY      # NYC
+    - KXHIGHDEN     # Denver
+    # LOW temperature - verified active
     - KXLOWTDAL     # Dallas
-    - KXLOWTLAX     # Los Angeles
     - KXLOWTSATX    # San Antonio
-    - KXLOWTNOLA    # New Orleans
     - KXLOWTMIA     # Miami
-    - KXLOWTOKC     # Oklahoma City
     - KXLOWTLV      # Las Vegas
-    - KXLOWTATL     # Atlanta
     - KXLOWTDC      # Washington DC
-    - KXLOWTPHIL    # Philadelphia
     - KXLOWTPHX     # Phoenix
-    - KXLOWDEN      # Denver
-    - KXLOWLAX      # Los Angeles (alt)
+    - KXLOWTDEN     # Denver
+    - KXLOWTAUS     # Austin
+    - KXLOWTHOU     # Houston
+    - KXLOWTNYC     # NYC
 
 decision:
   min_edge: 0.06             # 6 percentage points minimum

@@ -153,9 +153,18 @@ def _parse_strike_from_yes_subtitle(yes_sub_title: str) -> _Strike | None:
 # ----------- Open-Meteo client -----------
 
 _OPEN_METEO_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
-_FORECAST_CACHE_TTL_SEC = 600  # 10 minutes - forecasts don't change that fast
-_forecast_cache: dict[str, tuple[float, list[float], list[float]]] = {}
+_FORECAST_CACHE_TTL_SEC = 1800   # 30 min - forecasts barely move within that window
+_NEGATIVE_CACHE_TTL_SEC = 120    # backoff after a failed fetch
+# Open-Meteo recommends a User-Agent so they can contact heavy users
+# instead of rate-limiting blindly.
+_USER_AGENT = "kalshi-edge-bot/0.1 (https://github.com/lentzp87/kalshi-edge-bot)"
+
+# Cache stores (timestamp, highs, lows). On failure, we cache (timestamp, None, None)
+# as a negative entry so we don't hammer Open-Meteo retrying instantly.
+_forecast_cache: dict[str, tuple[float, list[float] | None, list[float] | None]] = {}
 _forecast_locks: dict[str, asyncio.Lock] = {}
+# Coarse semaphore to keep us well under Open-Meteo's burst limit (~10/s).
+_om_semaphore = asyncio.Semaphore(3)
 
 
 async def _fetch_ensemble_temps(
@@ -163,24 +172,35 @@ async def _fetch_ensemble_temps(
 ) -> tuple[list[float], list[float]] | None:
     """Fetch GFS-ensemble daily highs/lows for one city/date.
 
-    Returns (highs_F, lows_F) where each list has one entry per ensemble
-    member (typically 31). Cached for 10 minutes per (lat, lon, date) key.
-    Returns None on transient failures.
+    Caches positive responses for 30 min and negative responses for 2 min,
+    so a 429 from Open-Meteo doesn't trigger a retry storm.
     """
     key = f"{lat:.4f},{lon:.4f},{target_date.isoformat()}"
     now = time.time()
 
-    # Cheap cache hit
+    # Cheap cache hit (positive or negative)
     cached = _forecast_cache.get(key)
-    if cached and (now - cached[0]) < _FORECAST_CACHE_TTL_SEC:
-        return cached[1], cached[2]
+    if cached:
+        ts, highs, lows = cached
+        if highs is None and lows is None:
+            # Negative cache entry; backoff
+            if now - ts < _NEGATIVE_CACHE_TTL_SEC:
+                return None
+        else:
+            if now - ts < _FORECAST_CACHE_TTL_SEC:
+                return highs, lows
 
     # Single-flight: avoid concurrent calls fetching the same key
     lock = _forecast_locks.setdefault(key, asyncio.Lock())
     async with lock:
         cached = _forecast_cache.get(key)
-        if cached and (time.time() - cached[0]) < _FORECAST_CACHE_TTL_SEC:
-            return cached[1], cached[2]
+        if cached:
+            ts, highs, lows = cached
+            if highs is None and lows is None:
+                if time.time() - ts < _NEGATIVE_CACHE_TTL_SEC:
+                    return None
+            elif time.time() - ts < _FORECAST_CACHE_TTL_SEC:
+                return highs, lows
 
         params = {
             "latitude": lat,
@@ -191,17 +211,20 @@ async def _fetch_ensemble_temps(
             "end_date": target_date.isoformat(),
             "models": "gfs_seamless",
         }
+        headers = {"User-Agent": _USER_AGENT}
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.get(_OPEN_METEO_URL, params=params)
-                r.raise_for_status()
-                payload = r.json()
+            async with _om_semaphore:
+                async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+                    r = await client.get(_OPEN_METEO_URL, params=params)
+                    r.raise_for_status()
+                    payload = r.json()
         except Exception as e:
-            log.warning("open_meteo.fetch_failed", err=str(e), lat=lat, lon=lon)
+            log.warning("open_meteo.fetch_failed", err=str(e)[:120], lat=lat, lon=lon)
+            _forecast_cache[key] = (time.time(), None, None)  # negative cache
             return None
 
-        highs: list[float] = []
-        lows: list[float] = []
+        highs_out: list[float] = []
+        lows_out: list[float] = []
         daily = payload.get("daily") or {}
         for k, vals in daily.items():
             if not isinstance(vals, list) or not vals:
@@ -214,16 +237,75 @@ async def _fetch_ensemble_temps(
             except (TypeError, ValueError):
                 continue
             if "temperature_2m_max" in k:
-                highs.append(f)
+                highs_out.append(f)
             elif "temperature_2m_min" in k:
-                lows.append(f)
+                lows_out.append(f)
 
-        if not highs and not lows:
+        if not highs_out and not lows_out:
             log.warning("open_meteo.empty_payload", lat=lat, lon=lon)
+            _forecast_cache[key] = (time.time(), None, None)
             return None
 
-        _forecast_cache[key] = (time.time(), highs, lows)
-        return highs, lows
+        _forecast_cache[key] = (time.time(), highs_out, lows_out)
+        return highs_out, lows_out
+
+
+# ----------- Pre-warm + background refresh -----------
+#
+# Cloud datacenter IPs (like Render's) get aggressively rate-limited by
+# Open-Meteo's free tier. To avoid 429s during the trading loop, we
+# pre-fetch every city's forecast once at startup (sequentially, with a
+# small delay) and refresh in the background every 25 minutes. The
+# trading loop then only ever reads from the in-memory cache.
+
+_PREWARM_DELAY_SEC = 1.5         # spacing between sequential city fetches
+_BACKGROUND_REFRESH_SEC = 25 * 60  # how often to refresh the cache
+
+
+async def prewarm_forecasts(target_date: date | None = None) -> dict:
+    """Sequentially fetch a forecast for every city in CITY_BY_SERIES.
+
+    Spaced out by ~1.5 sec each so we stay well under any per-second
+    rate limit. Total wall-clock: ~30 sec for ~20 unique coords.
+    Returns {"success": N, "total": M}.
+    """
+    if target_date is None:
+        target_date = date.today()
+
+    seen: set[tuple[float, float]] = set()
+    cities: list[tuple[float, float, str]] = []
+    for code, (lat, lon, name) in CITY_BY_SERIES.items():
+        coord = (round(lat, 4), round(lon, 4))
+        if coord in seen:
+            continue
+        seen.add(coord)
+        cities.append((lat, lon, name))
+
+    log.info("weather.prewarm.start", cities=len(cities), date=target_date.isoformat())
+    success = 0
+    for lat, lon, name in cities:
+        try:
+            r = await _fetch_ensemble_temps(lat=lat, lon=lon, target_date=target_date)
+            if r:
+                success += 1
+        except Exception as e:
+            log.warning("weather.prewarm.city_failed", city=name, err=str(e)[:80])
+        await asyncio.sleep(_PREWARM_DELAY_SEC)
+
+    log.info("weather.prewarm.done", success=success, total=len(cities))
+    return {"success": success, "total": len(cities)}
+
+
+async def background_refresh_loop() -> None:
+    """Refresh forecast cache every 25 min. Runs as a background task."""
+    while True:
+        try:
+            await asyncio.sleep(_BACKGROUND_REFRESH_SEC)
+            await prewarm_forecasts()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("weather.background_refresh.error")
 
 
 # ----------- The model -----------
