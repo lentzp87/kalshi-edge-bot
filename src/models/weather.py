@@ -173,11 +173,14 @@ def _parse_strike_from_yes_subtitle(yes_sub_title: str) -> _Strike | None:
 
 # ----------- Open-Meteo client -----------
 
-_OPEN_METEO_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
+_OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
+_OPEN_METEO_STANDARD_URL = "https://api.open-meteo.com/v1/forecast"
 _FORECAST_CACHE_TTL_SEC = 1800   # 30 min - forecasts barely move within that window
 _NEGATIVE_CACHE_TTL_SEC = 120    # backoff after a failed fetch
-# Open-Meteo recommends a User-Agent so they can contact heavy users
-# instead of rate-limiting blindly.
+# Typical std-dev of a 24-hour temperature forecast in F. Used to synthesize
+# a 9-member band around a single deterministic forecast when the ensemble
+# endpoint isn't available (429-rate-limited from cloud IPs).
+_FORECAST_STD_F = 3.0
 _USER_AGENT = "kalshi-edge-bot/0.1 (https://github.com/lentzp87/kalshi-edge-bot)"
 
 # Cache stores (timestamp, highs, lows). On failure, we cache (timestamp, None, None)
@@ -188,30 +191,70 @@ _forecast_locks: dict[str, asyncio.Lock] = {}
 _om_semaphore = asyncio.Semaphore(3)
 
 
+def _synthesize_band(mean: float, std: float = _FORECAST_STD_F) -> list[float]:
+    """Build a 9-point band around a deterministic forecast that approximates
+    a normal distribution. We space points at ±2σ, ±1.5σ, ±1σ, ±0.5σ, 0.
+
+    Empirical CDF over this band gives the same probability as integrating a
+    normal CDF, so downstream `_empirical_p_yes` produces the right answer
+    when we only have a single deterministic forecast (no real ensemble).
+    """
+    offsets = (-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0)
+    return [mean + o * std for o in offsets]
+
+
+async def _fetch_open_meteo(
+    *, url: str, lat: float, lon: float, target_date: date,
+    extra_params: dict | None = None,
+) -> dict | None:
+    """Single HTTP call to Open-Meteo. Returns parsed JSON or None on failure."""
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "temperature_unit": "fahrenheit",
+        "start_date": target_date.isoformat(),
+        "end_date": target_date.isoformat(),
+    }
+    if extra_params:
+        params.update(extra_params)
+    headers = {"User-Agent": _USER_AGENT}
+    try:
+        async with _om_semaphore:
+            async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                return r.json()
+    except Exception as e:
+        log.warning("open_meteo.call_failed", url=url, err=str(e)[:120],
+                    lat=lat, lon=lon)
+        return None
+
+
 async def _fetch_ensemble_temps(
     *, lat: float, lon: float, target_date: date
 ) -> tuple[list[float], list[float]] | None:
-    """Fetch GFS-ensemble daily highs/lows for one city/date.
+    """Fetch daily highs/lows for one city/date.
+
+    Strategy: try the 31-member ensemble endpoint first (best signal). If it
+    fails (typically 429 from cloud IPs), fall back to the standard /forecast
+    endpoint and synthesize a 9-point band around the deterministic value.
 
     Caches positive responses for 30 min and negative responses for 2 min,
-    so a 429 from Open-Meteo doesn't trigger a retry storm.
+    so a 429 storm doesn't trigger a retry storm.
     """
     key = f"{lat:.4f},{lon:.4f},{target_date.isoformat()}"
     now = time.time()
 
-    # Cheap cache hit (positive or negative)
     cached = _forecast_cache.get(key)
     if cached:
         ts, highs, lows = cached
         if highs is None and lows is None:
-            # Negative cache entry; backoff
             if now - ts < _NEGATIVE_CACHE_TTL_SEC:
                 return None
-        else:
-            if now - ts < _FORECAST_CACHE_TTL_SEC:
-                return highs, lows
+        elif now - ts < _FORECAST_CACHE_TTL_SEC:
+            return highs, lows
 
-    # Single-flight: avoid concurrent calls fetching the same key
     lock = _forecast_locks.setdefault(key, asyncio.Lock())
     async with lock:
         cached = _forecast_cache.get(key)
@@ -223,52 +266,64 @@ async def _fetch_ensemble_temps(
             elif time.time() - ts < _FORECAST_CACHE_TTL_SEC:
                 return highs, lows
 
-        params = {
-            "latitude": lat,
-            "longitude": lon,
-            "daily": "temperature_2m_max,temperature_2m_min",
-            "temperature_unit": "fahrenheit",
-            "start_date": target_date.isoformat(),
-            "end_date": target_date.isoformat(),
-            "models": "gfs_seamless",
-        }
-        headers = {"User-Agent": _USER_AGENT}
-        try:
-            async with _om_semaphore:
-                async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
-                    r = await client.get(_OPEN_METEO_URL, params=params)
-                    r.raise_for_status()
-                    payload = r.json()
-        except Exception as e:
-            log.warning("open_meteo.fetch_failed", err=str(e)[:120], lat=lat, lon=lon)
-            _forecast_cache[key] = (time.time(), None, None)  # negative cache
-            return None
+        # ----- Attempt 1: 31-member GFS ensemble (preferred) -----
+        payload = await _fetch_open_meteo(
+            url=_OPEN_METEO_ENSEMBLE_URL, lat=lat, lon=lon, target_date=target_date,
+            extra_params={"models": "gfs_seamless"},
+        )
+        if payload:
+            highs_out: list[float] = []
+            lows_out: list[float] = []
+            daily = payload.get("daily") or {}
+            for k, vals in daily.items():
+                if not isinstance(vals, list) or not vals:
+                    continue
+                v = vals[0]
+                if v is None:
+                    continue
+                try:
+                    f = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if "temperature_2m_max" in k:
+                    highs_out.append(f)
+                elif "temperature_2m_min" in k:
+                    lows_out.append(f)
+            if highs_out or lows_out:
+                _forecast_cache[key] = (time.time(), highs_out, lows_out)
+                log.debug("open_meteo.ensemble_ok", lat=lat, lon=lon,
+                          members_high=len(highs_out), members_low=len(lows_out))
+                return highs_out, lows_out
 
-        highs_out: list[float] = []
-        lows_out: list[float] = []
-        daily = payload.get("daily") or {}
-        for k, vals in daily.items():
-            if not isinstance(vals, list) or not vals:
-                continue
-            v = vals[0]
-            if v is None:
-                continue
+        # ----- Attempt 2: standard deterministic forecast (fallback) -----
+        payload = await _fetch_open_meteo(
+            url=_OPEN_METEO_STANDARD_URL, lat=lat, lon=lon, target_date=target_date,
+        )
+        if payload:
+            daily = payload.get("daily") or {}
+            highs_raw = daily.get("temperature_2m_max") or []
+            lows_raw = daily.get("temperature_2m_min") or []
             try:
-                f = float(v)
+                mean_high = float(highs_raw[0]) if highs_raw and highs_raw[0] is not None else None
+                mean_low = float(lows_raw[0]) if lows_raw and lows_raw[0] is not None else None
             except (TypeError, ValueError):
-                continue
-            if "temperature_2m_max" in k:
-                highs_out.append(f)
-            elif "temperature_2m_min" in k:
-                lows_out.append(f)
+                mean_high = mean_low = None
 
-        if not highs_out and not lows_out:
-            log.warning("open_meteo.empty_payload", lat=lat, lon=lon)
-            _forecast_cache[key] = (time.time(), None, None)
-            return None
+            highs_band = _synthesize_band(mean_high) if mean_high is not None else []
+            lows_band = _synthesize_band(mean_low) if mean_low is not None else []
 
-        _forecast_cache[key] = (time.time(), highs_out, lows_out)
-        return highs_out, lows_out
+            if highs_band or lows_band:
+                _forecast_cache[key] = (time.time(), highs_band, lows_band)
+                log.info("open_meteo.standard_ok", lat=lat, lon=lon,
+                         mean_high=mean_high, mean_low=mean_low,
+                         note="synthesized 9-pt band; ensemble unavailable")
+                return highs_band, lows_band
+
+        # Both endpoints failed - negative-cache and back off
+        log.warning("open_meteo.both_failed", lat=lat, lon=lon,
+                    date=target_date.isoformat())
+        _forecast_cache[key] = (time.time(), None, None)
+        return None
 
 
 # ----------- Pre-warm + background refresh -----------
