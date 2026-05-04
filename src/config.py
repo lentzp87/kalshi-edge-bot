@@ -13,6 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class ScannerConfig(BaseModel):
     loop_interval_seconds: int = 30
+    max_pages_per_scan: int = 3
     price_min: float = 0.20
     price_max: float = 0.80
     max_spread_cents: int = 4

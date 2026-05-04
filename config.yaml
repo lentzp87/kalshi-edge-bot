@@ -4,6 +4,7 @@ bankroll_usd: 2000
 
 scanner:
   loop_interval_seconds: 30
+  max_pages_per_scan: 3      # 3 pages * 200/page = 600 markets per scan, ~30s
   price_min: 0.20            # only trade markets between 20¢ and 80¢
   price_max: 0.80
   max_spread_cents: 4        # ≤ 4¢ between bid and ask
