@@ -108,28 +108,16 @@ async def amain() -> None:
     # "Climate and Weather", etc.) — replaces the brittle ticker-prefix guesses.
     await client.load_series_categories()
 
-    # Dynamic discovery: build the list of series_tickers to scan from the
-    # live catalog instead of relying on the hardcoded list in config.yaml.
-    # This guarantees we catch every daily weather series Kalshi publishes,
-    # even ones added after this code was written.
-    if cfg.models.weather.enabled:
-        discovered = client.discover_series(
-            categories=["Climate and Weather"],
-            frequencies=["daily"],
-            exclude_prefixes=["RAIN", "KXRAIN"],  # temp-only model for now
-        )
-        if discovered:
-            log.info("scanner.dynamic_series", count=len(discovered),
-                     source="discover daily Climate-and-Weather")
-            cfg.scanner.series_tickers = discovered
+    # Dynamic discovery: build the list of series_tickers to scan.
+    discovered: list[str] = []
+    if cfg.models.sports.enabled:
+        from .models.sports import SERIES_REGISTRY as SPORTS_SERIES
+        sports = list(SPORTS_SERIES.keys())
+        log.info("scanner.dynamic_series.sports", count=len(sports), series=sports)
+        discovered += sports
 
-    # Pre-warm the weather forecast cache so the trading loop never has
-    # to call Open-Meteo (avoids 429 rate-limits on cloud datacenter IPs).
-    # Then keep it fresh in the background every 25 min.
-    if cfg.models.weather.enabled:
-        from .models.weather import prewarm_forecasts, background_refresh_loop
-        await prewarm_forecasts()
-        asyncio.create_task(background_refresh_loop())
+    if discovered:
+        cfg.scanner.series_tickers = discovered
 
     journal = Journal()
     risk = RiskEngine()

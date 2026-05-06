@@ -60,7 +60,10 @@ class Journal:
     def __init__(self) -> None:
         env = env_config()
         Path(env.data_dir).mkdir(parents=True, exist_ok=True)
-        self.path = Path(env.data_dir) / "trades.db"
+        # v2 DB = fresh slate after weather pivot. The old trades.db is
+        # left on disk (Render persistent volume) but no longer read or
+        # written, so the dashboard shows only sports-era trades.
+        self.path = Path(env.data_dir) / "trades_sports.db"
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.executescript(SCHEMA)
         self.conn.commit()

@@ -50,6 +50,10 @@ class Executor:
         self.open: dict[str, OpenPosition] = {}
 
     async def submit(self, signal: TradeSignal, market: Market) -> None:
+        # One position per ticker — never stack 5x exposure on the same thesis.
+        if signal.ticker in self.open:
+            log.debug("exec.skip.already_open", ticker=signal.ticker)
+            return
         if not self.risk.approve(signal):
             return
 

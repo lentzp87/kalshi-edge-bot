@@ -5,15 +5,11 @@ from .crypto import CryptoModel
 from .econ import EconModel
 from .politics import PoliticsModel
 from .sports import SportsModel
-from .weather import WeatherModel
 
 # Kalshi categories map to model classes.
-# Add new mappings as you build new models.
 REGISTRY: dict[str, type[Model]] = {
-    "Weather": WeatherModel,
-    "Climate and Weather": WeatherModel,
-    "Economics": EconModel,
     "Sports": SportsModel,
+    "Economics": EconModel,
     "Crypto": CryptoModel,
     "Politics": PoliticsModel,
 }

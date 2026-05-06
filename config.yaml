@@ -73,16 +73,12 @@ execution:
   order_type: limit          # never market orders
   scale_in_chunks: 2         # split each entry into 2 child orders
 
-# Per-category enables. Start with weather only.
+# Per-category enables.
 models:
-  weather:
-    enabled: true
-    horizon_hours: 24
+  sports:
+    enabled: true            # late-game sports model — see src/models/sports.py
   econ:
     enabled: false
-    sources: ["bls", "bea"]
-  sports:
-    enabled: false           # efficient market — leave off until you have edge
   crypto:
     enabled: false
   politics:

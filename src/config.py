@@ -54,9 +54,8 @@ class ModelToggle(BaseModel):
 
 
 class ModelsConfig(BaseModel):
-    weather: ModelToggle = Field(default_factory=lambda: ModelToggle(enabled=True))
-    econ: ModelToggle = Field(default_factory=ModelToggle)
     sports: ModelToggle = Field(default_factory=ModelToggle)
+    econ: ModelToggle = Field(default_factory=ModelToggle)
     crypto: ModelToggle = Field(default_factory=ModelToggle)
     politics: ModelToggle = Field(default_factory=ModelToggle)
 
