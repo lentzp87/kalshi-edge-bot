@@ -164,6 +164,9 @@ class SportsModel:
 
         parsed = parse_ticker(market)
         if not parsed:
+            log.info("sports.skip.parse_failed",
+                     ticker=market.ticker,
+                     event_ticker=market.raw.get("event_ticker", ""))
             return None
 
         comp = await find_live_game(
@@ -172,13 +175,13 @@ class SportsModel:
             home_abbr=parsed.home_abbr,
         )
         if not comp:
-            log.debug("sports.skip.no_espn_game",
+            log.info("sports.skip.no_espn_game",
                       ticker=market.ticker,
                       away=parsed.away_abbr, home=parsed.home_abbr)
             return None
 
         if not parsed.is_late_game(comp):
-            log.debug("sports.skip.not_late_game",
+            log.info("sports.skip.not_late_game",
                       ticker=market.ticker, state=comp["state"],
                       period=comp["period"], clock=comp["clock"])
             return None
