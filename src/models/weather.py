@@ -180,7 +180,10 @@ _NEGATIVE_CACHE_TTL_SEC = 120    # backoff after a failed fetch
 # Typical std-dev of a 24-hour temperature forecast in F. Used to synthesize
 # a 9-member band around a single deterministic forecast when the ensemble
 # endpoint isn't available (429-rate-limited from cloud IPs).
-_FORECAST_STD_F = 3.0
+# Bumped from 3.0 -> 5.0 after observing realized edge << predicted edge:
+# narrower bands made the model overconfident on tail strikes. Real 24h
+# temp forecast errors are 4-6F std-dev empirically.
+_FORECAST_STD_F = 5.0
 _USER_AGENT = "kalshi-edge-bot/0.1 (https://github.com/lentzp87/kalshi-edge-bot)"
 
 # Cache stores (timestamp, highs, lows). On failure, we cache (timestamp, None, None)

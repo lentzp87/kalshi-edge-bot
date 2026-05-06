@@ -54,7 +54,7 @@ scanner:
     - KXLOWTNYC     # NYC
 
 decision:
-  min_edge: 0.06             # 6 percentage points minimum
+  min_edge: 0.12             # 12pp minimum (raised from 6 — realized edge was 30-60% of predicted)
   kelly_fraction: 0.25       # fraction of full Kelly to size by
   min_entry_price: 0.55      # only enter when our side is priced >= 55c (favored)
 
@@ -68,7 +68,7 @@ risk:
 
 execution:
   take_profit_pct: 0.20      # exit at +20% on the position
-  stop_loss_pct: 0.12        # exit at -12% on the position
+  stop_loss_pct: 0.20        # raised from 12 — weather markets noise out 10-15% then mean-revert
   time_exit_minutes: 90      # if neither hit, kill the position after 90 min
   order_type: limit          # never market orders
   scale_in_chunks: 2         # split each entry into 2 child orders
