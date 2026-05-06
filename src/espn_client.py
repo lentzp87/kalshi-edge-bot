@@ -144,28 +144,65 @@ def parse_competition(event: dict) -> dict | None:
         return None
 
 
-async def find_live_game(
-    sport_key: str, *, away_abbr: str, home_abbr: str
-) -> dict | None:
-    """Find a specific game on today's scoreboard by team abbreviations.
+# Kalshi uses some team abbreviations that differ from ESPN. Map Kalshi -> ESPN.
+# Add new entries when sports.skip.no_espn_game logs reveal a fresh mismatch.
+KALSHI_TO_ESPN_ABBR: dict[str, str] = {
+    # MLB
+    "AZ":  "ARI",   # Arizona D-backs
+    "CWS": "CHW",   # Chicago White Sox
+    "ATH": "OAK",   # Athletics (Kalshi uses ATH, ESPN uses OAK)
+    # NBA
+    "NYK": "NY",    # NY Knicks
+    "SAS": "SA",    # SA Spurs
+    "GSW": "GS",    # Warriors
+    "NOP": "NO",    # Pelicans
+    "UTA": "UTAH",  # Utah Jazz
+    # NHL
+    "TBL": "TB",    # Tampa Bay Lightning
+    "VGK": "VGK",   # OK as-is
+    "NJD": "NJ",    # NJ Devils
+    "LAK": "LA",    # LA Kings
+    "SJS": "SJ",    # San Jose Sharks
+}
 
-    Returns the parsed competition dict (see parse_competition), or None.
-    Match is case-insensitive and tolerates either ordering.
+
+def _normalize_abbr(abbr: str) -> str:
+    a = (abbr or "").upper()
+    return KALSHI_TO_ESPN_ABBR.get(a, a)
+
+
+async def find_live_game(
+    sport_key: str, *, away_abbr: str, home_abbr: str,
+    target_date_utc: str | None = None,
+) -> dict | None:
+    """Find a specific game on today's scoreboard.
+
+    Match logic: team abbreviations (with Kalshi->ESPN translation) AND,
+    if target_date_utc is provided, the game date in UTC. The date filter
+    prevents matching tomorrow's same-teams game when both appear on the
+    rolling scoreboard window.
+
+    target_date_utc format: 'YYYY-MM-DD'.
     """
     sb = await fetch_scoreboard(sport_key)
     if not sb:
         return None
-    aw = (away_abbr or "").upper()
-    hm = (home_abbr or "").upper()
+    aw = _normalize_abbr(away_abbr)
+    hm = _normalize_abbr(home_abbr)
     for ev in sb.get("events", []):
         c = parse_competition(ev)
         if not c:
             continue
-        ca, ch = c["away"]["abbr"].upper(), c["home"]["abbr"].upper()
-        # Accept either orientation in case our parsing of the Kalshi
-        # ticker put away/home in the wrong slot.
-        if (ca == aw and ch == hm) or (ca == hm and ch == aw):
-            return c
+        ca = _normalize_abbr(c["away"]["abbr"])
+        ch = _normalize_abbr(c["home"]["abbr"])
+        if not ((ca == aw and ch == hm) or (ca == hm and ch == aw)):
+            continue
+        # Optional date filter
+        if target_date_utc:
+            ev_date = (ev.get("date") or "")[:10]  # ISO 'YYYY-MM-DDT...'
+            if ev_date and ev_date != target_date_utc:
+                continue
+        return c
     return None
 
 

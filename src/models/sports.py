@@ -1,94 +1,68 @@
-"""Late-game sports model.
+"""Pregame sports moneyline model.
 
-Edge thesis
------------
-Kalshi's market price for a given team to win the game lags ESPN's
-real-time win-probability model during in-game volatility. We trade
-the gap whenever:
+Edge thesis (pregame CLV bot)
+-----------------------------
+We compare Kalshi's executable YES/NO ask to the de-vigged sportsbook
+consensus. We trade only when the gap is large enough to overcome the
+spread + Kalshi's taker fee + a slippage buffer.
 
-    abs(ESPN_WP_for_our_team - Kalshi_market_price) >= min_edge
+Pipeline:
+    1. Parse Kalshi sports market ticker -> sport, date, away, home, side.
+    2. Confirm the matching ESPN game is PREGAME (state == "pre") and
+       in our trading window (5-240 min before tip).
+    3. Pull moneyline from sportsbook(s) — multi-book consensus via
+       The Odds API if ODDS_API_KEY is set, else ESPN pickcenter.
+    4. De-vig to fair probability for each side.
+    5. Run a basic injury sanity check (ESPN injuries field).
+    6. Return p_yes for the side this Kalshi market represents.
 
-We restrict to LATE GAME ONLY because that's when:
-  (a) WP estimates are tight (low variance — score and time dominate)
-  (b) Kalshi prices most often misprice (less time for arbs to clear)
+Decision-layer responsibility (in src/decision.py):
+    7. Compute net edge using *executable* price (not midpoint),
+       subtracting fee_buffer and a slippage buffer.
+    8. Apply min_net_edge threshold and Kelly-cap sizing.
 
-Late-game cutoffs by sport:
-  MLB: top/bottom of 7th inning or later
-  NBA: 4th quarter, < 8 minutes remaining
-  NHL: 3rd period
-  NFL: 4th quarter
-
-We *don't* run a WP model ourselves — ESPN's `homeWinPercentage` is
-the gold-standard WP that broadcast graphics use, so we just consume it.
+This file is the model only; sizing and fee math live in decision.py.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import structlog
 
 from ..config import file_config
-from ..espn_client import find_live_game, latest_home_win_prob
+from ..espn_client import fetch_scoreboard, find_live_game, parse_competition
+from ..injury_check import has_risky_injury
 from ..kalshi_client import Market
+from ..odds_provider import fair_probability_for_game
 from .base import ProbabilityEstimate
 
 log = structlog.get_logger(__name__)
 
 
-# Map a Kalshi series_ticker to (espn sport key, "late game" predicate).
-def _is_mlb_late(c: dict) -> bool:
-    return c["state"] == "in" and c["period"] >= 7
+# Trading window in minutes-to-tipoff:
+#   too early (>240 min)  -> sportsbook lines still volatile
+#   too late  (<5 min)    -> live lineup chaos / liquidity drain
+PREGAME_MAX_MIN = 240
+PREGAME_MIN_MIN = 5
 
 
-def _is_nba_late(c: dict) -> bool:
-    if c["state"] != "in":
-        return False
-    if c["period"] < 4:
-        return False
-    secs = _clock_to_seconds(c["clock"])
-    return secs is not None and secs <= 8 * 60
-
-
-def _is_nhl_late(c: dict) -> bool:
-    return c["state"] == "in" and c["period"] >= 3
-
-
-def _is_nfl_late(c: dict) -> bool:
-    return c["state"] == "in" and c["period"] >= 4
-
-
-def _clock_to_seconds(clk: str) -> int | None:
-    if not clk:
-        return None
-    s = clk.strip()
-    m = re.match(r"^(\d+):(\d{2})$", s)
-    if m:
-        return int(m.group(1)) * 60 + int(m.group(2))
-    try:
-        return int(float(s))
-    except ValueError:
-        return None
-
-
-SERIES_REGISTRY: dict[str, tuple[str, Any]] = {
-    "KXMLBGAME":   ("mlb", _is_mlb_late),
-    "KXNBAGAME":   ("nba", _is_nba_late),
-    "KXNHLGAME":   ("nhl", _is_nhl_late),
-    "KXNFLGAME":   ("nfl", _is_nfl_late),
+SERIES_REGISTRY: dict[str, str] = {
+    # Pregame-only model. Kalshi series -> ESPN sport key.
+    "KXNBAGAME":   "nba",
+    "KXNFLGAME":   "nfl",
+    "KXMLBGAME":   "mlb",   # supported but the spec recommends NBA/NFL first
+    "KXNHLGAME":   "nhl",
 }
 
 
-@dataclass
-class _ParsedTicker:
-    sport: str
-    series: str
-    away_abbr: str
-    home_abbr: str
-    our_team_abbr: str
-    is_late_game: Any
+_MONTH_NUM = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
 
 
 _TICKER_RE = re.compile(
@@ -100,27 +74,45 @@ _TICKER_RE = re.compile(
 )
 
 
-def _split_event_code(code: str) -> tuple[str, str] | None:
-    """Pull away/home team abbreviations out of the event code.
+@dataclass
+class _ParsedTicker:
+    sport: str
+    series: str
+    away_abbr: str
+    home_abbr: str
+    our_team_abbr: str
+    game_date_utc: str | None = None
 
-    Examples:
-        '26MAY082210ATLLAD' -> ('ATL', 'LAD')
-        '26MAY11DETCLE'     -> ('DET', 'CLE')
 
-    Strategy: strip the leading date prefix (digits + 3-letter month +
-    optional more digits), then try splits of the remaining team-letters.
-    """
-    m = re.match(r"^\d{2}[A-Z]{3}\d+(?P<teams>[A-Z]+)$", code)
+def _split_event_code(code: str) -> tuple[str, str, str | None] | None:
+    """Pull (away, home, YYYY-MM-DD) out of the event-code segment."""
+    m = re.match(
+        r"^(?P<yy>\d{2})(?P<mon>[A-Z]{3})(?P<rest>\d+)(?P<teams>[A-Z]+)$",
+        code,
+    )
     if not m:
         return None
     teams = m.group("teams")
     n = len(teams)
-    # Try splits, preferring symmetric 3+3 then variants
+    pair = None
     for left in (3, 2, 4):
         right = n - left
         if 2 <= right <= 4:
-            return teams[:left], teams[left:]
-    return None
+            pair = (teams[:left], teams[left:])
+            break
+    if not pair:
+        return None
+    date_str = None
+    try:
+        yy = int(m.group("yy"))
+        mon = _MONTH_NUM.get(m.group("mon"))
+        rest = m.group("rest")
+        dd = int(rest[:2]) if len(rest) >= 2 else int(rest)
+        if mon and 1 <= dd <= 31:
+            date_str = f"{2000 + yy:04d}-{mon:02d}-{dd:02d}"
+    except (ValueError, IndexError):
+        pass
+    return pair[0], pair[1], date_str
 
 
 def parse_ticker(market: Market) -> _ParsedTicker | None:
@@ -132,23 +124,68 @@ def parse_ticker(market: Market) -> _ParsedTicker | None:
     series = m.group("series")
     if series not in SERIES_REGISTRY:
         return None
-    sport, late_pred = SERIES_REGISTRY[series]
+    sport = SERIES_REGISTRY[series]
     our_team = m.group("our_team")
 
     parts = event_ticker.split("-")
     if len(parts) < 2:
         return None
-    eventcode = parts[1]
-    team_pair = _split_event_code(eventcode)
-    if not team_pair:
+    parsed = _split_event_code(parts[1])
+    if not parsed:
         return None
-    a, b = team_pair
+    a, b, game_date = parsed
     return _ParsedTicker(
         sport=sport, series=series,
         away_abbr=a, home_abbr=b,
         our_team_abbr=our_team,
-        is_late_game=late_pred,
+        game_date_utc=game_date,
     )
+
+
+def _minutes_to_tip(comp: dict, scoreboard_ev: dict | None) -> float | None:
+    """Best-effort: parse the event's start time from ESPN data and
+    return minutes from now (UTC) until tip. Negative if game already
+    started.
+    """
+    iso = None
+    if scoreboard_ev:
+        iso = scoreboard_ev.get("date")
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        delta = (dt - datetime.now(timezone.utc)).total_seconds() / 60
+        return delta
+    except (ValueError, TypeError):
+        return None
+
+
+async def _find_event_with_raw(
+    sport_key: str, *, away: str, home: str, date_utc: str | None,
+) -> tuple[dict | None, dict | None]:
+    """Like find_live_game but also returns the raw event dict so we
+    can pull the start time. Returns (parsed_competition, raw_event).
+    """
+    sb = await fetch_scoreboard(sport_key)
+    if not sb:
+        return None, None
+    from ..espn_client import _normalize_abbr  # local import to keep API clean
+    aw = _normalize_abbr(away)
+    hm = _normalize_abbr(home)
+    for ev in sb.get("events", []):
+        c = parse_competition(ev)
+        if not c:
+            continue
+        ca = _normalize_abbr(c["away"]["abbr"])
+        ch = _normalize_abbr(c["home"]["abbr"])
+        if not ((ca == aw and ch == hm) or (ca == hm and ch == aw)):
+            continue
+        if date_utc:
+            ev_date = (ev.get("date") or "")[:10]
+            if ev_date and ev_date != date_utc:
+                continue
+        return c, ev
+    return None, None
 
 
 @dataclass
@@ -169,63 +206,79 @@ class SportsModel:
                      event_ticker=market.raw.get("event_ticker", ""))
             return None
 
-        comp = await find_live_game(
+        comp, raw_ev = await _find_event_with_raw(
             parsed.sport,
-            away_abbr=parsed.away_abbr,
-            home_abbr=parsed.home_abbr,
+            away=parsed.away_abbr,
+            home=parsed.home_abbr,
+            date_utc=parsed.game_date_utc,
         )
         if not comp:
             log.info("sports.skip.no_espn_game",
-                      ticker=market.ticker,
-                      away=parsed.away_abbr, home=parsed.home_abbr)
+                     ticker=market.ticker,
+                     away=parsed.away_abbr, home=parsed.home_abbr,
+                     date=parsed.game_date_utc)
             return None
 
-        if not parsed.is_late_game(comp):
-            log.info("sports.skip.not_late_game",
-                      ticker=market.ticker, state=comp["state"],
-                      period=comp["period"], clock=comp["clock"])
+        # Pregame-only filter
+        if comp["state"] != "pre":
+            log.info("sports.skip.not_pregame",
+                     ticker=market.ticker, state=comp["state"], period=comp["period"])
             return None
 
-        home_wp = await latest_home_win_prob(parsed.sport, comp["id"])
-        if home_wp is None:
-            log.info("sports.skip.no_wp_yet", ticker=market.ticker, sport=parsed.sport)
+        mins_to_tip = _minutes_to_tip(comp, raw_ev)
+        if mins_to_tip is None:
+            log.info("sports.skip.no_start_time", ticker=market.ticker)
+            return None
+        if mins_to_tip < PREGAME_MIN_MIN:
+            log.info("sports.skip.too_close_to_tip",
+                     ticker=market.ticker, mins_to_tip=round(mins_to_tip, 1))
+            return None
+        if mins_to_tip > PREGAME_MAX_MIN:
+            log.info("sports.skip.too_far_from_tip",
+                     ticker=market.ticker, mins_to_tip=round(mins_to_tip, 1))
             return None
 
+        # Injury / news sanity check (skip if any active risky-status player)
+        risky, listed = await has_risky_injury(parsed.sport, comp["id"])
+        if risky:
+            log.info("sports.skip.injuries_listed",
+                     ticker=market.ticker, count=len(listed),
+                     sample=listed[:3])
+            return None
+
+        # Get fair probability from sportsbook(s)
+        fair = await fair_probability_for_game(
+            sport=parsed.sport,
+            espn_event_id=comp["id"],
+            kalshi_away=parsed.away_abbr,
+            kalshi_home=parsed.home_abbr,
+            date_utc=parsed.game_date_utc,
+        )
+        if not fair:
+            log.info("sports.skip.no_sportsbook_odds",
+                     ticker=market.ticker, sport=parsed.sport)
+            return None
+        fair_home, fair_away, provider = fair
+
+        # Map to our side
         our_is_home = (parsed.our_team_abbr.upper() == comp["home"]["abbr"].upper())
-        p_yes = home_wp if our_is_home else (1.0 - home_wp)
+        # Translate via ESPN abbrev map for the comparison
+        from ..espn_client import _normalize_abbr
+        if not our_is_home:
+            our_is_home = _normalize_abbr(parsed.our_team_abbr) == _normalize_abbr(comp["home"]["abbr"])
+        p_yes = fair_home if our_is_home else fair_away
         p_yes = max(0.02, min(0.98, p_yes))
 
-        confidence = self._late_game_confidence(parsed.sport, comp)
+        # Confidence: sportsbook consensus is reasonably tight for major
+        # leagues. Cap at 0.8 so the Kelly fraction stays restrained.
+        confidence = 0.75
 
-        side_str = "home" if our_is_home else "away"
-        score = f"{comp['away']['abbr']} {comp['away']['score']} @ {comp['home']['abbr']} {comp['home']['score']}"
+        side = "home" if our_is_home else "away"
+        score = f"{comp['away']['abbr']}@{comp['home']['abbr']}"
         reason = (
-            f"{parsed.sport.upper()} {comp['short_detail']} {score} | "
-            f"ESPN home_wp={home_wp:.3f} our={parsed.our_team_abbr}"
-            f"({side_str}) -> p_yes={p_yes:.3f} conf={confidence:.2f}"
+            f"{parsed.sport.upper()} pregame {score} | "
+            f"book[{provider}] fair_home={fair_home:.3f} fair_away={fair_away:.3f} | "
+            f"our={parsed.our_team_abbr}({side}) p_yes={p_yes:.3f} | "
+            f"tip in {mins_to_tip:.0f}min"
         )
         return ProbabilityEstimate(p_yes=p_yes, confidence=confidence, reason=reason)
-
-    @staticmethod
-    def _late_game_confidence(sport: str, comp: dict) -> float:
-        if sport == "mlb":
-            inning = comp["period"]
-            if inning >= 9:
-                return 0.85
-            if inning == 8:
-                return 0.75
-            return 0.65
-        if sport == "nba":
-            secs = _clock_to_seconds(comp["clock"]) or 999
-            if secs <= 60:
-                return 0.85
-            if secs <= 180:
-                return 0.75
-            return 0.65
-        if sport == "nhl":
-            secs = _clock_to_seconds(comp["clock"]) or 999
-            return 0.80 if secs <= 5 * 60 else 0.65
-        if sport == "nfl":
-            secs = _clock_to_seconds(comp["clock"]) or 999
-            return 0.80 if secs <= 5 * 60 else 0.65
-        return 0.6
