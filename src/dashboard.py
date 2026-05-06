@@ -1,4 +1,4 @@
-"""FastAPI dashboard.
+"""FastAPI dashboard with sports CLV breakdowns.
 
 Endpoints:
   GET /health              liveness (used by Render health check)
@@ -6,16 +6,14 @@ Endpoints:
   GET /pnl                 daily P&L for last 30 days
   GET /trades?limit=100    recent trade log
   GET /edge                realized vs predicted edge buckets
-  GET /stats               aggregate metrics (clean trades only)
+  GET /stats               aggregate metrics + per-dimension breakdowns
   GET /                    full dashboard UI (auto-refreshing)
-
-In production this is mounted by src/main.py inside the same process as
-the trading loop. For standalone local runs: `python -m src.dashboard`.
 """
 
 from __future__ import annotations
 
 import os
+import re
 from collections import defaultdict
 
 import uvicorn
@@ -32,15 +30,117 @@ _journal = Journal()
 # ----- Helpers --------------------------------------------------------------
 
 def _is_clean_trade(t: dict) -> bool:
-    """Filter out trades with corrupted P&L from the early-deploy bug era.
-    A long can never lose more than ~size_usd (plus a small fee buffer).
-    """
+    """Filter out trades with corrupted P&L from the early-deploy bug era."""
     pnl = t.get("pnl_usd")
     size = t.get("size_usd") or 0
     if pnl is None:
         return False
-    # Generous bound: anything beyond 3x position size is corrupt data.
     return abs(pnl) <= max(size * 3.0, 200.0)
+
+
+def _sport_from_ticker(ticker: str) -> str:
+    """Pull a friendly sport label from the Kalshi market ticker."""
+    if not ticker:
+        return "?"
+    series = ticker.split("-", 1)[0].upper()
+    mapping = {
+        "KXNBAGAME": "NBA",
+        "KXNFLGAME": "NFL",
+        "KXMLBGAME": "MLB",
+        "KXNHLGAME": "NHL",
+    }
+    return mapping.get(series, series)
+
+
+_RE_PROVIDER = re.compile(r"book\[([^\]]+)\]")
+_RE_BOOKS = re.compile(r"\((\d+)\s+books?\)")
+_RE_OUR_SIDE = re.compile(r"our=\w+\((home|away)\)")
+_RE_TIP_MIN = re.compile(r"tip in ([\d.]+)min")
+_RE_NET_EDGE = re.compile(r"net_edge=([+-]?[\d.]+)")
+_RE_GROSS = re.compile(r"gross ([+-]?[\d.]+)")
+
+
+def _parse_reason(reason: str | None) -> dict:
+    """Extract structured signal-time fields from the journal reason string."""
+    out: dict = {}
+    if not reason:
+        return out
+    if m := _RE_PROVIDER.search(reason):
+        provider_full = m.group(1)
+        # "odds_api (8 books)" or "espn:Draft Kings"
+        if provider_full.startswith("odds_api"):
+            out["provider"] = "odds_api"
+            if bm := _RE_BOOKS.search(provider_full):
+                out["books"] = int(bm.group(1))
+        elif provider_full.startswith("espn"):
+            out["provider"] = "espn"
+        else:
+            out["provider"] = provider_full
+    if m := _RE_OUR_SIDE.search(reason):
+        out["our_side"] = m.group(1)  # "home" or "away"
+    if m := _RE_TIP_MIN.search(reason):
+        try:
+            out["mins_to_tip"] = float(m.group(1))
+        except ValueError:
+            pass
+    if m := _RE_NET_EDGE.search(reason):
+        try:
+            out["net_edge"] = float(m.group(1))
+        except ValueError:
+            pass
+    if m := _RE_GROSS.search(reason):
+        try:
+            out["gross_edge"] = float(m.group(1))
+        except ValueError:
+            pass
+    return out
+
+
+def _entry_price_bucket(fill_price: float | None) -> str:
+    if fill_price is None:
+        return "?"
+    p = fill_price
+    if p < 0.55: return "<55"
+    if p < 0.65: return "55-65"
+    if p < 0.75: return "65-75"
+    if p < 0.85: return "75-85"
+    return "85+"
+
+
+def _tip_bucket(mins: float | None) -> str:
+    if mins is None:
+        return "?"
+    if mins < 30: return "0-30m"
+    if mins < 60: return "30-60m"
+    if mins < 120: return "1-2h"
+    if mins < 240: return "2-4h"
+    return "4h+"
+
+
+def _bucket_aggregate(rows: list[dict], key_fn) -> list[dict]:
+    """Group rows by key_fn(row) and return [{key, n, wins, pnl, avg_pnl, win_rate}]."""
+    bucket: dict = defaultdict(lambda: {"n": 0, "wins": 0, "pnl": 0.0})
+    for r in rows:
+        k = key_fn(r)
+        if k is None:
+            continue
+        b = bucket[k]
+        b["n"] += 1
+        b["pnl"] += r["pnl_usd"]
+        if r["pnl_usd"] > 0:
+            b["wins"] += 1
+    out = []
+    for k, v in bucket.items():
+        n = v["n"]
+        out.append({
+            "key": str(k),
+            "n": n,
+            "wins": v["wins"],
+            "pnl": round(v["pnl"], 2),
+            "avg_pnl": round(v["pnl"] / n, 2) if n else 0.0,
+            "win_rate": round(v["wins"] / n, 3) if n else 0.0,
+        })
+    return sorted(out, key=lambda x: -abs(x["pnl"]))
 
 
 # ----- Endpoints ------------------------------------------------------------
@@ -72,29 +172,51 @@ def edge() -> dict:
 
 @app.get("/stats")
 def stats() -> dict:
-    """Aggregate metrics. Filters out the corrupt early-deploy trades."""
     raw = _journal.recent_trades(limit=10000)
     closed = [t for t in raw if t.get("closed_ts")]
     clean = [t for t in closed if _is_clean_trade(t)]
 
-    if not clean:
+    # Pre-compute parsed signal fields once per trade
+    enriched: list[dict] = []
+    for t in clean:
+        meta = _parse_reason(t.get("reason"))
+        enriched.append({
+            **t,
+            "_sport": _sport_from_ticker(t.get("ticker", "")),
+            "_provider": meta.get("provider"),
+            "_books": meta.get("books"),
+            "_our_side": meta.get("our_side"),
+            "_mins_to_tip": meta.get("mins_to_tip"),
+            "_net_edge": meta.get("net_edge"),
+            "_gross_edge": meta.get("gross_edge"),
+            "_entry_bucket": _entry_price_bucket(t.get("fill_price")),
+            "_tip_bucket": _tip_bucket(meta.get("mins_to_tip")),
+            "_fav_dog": (
+                "favorite" if (t.get("fill_price") or 0) >= 0.5 else "underdog"
+            ),
+        })
+
+    if not enriched:
         return {
             "total_pnl": 0.0, "n_trades": 0, "n_wins": 0, "n_losses": 0,
             "win_rate": 0.0, "avg_pnl": 0.0, "avg_edge_bp": 0.0,
             "best_trade": 0.0, "worst_trade": 0.0,
             "open_positions": len(_journal.open_positions()),
-            "filtered_out": len(closed) - len(clean),
-            "pnl_curve": [], "by_category": {}, "edge_calibration": [],
+            "filtered_out": len(closed),
+            "pnl_curve": [], "edge_calibration": [],
+            "by_sport": [], "by_provider": [], "by_our_side": [],
+            "by_fav_dog": [], "by_entry_bucket": [], "by_tip_bucket": [],
+            "by_exit_reason": [], "by_series": [],
         }
 
-    chronological = sorted(clean, key=lambda t: t["closed_ts"])
+    chronological = sorted(enriched, key=lambda t: t["closed_ts"])
     total = sum(t["pnl_usd"] for t in chronological)
     wins = [t for t in chronological if t["pnl_usd"] > 0]
     losses = [t for t in chronological if t["pnl_usd"] <= 0]
     n = len(chronological)
     avg_edge_pp = sum((t.get("edge") or 0) for t in chronological) / n
 
-    # Cumulative curve over closed trades
+    # Cumulative curve
     curve, cum = [], 0.0
     for t in chronological:
         cum += t["pnl_usd"]
@@ -105,48 +227,26 @@ def stats() -> dict:
             "ticker": t.get("ticker", ""),
         })
 
-    # Edge calibration: bucket trades by predicted edge (5pp buckets).
-    bucket_data: dict[int, dict] = defaultdict(lambda: {"n": 0, "predicted": 0.0, "realized": 0.0, "wins": 0})
+    # Edge calibration (5pp buckets of predicted edge)
+    bucket_data: dict = defaultdict(lambda: {"n": 0, "predicted": 0.0, "realized": 0.0, "wins": 0})
     for t in chronological:
         e = (t.get("edge") or 0)
         size = t.get("size_usd") or 0
-        # Predicted dollar edge = edge_pp * size_usd
-        predicted_usd = e * size
-        b = int(round(e * 100 / 5)) * 5  # nearest 5pp bucket
+        b = int(round(e * 100 / 5)) * 5
         bd = bucket_data[b]
         bd["n"] += 1
-        bd["predicted"] += predicted_usd
+        bd["predicted"] += e * size
         bd["realized"] += t["pnl_usd"]
         if t["pnl_usd"] > 0:
             bd["wins"] += 1
     edge_calibration = [
         {
-            "bucket_pp": k,
-            "n": v["n"],
+            "bucket_pp": k, "n": v["n"],
             "predicted": round(v["predicted"] / v["n"], 2),
             "realized": round(v["realized"] / v["n"], 2),
             "win_rate": round(v["wins"] / v["n"], 3),
         }
         for k, v in sorted(bucket_data.items())
-    ]
-
-    # Per-ticker-prefix (proxy for category) breakdown
-    by_cat: dict[str, dict] = defaultdict(lambda: {"n": 0, "pnl": 0.0, "wins": 0})
-    for t in chronological:
-        ticker = t.get("ticker", "")
-        # First segment of ticker = series_ticker (e.g. KXHIGHTDAL)
-        series = ticker.split("-", 1)[0] if ticker else "UNKNOWN"
-        bd = by_cat[series]
-        bd["n"] += 1
-        bd["pnl"] += t["pnl_usd"]
-        if t["pnl_usd"] > 0:
-            bd["wins"] += 1
-    by_category = [
-        {
-            "series": k, "n": v["n"], "pnl": round(v["pnl"], 2),
-            "win_rate": round(v["wins"] / v["n"], 3),
-        }
-        for k, v in sorted(by_cat.items(), key=lambda kv: -abs(kv[1]["pnl"]))
     ]
 
     return {
@@ -162,8 +262,19 @@ def stats() -> dict:
         "open_positions": len(_journal.open_positions()),
         "filtered_out": len(closed) - len(clean),
         "pnl_curve": curve,
-        "by_category": by_category,
         "edge_calibration": edge_calibration,
+        # Per-dimension breakdowns
+        "by_sport": _bucket_aggregate(chronological, lambda r: r["_sport"]),
+        "by_provider": _bucket_aggregate(chronological, lambda r: r["_provider"]),
+        "by_our_side": _bucket_aggregate(chronological, lambda r: r["_our_side"]),
+        "by_fav_dog": _bucket_aggregate(chronological, lambda r: r["_fav_dog"]),
+        "by_entry_bucket": _bucket_aggregate(chronological, lambda r: r["_entry_bucket"]),
+        "by_tip_bucket": _bucket_aggregate(chronological, lambda r: r["_tip_bucket"]),
+        "by_exit_reason": _bucket_aggregate(chronological, lambda r: r.get("exit_reason")),
+        "by_series": _bucket_aggregate(
+            chronological,
+            lambda r: (r.get("ticker") or "").split("-", 1)[0] or "?"
+        ),
     }
 
 
@@ -193,16 +304,10 @@ def _render_dashboard(*, mode: str, kalshi_env: str, bankroll: float,
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
 :root {{
-  --bg: #0b0d10;
-  --panel: #14171c;
-  --panel-2: #1b2027;
-  --border: #232931;
-  --text: #e8ecef;
-  --text-dim: #8a93a0;
-  --accent: #4ade80;
-  --danger: #f87171;
-  --warn: #fbbf24;
-  --info: #60a5fa;
+  --bg: #0b0d10; --panel: #14171c; --panel-2: #1b2027;
+  --border: #232931; --text: #e8ecef; --text-dim: #8a93a0;
+  --accent: #4ade80; --danger: #f87171;
+  --warn: #fbbf24; --info: #60a5fa;
 }}
 * {{ box-sizing: border-box; }}
 html, body {{ margin: 0; padding: 0; background: var(--bg); color: var(--text);
@@ -210,12 +315,12 @@ html, body {{ margin: 0; padding: 0; background: var(--bg); color: var(--text);
 a {{ color: var(--info); text-decoration: none; }}
 a:hover {{ text-decoration: underline; }}
 
-.shell {{ max-width: 1400px; margin: 0 auto; padding: 24px; }}
+.shell {{ max-width: 1500px; margin: 0 auto; padding: 24px; }}
 
 .header {{ display: flex; align-items: center; justify-content: space-between;
   flex-wrap: wrap; gap: 12px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }}
 .header h1 {{ font-size: 20px; margin: 0; font-weight: 600; }}
-.header .subtitle {{ color: var(--text-dim); font-size: 13px; }}
+.subtitle {{ color: var(--text-dim); font-size: 13px; }}
 .badges {{ display: flex; gap: 8px; flex-wrap: wrap; }}
 .badge {{ padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 500;
   letter-spacing: 0.4px; text-transform: uppercase; background: var(--panel-2); border: 1px solid var(--border); }}
@@ -236,18 +341,29 @@ a:hover {{ text-decoration: underline; }}
 
 .grid {{ display: grid; gap: 16px; margin-bottom: 16px; }}
 .grid.cols-2 {{ grid-template-columns: 1fr 1fr; }}
-@media (max-width: 980px) {{ .grid.cols-2 {{ grid-template-columns: 1fr; }} }}
+.grid.cols-3 {{ grid-template-columns: 1fr 1fr 1fr; }}
+.grid.cols-4 {{ grid-template-columns: 1fr 1fr 1fr 1fr; }}
+@media (max-width: 1100px) {{ .grid.cols-3, .grid.cols-4 {{ grid-template-columns: 1fr 1fr; }} }}
+@media (max-width: 720px) {{ .grid.cols-2, .grid.cols-3, .grid.cols-4 {{ grid-template-columns: 1fr; }} }}
 
 .panel {{ background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-  padding: 16px; }}
-.panel .title {{ font-size: 13px; color: var(--text-dim); text-transform: uppercase;
-  letter-spacing: 0.6px; margin: 0 0 12px 0; display: flex; align-items: center; justify-content: space-between; }}
+  padding: 14px 16px; }}
+.panel .title {{ font-size: 12px; color: var(--text-dim); text-transform: uppercase;
+  letter-spacing: 0.6px; margin: 0 0 10px 0; display: flex; align-items: center;
+  justify-content: space-between; gap: 8px; }}
+.panel .title .meta {{ text-transform: none; letter-spacing: 0; color: var(--text-dim);
+  font-weight: 400; font-size: 11px; }}
 
-.chart-wrap {{ position: relative; height: 280px; }}
+.section-header {{ font-size: 13px; color: var(--text); font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.6px; margin: 24px 0 8px 0;
+  display: flex; align-items: center; gap: 10px; }}
+.section-header::after {{ content: ''; flex: 1; height: 1px; background: var(--border); }}
+
+.chart-wrap {{ position: relative; height: 260px; }}
 .chart-wrap.tall {{ height: 320px; }}
 
 table {{ width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }}
-th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }}
+th, td {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }}
 th {{ font-weight: 500; color: var(--text-dim); font-size: 11px;
   text-transform: uppercase; letter-spacing: 0.4px; }}
 tr:last-child td {{ border-bottom: none; }}
@@ -258,7 +374,7 @@ td.muted {{ color: var(--text-dim); }}
 td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }}
 .scroll {{ max-height: 380px; overflow-y: auto; }}
 
-.empty {{ color: var(--text-dim); text-align: center; padding: 20px 0; font-style: italic; }}
+.empty {{ color: var(--text-dim); text-align: center; padding: 16px 0; font-style: italic; }}
 
 .refresh-pill {{ font-size: 11px; color: var(--text-dim); }}
 .dot {{ display: inline-block; width: 7px; height: 7px; border-radius: 50%;
@@ -268,12 +384,6 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
 
 .footer {{ color: var(--text-dim); font-size: 11px; padding: 18px 0;
   text-align: center; border-top: 1px solid var(--border); margin-top: 16px; }}
-.footer code {{ background: var(--panel-2); padding: 2px 6px; border-radius: 4px; font-size: 11px; }}
-
-.cfg {{ display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--text-dim); }}
-.cfg span {{ background: var(--panel-2); border: 1px solid var(--border); padding: 4px 10px;
-  border-radius: 6px; }}
-.cfg b {{ color: var(--text); font-variant-numeric: tabular-nums; }}
 </style>
 </head>
 <body>
@@ -305,17 +415,17 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
   </div>
 
   <div class="panel">
-    <div class="title">Cumulative P&amp;L <span id="curve-meta" style="text-transform:none;letter-spacing:0;color:var(--text-dim);font-weight:400"></span></div>
+    <div class="title">Cumulative P&amp;L <span class="meta" id="curve-meta"></span></div>
     <div class="chart-wrap tall"><canvas id="chart-curve"></canvas></div>
   </div>
 
   <div class="grid cols-2" style="margin-top:16px">
     <div class="panel">
-      <div class="title">Edge Calibration <span style="text-transform:none;letter-spacing:0;color:var(--text-dim);font-weight:400">predicted vs realized $ per trade, bucketed by edge</span></div>
+      <div class="title">Edge Calibration <span class="meta">predicted vs realized $ per trade, by edge bucket</span></div>
       <div class="chart-wrap"><canvas id="chart-calibration"></canvas></div>
     </div>
     <div class="panel">
-      <div class="title">Open Positions <span id="open-count" style="text-transform:none;letter-spacing:0;color:var(--text-dim);font-weight:400"></span></div>
+      <div class="title">Open Positions <span class="meta" id="open-count"></span></div>
       <div class="scroll">
         <table>
           <thead><tr><th>Ticker</th><th>Side</th><th class="num">Size</th><th class="num">Fill</th><th class="num">Edge</th></tr></thead>
@@ -325,24 +435,84 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
     </div>
   </div>
 
+  <div class="section-header">What works, what doesn't</div>
+
+  <div class="grid cols-3">
+    <div class="panel">
+      <div class="title">By Sport</div>
+      <table>
+        <thead><tr><th>Sport</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="tbody-sport"><tr><td colspan="4" class="empty">none</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <div class="title">Favorite vs Underdog <span class="meta">entry &gt;= 50¢ = favorite</span></div>
+      <table>
+        <thead><tr><th>Side</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="tbody-favdog"><tr><td colspan="4" class="empty">none</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <div class="title">Home vs Away</div>
+      <table>
+        <thead><tr><th>Side</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="tbody-side"><tr><td colspan="4" class="empty">none</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid cols-3" style="margin-top:16px">
+    <div class="panel">
+      <div class="title">By Sportsbook Source <span class="meta">does multi-book help?</span></div>
+      <table>
+        <thead><tr><th>Provider</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="tbody-provider"><tr><td colspan="4" class="empty">none</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <div class="title">By Entry Price</div>
+      <table>
+        <thead><tr><th>Price</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="tbody-entry"><tr><td colspan="4" class="empty">none</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <div class="title">By Time-to-Tip <span class="meta">when in pregame did we enter</span></div>
+      <table>
+        <thead><tr><th>Window</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="tbody-tip"><tr><td colspan="4" class="empty">none</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
   <div class="grid cols-2" style="margin-top:16px">
     <div class="panel">
-      <div class="title">Recent Trades <span id="trades-count" style="text-transform:none;letter-spacing:0;color:var(--text-dim);font-weight:400"></span></div>
+      <div class="title">By Exit Reason</div>
+      <table>
+        <thead><tr><th>Reason</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="tbody-exit"><tr><td colspan="4" class="empty">none</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <div class="title">By Series <span class="meta">drill into specific Kalshi series</span></div>
       <div class="scroll">
         <table>
-          <thead><tr><th>Ticker</th><th>Side</th><th class="num">Edge</th><th class="num">Fill</th><th class="num">Exit</th><th class="num">P&amp;L</th><th>Why</th></tr></thead>
-          <tbody id="tbody-trades"><tr><td colspan="7" class="empty">loading...</td></tr></tbody>
+          <thead><tr><th>Series</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+          <tbody id="tbody-series"><tr><td colspan="4" class="empty">none</td></tr></tbody>
         </table>
       </div>
     </div>
-    <div class="panel">
-      <div class="title">By Series <span style="text-transform:none;letter-spacing:0;color:var(--text-dim);font-weight:400">where we&rsquo;ve traded</span></div>
-      <div class="scroll">
-        <table>
-          <thead><tr><th>Series</th><th class="num">Trades</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-          <tbody id="tbody-cat"><tr><td colspan="4" class="empty">loading...</td></tr></tbody>
-        </table>
-      </div>
+  </div>
+
+  <div class="section-header">Recent activity</div>
+
+  <div class="panel">
+    <div class="title">Recent Trades <span class="meta" id="trades-count"></span></div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Ticker</th><th>Sport</th><th>Side</th><th class="num">Edge</th><th class="num">Fill</th><th class="num">Exit</th><th class="num">P&amp;L</th><th>Why</th></tr></thead>
+        <tbody id="tbody-trades"><tr><td colspan="8" class="empty">loading...</td></tr></tbody>
+      </table>
     </div>
   </div>
 
@@ -356,24 +526,24 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
 
   <div class="footer">
     Auto-refreshes every 15s &middot;
-    <a href="/stats">/stats</a> &middot;
-    <a href="/edge">/edge</a> &middot;
-    <a href="/trades">/trades</a> &middot;
-    <a href="/positions">/positions</a> &middot;
-    <a href="/pnl">/pnl</a>
+    <a href="/stats">/stats</a> &middot; <a href="/edge">/edge</a> &middot;
+    <a href="/trades">/trades</a> &middot; <a href="/positions">/positions</a> &middot; <a href="/pnl">/pnl</a>
   </div>
 
 </div>
 
 <script>
 const fmt$ = n => (n >= 0 ? '+$' : '-$') + Math.abs(n).toFixed(2);
-const fmtPct = n => (n * 100).toFixed(1) + '%';
 const fmtTime = iso => {{
   if (!iso) return '';
   try {{ return new Date(iso).toLocaleString(undefined, {{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}}); }}
   catch {{ return iso; }}
 }};
 const cls = n => n > 0 ? 'pos' : (n < 0 ? 'neg' : 'muted');
+const sportFromTicker = t => {{
+  const s = (t || '').split('-')[0].toUpperCase();
+  return ({{KXNBAGAME:'NBA',KXNFLGAME:'NFL',KXMLBGAME:'MLB',KXNHLGAME:'NHL'}})[s] || s;
+}};
 
 let curveChart, calibChart;
 
@@ -386,36 +556,25 @@ function buildCurveChart(curve) {{
     curveChart.data.labels = labels;
     curveChart.data.datasets[0].data = values;
     curveChart.data.datasets[0].tooltips = tooltips;
-    curveChart.update('none');
-    return;
+    curveChart.update('none'); return;
   }}
   curveChart = new Chart(ctx, {{
     type: 'line',
     data: {{ labels, datasets: [{{
-      label: 'Cumulative P&L',
-      data: values,
-      tooltips,
-      borderColor: '#4ade80',
-      backgroundColor: 'rgba(74,222,128,0.08)',
-      borderWidth: 2,
-      pointRadius: 0,
-      pointHoverRadius: 4,
-      tension: 0.18,
-      fill: true,
+      label: 'Cumulative P&L', data: values, tooltips,
+      borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.08)',
+      borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, tension: 0.18, fill: true,
     }}] }},
     options: {{
-      responsive: true, maintainAspectRatio: false,
-      animation: false,
+      responsive: true, maintainAspectRatio: false, animation: false,
       plugins: {{
         legend: {{ display: false }},
-        tooltip: {{
-          callbacks: {{
-            label: ctx => {{
-              const tt = ctx.dataset.tooltips ? ctx.dataset.tooltips[ctx.dataIndex] : '';
-              return [`Cum: ${{fmt$(ctx.parsed.y)}}`, tt].filter(Boolean);
-            }}
+        tooltip: {{ callbacks: {{
+          label: ctx => {{
+            const tt = ctx.dataset.tooltips ? ctx.dataset.tooltips[ctx.dataIndex] : '';
+            return [`Cum: ${{fmt$(ctx.parsed.y)}}`, tt].filter(Boolean);
           }}
-        }}
+        }} }}
       }},
       scales: {{
         x: {{ ticks: {{ color: '#8a93a0', maxRotation: 0, autoSkip: true, maxTicksLimit: 8 }}, grid: {{ color: 'rgba(255,255,255,0.04)' }} }},
@@ -434,8 +593,7 @@ function buildCalibChart(buckets) {{
     calibChart.data.labels = labels;
     calibChart.data.datasets[0].data = predicted;
     calibChart.data.datasets[1].data = realized;
-    calibChart.update('none');
-    return;
+    calibChart.update('none'); return;
   }}
   calibChart = new Chart(ctx, {{
     type: 'bar',
@@ -445,15 +603,27 @@ function buildCalibChart(buckets) {{
     ] }},
     options: {{
       responsive: true, maintainAspectRatio: false, animation: false,
-      plugins: {{
-        legend: {{ labels: {{ color: '#e8ecef', boxWidth: 12, font: {{ size: 11 }} }} }},
-      }},
+      plugins: {{ legend: {{ labels: {{ color: '#e8ecef', boxWidth: 12, font: {{ size: 11 }} }} }} }},
       scales: {{
         x: {{ ticks: {{ color: '#8a93a0' }}, grid: {{ color: 'rgba(255,255,255,0.04)' }} }},
         y: {{ ticks: {{ color: '#8a93a0', callback: v => '$' + v.toFixed(0) }}, grid: {{ color: 'rgba(255,255,255,0.04)' }} }},
       }}
     }}
   }});
+}}
+
+function renderBucketTable(tbodyId, rows) {{
+  const tb = document.getElementById(tbodyId);
+  if (!rows || !rows.length) {{
+    tb.innerHTML = '<tr><td colspan="4" class="empty">no data yet</td></tr>'; return;
+  }}
+  tb.innerHTML = rows.map(r => `
+    <tr>
+      <td>${{r.key}}</td>
+      <td class="num">${{r.n}}</td>
+      <td class="num">${{(r.win_rate*100).toFixed(0)}}%</td>
+      <td class="num ${{cls(r.pnl)}}">${{fmt$(r.pnl)}}</td>
+    </tr>`).join('');
 }}
 
 function renderOpen(positions) {{
@@ -474,12 +644,12 @@ function renderTrades(rows) {{
   document.getElementById('trades-count').textContent = rows.length + ' shown';
   const tb = document.getElementById('tbody-trades');
   const closed = rows.filter(r => r.closed_ts && r.pnl_usd != null);
-  if (!closed.length) {{ tb.innerHTML = '<tr><td colspan="7" class="empty">no closed trades yet</td></tr>'; return; }}
-  // Hide bug-era trades with absurd P&L
+  if (!closed.length) {{ tb.innerHTML = '<tr><td colspan="8" class="empty">no closed trades yet</td></tr>'; return; }}
   const safe = closed.filter(r => Math.abs(r.pnl_usd) <= Math.max(3 * (r.size_usd||0), 200));
   tb.innerHTML = safe.slice(0, 50).map(r => `
     <tr>
       <td class="ticker">${{r.ticker}}</td>
+      <td>${{sportFromTicker(r.ticker)}}</td>
       <td>${{r.side}}</td>
       <td class="num">${{((r.edge||0)*100).toFixed(1)}}bp</td>
       <td class="num">${{(r.fill_price||0).toFixed(2)}}</td>
@@ -489,21 +659,8 @@ function renderTrades(rows) {{
     </tr>`).join('');
 }}
 
-function renderCategory(byCat) {{
-  const tb = document.getElementById('tbody-cat');
-  if (!byCat.length) {{ tb.innerHTML = '<tr><td colspan="4" class="empty">none</td></tr>'; return; }}
-  tb.innerHTML = byCat.map(r => `
-    <tr>
-      <td class="ticker">${{r.series}}</td>
-      <td class="num">${{r.n}}</td>
-      <td class="num">${{(r.win_rate*100).toFixed(0)}}%</td>
-      <td class="num ${{cls(r.pnl)}}">${{fmt$(r.pnl)}}</td>
-    </tr>`).join('');
-}}
-
 function renderDaily(dailyMap) {{
   const tb = document.getElementById('tbody-daily');
-  // Hide the big buggy day if it shows up: any |pnl| > $1000 is from the early bug era
   const entries = Object.entries(dailyMap || {{}})
     .filter(([d, v]) => Math.abs(v.pnl||0) <= 1000)
     .sort((a,b) => b[0].localeCompare(a[0]));
@@ -521,23 +678,14 @@ function renderKpis(s) {{
   e1.parentElement.classList.toggle('neg', pnl < 0);
   document.getElementById('kpi-pnl-sub').textContent = (s.filtered_out > 0)
     ? `excluded ${{s.filtered_out}} corrupt trades` : 'clean trades only';
-
   document.getElementById('kpi-trades').textContent = s.n_trades;
   document.getElementById('kpi-trades-sub').textContent = `${{s.n_wins}}W / ${{s.n_losses}}L`;
-
   document.getElementById('kpi-winrate').textContent = (s.win_rate*100).toFixed(0) + '%';
   document.getElementById('kpi-winrate-sub').textContent = `avg ${{fmt$(s.avg_pnl)}} per trade`;
-
   document.getElementById('kpi-edge').textContent = (s.avg_edge_bp||0).toFixed(0) + 'bp';
-
   document.getElementById('kpi-open').textContent = s.open_positions;
-
-  const bw = `${{fmt$(s.best_trade)}} / ${{fmt$(s.worst_trade)}}`;
-  document.getElementById('kpi-bestworst').textContent = bw;
-
-  // Curve metadata
-  const meta = document.getElementById('curve-meta');
-  meta.textContent = s.pnl_curve.length
+  document.getElementById('kpi-bestworst').textContent = `${{fmt$(s.best_trade)}} / ${{fmt$(s.worst_trade)}}`;
+  document.getElementById('curve-meta').textContent = s.pnl_curve.length
     ? `${{s.n_trades}} trades · range ${{fmt$(s.worst_trade)}} ... ${{fmt$(s.best_trade)}}`
     : 'no closed trades yet';
 }}
@@ -553,7 +701,14 @@ async function refresh() {{
     renderKpis(stats);
     buildCurveChart(stats.pnl_curve);
     buildCalibChart(stats.edge_calibration);
-    renderCategory(stats.by_category);
+    renderBucketTable('tbody-sport',    stats.by_sport);
+    renderBucketTable('tbody-favdog',   stats.by_fav_dog);
+    renderBucketTable('tbody-side',     stats.by_our_side);
+    renderBucketTable('tbody-provider', stats.by_provider);
+    renderBucketTable('tbody-entry',    stats.by_entry_bucket);
+    renderBucketTable('tbody-tip',      stats.by_tip_bucket);
+    renderBucketTable('tbody-exit',     stats.by_exit_reason);
+    renderBucketTable('tbody-series',   stats.by_series);
     renderOpen(openPos);
     renderTrades(tradesRows);
     renderDaily(daily);
