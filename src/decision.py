@@ -63,8 +63,8 @@ def evaluate(market: Market, est: ProbabilityEstimate) -> TradeSignal | None:
     yes_ask = market.effective_yes_ask
     yes_bid = market.effective_yes_bid
     if yes_ask <= 0 or yes_bid <= 0 or yes_ask >= 1 or yes_bid >= 1:
-        log.debug("decision.skip.bad_book", ticker=market.ticker,
-                  yes_ask=yes_ask, yes_bid=yes_bid)
+        log.info("decision.skip.bad_book", ticker=market.ticker,
+                 yes_ask=yes_ask, yes_bid=yes_bid)
         return None
     no_ask = 1.0 - yes_bid  # buying NO at p means selling YES at (1-p)
 
@@ -85,9 +85,11 @@ def evaluate(market: Market, est: ProbabilityEstimate) -> TradeSignal | None:
 
     # Skip cheap entries — bad risk/reward and high fee drag
     if target_price < cfg.decision.min_entry_price:
-        log.debug("decision.skip.low_price",
-                  ticker=market.ticker, side=side, price=target_price,
-                  min=cfg.decision.min_entry_price)
+        log.info("decision.skip.low_price",
+                 ticker=market.ticker, side=side,
+                 price=round(target_price, 3),
+                 p_yes=round(p_yes, 3),
+                 min=cfg.decision.min_entry_price)
         return None
 
     # Subtract fees + slippage. Estimate contract count at our max position
@@ -97,18 +99,28 @@ def evaluate(market: Market, est: ProbabilityEstimate) -> TradeSignal | None:
     net_edge = gross_edge - fee_buf - _SLIPPAGE_BUFFER
 
     if net_edge < cfg.decision.min_edge:
-        log.debug("decision.skip.edge_too_small",
-                  ticker=market.ticker, side=side,
-                  gross=round(gross_edge, 4), fee_buf=round(fee_buf, 4),
-                  net=round(net_edge, 4), min=cfg.decision.min_edge)
+        log.info("decision.skip.edge_too_small",
+                 ticker=market.ticker, side=side,
+                 gross=round(gross_edge, 4), fee_buf=round(fee_buf, 4),
+                 net=round(net_edge, 4), min=cfg.decision.min_edge,
+                 p_yes=round(p_yes, 3), price=round(target_price, 3))
         return None
 
     # Kelly sizing on net edge, scaled by model confidence
     size_usd = _kelly_size(cfg.bankroll_usd, net_edge * est.confidence, target_price)
     size_usd = min(size_usd, cfg.risk.max_position_size_usd)
     if size_usd < 5:
+        log.info("decision.skip.size_too_small",
+                 ticker=market.ticker, size_usd=round(size_usd, 2),
+                 net_edge=round(net_edge, 4))
         return None
 
+    log.info("decision.signal_fired",
+             ticker=market.ticker, side=side,
+             price=round(target_price, 3),
+             size_usd=round(size_usd, 2),
+             net_edge=round(net_edge, 4),
+             p_yes=round(p_yes, 3))
     return TradeSignal(
         ticker=market.ticker,
         side=side,
