@@ -115,6 +115,19 @@ async def fetch_summary(sport_key: str, event_id: str) -> dict | None:
 
 # ----- Higher-level helpers --------------------------------------------------
 
+def _team_view(c: dict) -> dict:
+    """Extract a team's matchable name fields from a competitor dict."""
+    team = c.get("team") or {}
+    return {
+        "abbr": team.get("abbreviation", "") or "",
+        "location": team.get("location", "") or "",
+        "name": team.get("name", "") or "",
+        "shortDisplayName": team.get("shortDisplayName", "") or "",
+        "displayName": team.get("displayName", "") or "",
+        "score": int(c.get("score") or 0),
+    }
+
+
 def parse_competition(event: dict) -> dict | None:
     """Pull a normalized view of one ESPN scoreboard event.
 
@@ -125,8 +138,8 @@ def parse_competition(event: dict) -> dict | None:
           "period": int,             # inning, quarter, period
           "clock": str,              # display clock (e.g. "5:32" or "0:00")
           "short_detail": str,       # "Top 5th" or "End 8th"
-          "home": {"abbr": "...", "score": int},
-          "away": {"abbr": "...", "score": int},
+          "home": {abbr, location, name, shortDisplayName, displayName, score},
+          "away": {abbr, location, name, shortDisplayName, displayName, score},
         }
         or None if event shape is unexpected.
     """
@@ -143,14 +156,8 @@ def parse_competition(event: dict) -> dict | None:
             "period": int(status.get("period") or 0),
             "clock": status.get("displayClock") or "",
             "short_detail": st.get("shortDetail") or "",
-            "home": {
-                "abbr": (home.get("team") or {}).get("abbreviation", "") or "",
-                "score": int(home.get("score") or 0),
-            },
-            "away": {
-                "abbr": (away.get("team") or {}).get("abbreviation", "") or "",
-                "score": int(away.get("score") or 0),
-            },
+            "home": _team_view(home),
+            "away": _team_view(away),
         }
     except Exception:
         log.exception("espn.parse_competition_failed", event_id=event.get("id"))
@@ -283,6 +290,52 @@ async def find_live_game(
                 continue
         return c
     return None
+
+
+async def find_event_by_names(
+    sport_key: str, *, away_name: str, home_name: str,
+    target_date_utc: str | None = None,
+) -> tuple[dict | None, dict | None]:
+    """Find an ESPN event by full team names from a Kalshi market title.
+
+    Matches against any of {abbreviation, location, name, shortDisplayName,
+    displayName} on each ESPN competitor. Returns (parsed_competition,
+    raw_event) so callers can also use the raw event for start time, etc.
+
+    This obsoletes the abbreviation-translation path (KALSHI_TO_ESPN_ABBR)
+    for any caller that has Kalshi's title-derived names — much more
+    robust than chasing abbreviation mismatches.
+    """
+    from .market_fields import name_match
+    events = await fetch_scoreboard_window(sport_key, target_date_utc=target_date_utc)
+    if not events:
+        return None, None
+    date_window = _date_set_pm1(target_date_utc)
+
+    def _team_matches(team_view: dict, target: str) -> bool:
+        for k in ("location", "shortDisplayName", "displayName", "name", "abbr"):
+            if name_match(target, team_view.get(k, "")):
+                return True
+        return False
+
+    for ev in events:
+        c = parse_competition(ev)
+        if not c:
+            continue
+        h = c["home"]
+        a = c["away"]
+        # Match in either orientation since Kalshi's "X vs Y" is usually
+        # away-vs-home but we tolerate the other order for safety.
+        forward = _team_matches(a, away_name) and _team_matches(h, home_name)
+        reverse = _team_matches(h, away_name) and _team_matches(a, home_name)
+        if not (forward or reverse):
+            continue
+        if date_window:
+            ev_date = (ev.get("date") or "")[:10]
+            if ev_date and ev_date not in date_window:
+                continue
+        return c, ev
+    return None, None
 
 
 async def latest_home_win_prob(sport_key: str, event_id: str) -> float | None:

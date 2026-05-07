@@ -29,7 +29,8 @@ import httpx
 import structlog
 
 from .devig import devig_two_way
-from .espn_client import KALSHI_TO_ESPN_ABBR, fetch_summary
+from .espn_client import fetch_summary
+from .market_fields import name_match
 
 log = structlog.get_logger(__name__)
 
@@ -102,40 +103,28 @@ async def _fetch_odds_api(sport_key: str) -> list[dict] | None:
         return data
 
 
-def _norm_team(s: str) -> str:
-    """Loose normalization to match Kalshi/ESPN abbreviations against
-    The Odds API's full team names. We match on substring, lowercase.
-    """
-    return (s or "").upper()
-
-
 async def _odds_api_fair_prob(
-    *, sport: str, kalshi_away: str, kalshi_home: str, date_utc: str | None,
+    *, sport: str, away_name: str, home_name: str, date_utc: str | None,
 ) -> tuple[float, float, str] | None:
     """Find the matching event in The Odds API response and return
     (fair_home, fair_away, provider) using the median across books.
+
+    away_name / home_name are full team names (e.g. "Pittsburgh", "San
+    Francisco") taken straight from Kalshi's market title. Matched via
+    market_fields.name_match against The Odds API's full home_team /
+    away_team strings — robust to abbreviation differences.
     """
     events = await _fetch_odds_api(sport)
     if not events:
         return None
 
-    # Normalize the Kalshi abbreviations through ESPN translation since the
-    # Odds API uses full team names. We match on team-name substring.
-    away_token = KALSHI_TO_ESPN_ABBR.get(kalshi_away.upper(), kalshi_away).upper()
-    home_token = KALSHI_TO_ESPN_ABBR.get(kalshi_home.upper(), kalshi_home).upper()
-
     for ev in events:
-        away_full = (ev.get("away_team") or "").upper()
-        home_full = (ev.get("home_team") or "").upper()
-        # Loose substring match — handles "Knicks" vs "NY"; we allow the
-        # 2-3 letter token to appear anywhere in the full name.
-        away_match = (away_token in away_full) or any(
-            t in away_full for t in away_token.split()
-        )
-        home_match = (home_token in home_full) or any(
-            t in home_full for t in home_token.split()
-        )
-        if not (away_match and home_match):
+        away_full = ev.get("away_team") or ""
+        home_full = ev.get("home_team") or ""
+        # name_match is symmetric/substring + punctuation-tolerant, so
+        # 'Pittsburgh' matches 'Pittsburgh Pirates' and 'Knicks' matches
+        # 'New York Knicks'.
+        if not (name_match(away_name, away_full) and name_match(home_name, home_full)):
             continue
 
         # Optional date filter (±1 day to bridge ET-vs-UTC shift)
@@ -156,10 +145,10 @@ async def _odds_api_fair_prob(
                 outcomes = mkt.get("outcomes") or []
                 home_odds = away_odds = None
                 for o in outcomes:
-                    name = (o.get("name") or "").upper()
-                    if name == home_full:
+                    n = o.get("name") or ""
+                    if n == home_full:
                         home_odds = o.get("price")
-                    elif name == away_full:
+                    elif n == away_full:
                         away_odds = o.get("price")
                 if home_odds is None or away_odds is None:
                     continue
@@ -206,28 +195,32 @@ async def _espn_fair_prob(*, sport: str, espn_event_id: str) -> tuple[float, flo
 # ---- Public API used by the sports model ----
 
 async def fair_probability_for_game(
-    *, sport: str, espn_event_id: str,
-    kalshi_away: str, kalshi_home: str,
+    *, sport: str, espn_event_id: str | None,
+    away_name: str, home_name: str,
     date_utc: str | None = None,
 ) -> tuple[float, float, str] | None:
     """Return (fair_home_prob, fair_away_prob, provider_name).
 
     Tries The Odds API (multi-book median) first, falls back to ESPN
-    pickcenter. Returns None if no source has data.
+    pickcenter. away_name / home_name are full team names from Kalshi's
+    title (e.g. "Pittsburgh", "San Francisco"). espn_event_id is
+    optional — only used for the ESPN fallback.
     """
     # Tier 1: multi-book consensus (only if API key set)
     if _odds_api_key():
         r = await _odds_api_fair_prob(
             sport=sport,
-            kalshi_away=kalshi_away,
-            kalshi_home=kalshi_home,
+            away_name=away_name,
+            home_name=home_name,
             date_utc=date_utc,
         )
         if r:
             return r
 
-    # Tier 2: ESPN pickcenter
-    return await _espn_fair_prob(sport=sport, espn_event_id=espn_event_id)
+    # Tier 2: ESPN pickcenter (only if we have an ESPN event id)
+    if espn_event_id:
+        return await _espn_fair_prob(sport=sport, espn_event_id=espn_event_id)
+    return None
 
 
 # ============================================================================
@@ -343,24 +336,22 @@ def _player_match(token: str, full_name: str) -> bool:
 
 
 async def fair_probability_for_tennis(
-    *, player_a_token: str, player_b_token: str,
+    *, player_a_name: str, player_b_name: str,
     date_utc: str | None = None,
 ) -> tuple[float, float, str, str, str] | None:
-    """Find the matching tennis match across all active tennis tournaments.
+    """Find a tennis match across all active tennis tournaments by full
+    player names. Returns (fair_a, fair_b, provider, a_full, b_full).
 
-    Returns (fair_a, fair_b, provider, player_a_full, player_b_full) or
-    None if no match is found.
-
-    Player A is whichever of (home_team, away_team) matches player_a_token;
-    fair_a is its de-vigged probability.
+    Player names are full names from Kalshi's title (e.g. "Taylor
+    Townsend") and are matched via name_match against The Odds API's
+    home_team / away_team fields. Player A's probability is fair_a
+    regardless of which slot it falls into in the book's response.
     """
     sport_keys = await _fetch_active_tennis_sport_keys()
     if not sport_keys:
         return None
 
-    a_token = (player_a_token or "").upper()
-    b_token = (player_b_token or "").upper()
-    if not a_token or not b_token:
+    if not player_a_name or not player_b_name:
         return None
 
     date_window = None
@@ -385,11 +376,11 @@ async def fair_probability_for_tennis(
             home = ev.get("home_team") or ""
             away = ev.get("away_team") or ""
 
-            # Determine which Odds-API slot is player_a
-            if _player_match(a_token, home) and _player_match(b_token, away):
+            # Determine which Odds-API slot is player_a using full-name match
+            if name_match(player_a_name, home) and name_match(player_b_name, away):
                 a_full, b_full = home, away
                 a_is_home = True
-            elif _player_match(a_token, away) and _player_match(b_token, home):
+            elif name_match(player_a_name, away) and name_match(player_b_name, home):
                 a_full, b_full = away, home
                 a_is_home = False
             else:
@@ -410,10 +401,10 @@ async def fair_probability_for_tennis(
                         continue
                     home_odds = away_odds = None
                     for o in mkt.get("outcomes") or []:
-                        name = o.get("name") or ""
-                        if name == home:
+                        n_str = o.get("name") or ""
+                        if n_str == home:
                             home_odds = o.get("price")
-                        elif name == away:
+                        elif n_str == away:
                             away_odds = o.get("price")
                     if home_odds is None or away_odds is None:
                         continue

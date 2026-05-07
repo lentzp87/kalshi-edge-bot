@@ -1,4 +1,4 @@
-"""Tennis match moneyline model.
+"""Tennis match moneyline model (WTA + ATP).
 
 Edge thesis (same as the team-sports CLV bot)
 ---------------------------------------------
@@ -15,16 +15,13 @@ Tennis differs from team sports in three ways:
   3. No injury check (handled by the book — if a player has withdrawn
      The Odds API simply won't list the match).
 
-Pipeline
---------
-  1. Parse Kalshi ticker -> (player_a, player_b, our_player, date_utc).
-     Series: KXWTAMATCH (WTA) or KXATPMATCH (ATP).
-     Event:  YYMMM<DD><player_a_token><player_b_token>
-             where each token is 2-4 letters (typically last-name prefix).
-  2. Search across all active tennis sport keys for an event whose
-     home_team / away_team match player_a_token / player_b_token.
-  3. De-vig moneyline median across books.
-  4. Return p_yes for our_player.
+Pipeline (post-refactor — uses Kalshi's structured fields):
+  1. Series prefix (KXWTAMATCH / KXATPMATCH) gates dispatch.
+  2. Read player names from market.title ("Player A vs Player B").
+  3. Read tip time from market.occurrence_datetime.
+  4. Read our YES side from market.yes_sub_title.
+  5. Look up multi-book de-vigged moneyline by player full name.
+  6. Return p_yes for our side.
 
 The decision layer (src/decision.py) handles fee math + executable
 price + Kelly sizing — same as for team sports.
@@ -32,13 +29,17 @@ price + Kelly sizing — same as for team sports.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import structlog
 
 from ..config import file_config
 from ..kalshi_client import Market
+from ..market_fields import (
+    event_start_utc, name_match,
+    teams_from_rules, teams_from_title, yes_side_name,
+)
 from ..odds_provider import fair_probability_for_tennis
 from .base import ProbabilityEstimate
 
@@ -49,99 +50,11 @@ log = structlog.get_logger(__name__)
 TENNIS_SERIES: set[str] = {"KXWTAMATCH", "KXATPMATCH"}
 
 
-_MONTH_NUM = {
-    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
-}
-
-
-# Market ticker:  KX(WTA|ATP)MATCH-<event_code>-<our_player_token>
-_TICKER_RE = re.compile(
-    r"""^
-        (?P<series>KX(?:WTA|ATP)MATCH) -
-        (?P<eventcode>[A-Z0-9]+) -
-        (?P<our>[A-Z0-9]+)
-        $""", re.VERBOSE,
-)
-
-
-@dataclass
-class _ParsedTennisTicker:
-    series: str
-    player_a_token: str
-    player_b_token: str
-    our_player_token: str
-    match_date_utc: str | None = None
-
-
-def _split_event_code(code: str) -> tuple[str, str, str | None] | None:
-    """Pull (player_a, player_b, YYYY-MM-DD) out of the event-code segment.
-
-    Examples observed on Kalshi:
-        '26MAY04TOWSRA'   -> (TOW, SRA, 2026-05-04)
-        '26MAY041430ALCM' -> (ALC, M??, 2026-05-04) — with a time block
-
-    The pattern is YY + MMM + (DD or DDHHMM) + <letters>. We greedy-eat
-    the leading digits and split the trailing letter run roughly in half.
-    """
-    m = re.match(
-        r"^(?P<yy>\d{2})(?P<mon>[A-Z]{3})(?P<rest>\d+)(?P<players>[A-Z]+)$",
-        code,
-    )
-    if not m:
-        return None
-    players = m.group("players")
-    n = len(players)
-    if n < 4:
-        return None
-    # Try splitting at common token lengths. Tennis player tokens are
-    # almost always 3 letters, occasionally 2 or 4.
-    pair = None
-    for left in (3, 4, 2):
-        right = n - left
-        if 2 <= right <= 4:
-            pair = (players[:left], players[left:])
-            break
-    if not pair:
-        return None
-    date_str = None
-    try:
-        yy = int(m.group("yy"))
-        mon = _MONTH_NUM.get(m.group("mon"))
-        rest = m.group("rest")
-        dd = int(rest[:2]) if len(rest) >= 2 else int(rest)
-        if mon and 1 <= dd <= 31:
-            date_str = f"{2000 + yy:04d}-{mon:02d}-{dd:02d}"
-    except (ValueError, IndexError):
-        pass
-    return pair[0], pair[1], date_str
-
-
-def parse_ticker(market: Market) -> _ParsedTennisTicker | None:
-    market_ticker = market.ticker or ""
-    m = _TICKER_RE.match(market_ticker)
-    if not m:
-        return None
-    series = m.group("series")
-    if series not in TENNIS_SERIES:
-        return None
-    our = m.group("our")
-
-    event_ticker = market.raw.get("event_ticker", "") or ""
-    parts = event_ticker.split("-")
-    if len(parts) < 2:
-        return None
-    parsed = _split_event_code(parts[1])
-    if not parsed:
-        return None
-    a, b, date_utc = parsed
-    return _ParsedTennisTicker(
-        series=series,
-        player_a_token=a,
-        player_b_token=b,
-        our_player_token=our,
-        match_date_utc=date_utc,
-    )
+# Pregame / live trading window in minutes-to-start.
+# Tennis matches can shift schedule by hours when prior matches run
+# long, so we tolerate a wide window.
+TENNIS_MAX_MIN = 360  # 6 hours
+TENNIS_MIN_MIN = 5
 
 
 @dataclass
@@ -151,48 +64,63 @@ class TennisModel:
     enabled: bool = True
 
     async def estimate(self, market: Market) -> ProbabilityEstimate | None:
-        # Honor the same kill switch as the rest of the sports family
         if not file_config().models.sports.enabled:
             return None
 
-        parsed = parse_ticker(market)
-        if not parsed:
-            log.info("tennis.skip.parse_failed",
-                     ticker=market.ticker,
-                     event_ticker=market.raw.get("event_ticker", ""))
+        ticker = market.ticker or ""
+        title = market.raw.get("title") or ""
+        rules = market.raw.get("rules_primary") or ""
+
+        # ----- Read structured fields -----
+        teams = teams_from_title(title) or teams_from_rules(rules)
+        if not teams:
+            log.info("tennis.skip.no_player_names",
+                     ticker=ticker, title=title[:80])
+            return None
+        player_a, player_b = teams
+
+        our_name = yes_side_name(market.raw)
+        if not our_name:
+            log.info("tennis.skip.no_yes_side", ticker=ticker)
             return None
 
+        tip_utc = event_start_utc(market.raw)
+        if tip_utc:
+            mins_to_tip = (tip_utc - datetime.now(timezone.utc)).total_seconds() / 60
+            if mins_to_tip < TENNIS_MIN_MIN:
+                log.info("tennis.skip.too_close_to_start",
+                         ticker=ticker, mins_to_tip=round(mins_to_tip, 1))
+                return None
+            if mins_to_tip > TENNIS_MAX_MIN:
+                log.info("tennis.skip.too_far_from_start",
+                         ticker=ticker, mins_to_tip=round(mins_to_tip, 1))
+                return None
+            date_utc_str = tip_utc.strftime("%Y-%m-%d")
+        else:
+            mins_to_tip = None
+            date_utc_str = None
+
+        # ----- Fair probability from book consensus -----
         fair = await fair_probability_for_tennis(
-            player_a_token=parsed.player_a_token,
-            player_b_token=parsed.player_b_token,
-            date_utc=parsed.match_date_utc,
+            player_a_name=player_a,
+            player_b_name=player_b,
+            date_utc=date_utc_str,
         )
         if not fair:
             log.info("tennis.skip.no_book_match",
-                     ticker=market.ticker,
-                     a=parsed.player_a_token, b=parsed.player_b_token,
-                     date=parsed.match_date_utc)
+                     ticker=ticker, a=player_a, b=player_b, date=date_utc_str)
             return None
         fair_a, fair_b, provider, a_full, b_full = fair
 
-        # Map to our side: which of (a, b) is the market's "yes" side?
-        our = parsed.our_player_token.upper()
-        if our == parsed.player_a_token.upper():
+        # ----- Map our YES side to player_a / player_b probability -----
+        if name_match(our_name, player_a) or name_match(our_name, a_full):
             p_yes = fair_a
-        elif our == parsed.player_b_token.upper():
+        elif name_match(our_name, player_b) or name_match(our_name, b_full):
             p_yes = fair_b
         else:
-            # Last resort: substring match against the resolved full names
-            from ..odds_provider import _player_match
-            if _player_match(our, a_full):
-                p_yes = fair_a
-            elif _player_match(our, b_full):
-                p_yes = fair_b
-            else:
-                log.info("tennis.skip.our_player_unmatched",
-                         ticker=market.ticker, our=our,
-                         a_full=a_full, b_full=b_full)
-                return None
+            log.info("tennis.skip.our_player_unmatched",
+                     ticker=ticker, our=our_name, a=a_full, b=b_full)
+            return None
 
         p_yes = max(0.02, min(0.98, p_yes))
 
@@ -201,9 +129,10 @@ class TennisModel:
         # Kelly size stays restrained when the book is thin.
         confidence = 0.70
 
+        tip_str = f"start in {mins_to_tip:.0f}min" if mins_to_tip is not None else "no start time"
         reason = (
             f"TENNIS pregame {a_full} vs {b_full} | "
             f"book[{provider}] fair_a={fair_a:.3f} fair_b={fair_b:.3f} | "
-            f"our={parsed.our_player_token} p_yes={p_yes:.3f}"
+            f"our={our_name} p_yes={p_yes:.3f} | {tip_str}"
         )
         return ProbabilityEstimate(p_yes=p_yes, confidence=confidence, reason=reason)

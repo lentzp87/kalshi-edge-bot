@@ -1,42 +1,44 @@
-"""Pregame sports moneyline model.
+"""Pregame sports moneyline model (NBA, NFL, MLB, NHL).
 
 Edge thesis (pregame CLV bot)
 -----------------------------
-We compare Kalshi's executable YES/NO ask to the de-vigged sportsbook
-consensus. We trade only when the gap is large enough to overcome the
+Compare Kalshi's executable YES/NO ask to the de-vigged sportsbook
+consensus. Trade only when the gap is large enough to overcome the
 spread + Kalshi's taker fee + a slippage buffer.
 
-Pipeline:
-    1. Parse Kalshi sports market ticker -> sport, date, away, home, side.
-    2. Confirm the matching ESPN game is PREGAME (state == "pre") and
-       in our trading window (5-240 min before tip).
-    3. Pull moneyline from sportsbook(s) — multi-book consensus via
-       The Odds API if ODDS_API_KEY is set, else ESPN pickcenter.
-    4. De-vig to fair probability for each side.
-    5. Run a basic injury sanity check (ESPN injuries field).
-    6. Return p_yes for the side this Kalshi market represents.
+Pipeline (post-refactor — uses Kalshi's structured fields):
+    1. Series prefix (KXNBAGAME etc.) -> sport key.
+    2. Read teams from market.title ("Pittsburgh vs San Francisco").
+    3. Read tip time from market.occurrence_datetime (UTC ISO).
+    4. Read our YES side from market.yes_sub_title.
+    5. Pregame window check via mins_to_tip (5-240 min).
+    6. Pull moneyline from sportsbook(s):
+         Tier 1: The Odds API (multi-book consensus, full-name match)
+         Tier 2: ESPN pickcenter (only if Tier 1 has no data)
+    7. (NBA/NFL only) Injury sanity check via ESPN summary.
+    8. Return p_yes for our side.
 
 Decision-layer responsibility (in src/decision.py):
-    7. Compute net edge using *executable* price (not midpoint),
+    9. Compute net edge using *executable* price (not midpoint),
        subtracting fee_buffer and a slippage buffer.
-    8. Apply min_net_edge threshold and Kelly-cap sizing.
-
-This file is the model only; sizing and fee math live in decision.py.
+   10. Apply min_net_edge threshold and Kelly-cap sizing.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 import structlog
 
 from ..config import file_config
-from ..espn_client import fetch_scoreboard, find_live_game, parse_competition
+from ..espn_client import find_event_by_names
 from ..injury_check import has_risky_injury
 from ..kalshi_client import Market
+from ..market_fields import (
+    event_start_utc, name_match, series_prefix,
+    teams_from_rules, teams_from_title, yes_side_name,
+)
 from ..odds_provider import fair_probability_for_game
 from .base import ProbabilityEstimate
 
@@ -59,151 +61,14 @@ SERIES_REGISTRY: dict[str, str] = {
 }
 
 
-_MONTH_NUM = {
-    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
-}
-
-
-_TICKER_RE = re.compile(
-    r"""^
-        (?P<series>KX[A-Z]+GAME) -
-        (?P<eventcode>[A-Z0-9]+) -
-        (?P<our_team>[A-Z0-9]+)
-        $""", re.VERBOSE,
-)
-
-
-@dataclass
-class _ParsedTicker:
-    sport: str
-    series: str
-    away_abbr: str
-    home_abbr: str
-    our_team_abbr: str
-    game_date_utc: str | None = None
-
-
-def _split_event_code(code: str) -> tuple[str, str, str | None] | None:
-    """Pull (away, home, YYYY-MM-DD) out of the event-code segment."""
-    m = re.match(
-        r"^(?P<yy>\d{2})(?P<mon>[A-Z]{3})(?P<rest>\d+)(?P<teams>[A-Z]+)$",
-        code,
-    )
-    if not m:
-        return None
-    teams = m.group("teams")
-    n = len(teams)
-    pair = None
-    for left in (3, 2, 4):
-        right = n - left
-        if 2 <= right <= 4:
-            pair = (teams[:left], teams[left:])
-            break
-    if not pair:
-        return None
-    date_str = None
-    try:
-        yy = int(m.group("yy"))
-        mon = _MONTH_NUM.get(m.group("mon"))
-        rest = m.group("rest")
-        dd = int(rest[:2]) if len(rest) >= 2 else int(rest)
-        if mon and 1 <= dd <= 31:
-            date_str = f"{2000 + yy:04d}-{mon:02d}-{dd:02d}"
-    except (ValueError, IndexError):
-        pass
-    return pair[0], pair[1], date_str
-
-
-def parse_ticker(market: Market) -> _ParsedTicker | None:
-    event_ticker = market.raw.get("event_ticker", "") or ""
-    market_ticker = market.ticker or ""
-    m = _TICKER_RE.match(market_ticker)
-    if not m:
-        return None
-    series = m.group("series")
-    if series not in SERIES_REGISTRY:
-        return None
-    sport = SERIES_REGISTRY[series]
-    our_team = m.group("our_team")
-
-    parts = event_ticker.split("-")
-    if len(parts) < 2:
-        return None
-    parsed = _split_event_code(parts[1])
-    if not parsed:
-        return None
-    a, b, game_date = parsed
-    return _ParsedTicker(
-        sport=sport, series=series,
-        away_abbr=a, home_abbr=b,
-        our_team_abbr=our_team,
-        game_date_utc=game_date,
-    )
-
-
-def _minutes_to_tip(comp: dict, scoreboard_ev: dict | None) -> float | None:
-    """Best-effort: parse the event's start time from ESPN data and
-    return minutes from now (UTC) until tip. Negative if game already
-    started.
-    """
-    iso = None
-    if scoreboard_ev:
-        iso = scoreboard_ev.get("date")
-    if not iso:
-        return None
-    try:
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        delta = (dt - datetime.now(timezone.utc)).total_seconds() / 60
-        return delta
-    except (ValueError, TypeError):
-        return None
-
-
-async def _find_event_with_raw(
-    sport_key: str, *, away: str, home: str, date_utc: str | None,
-) -> tuple[dict | None, dict | None]:
-    """Like find_live_game but also returns the raw event dict so we
-    can pull the start time. Returns (parsed_competition, raw_event).
-
-    Fetches ESPN's scoreboard for the explicit date (and date+1) so we
-    can see upcoming-evening games even when scanning earlier in the
-    day. Date filter then accepts ±1 day to bridge the ET vs UTC shift.
-    """
-    from ..espn_client import (
-        _normalize_abbr, _date_set_pm1, fetch_scoreboard_window,
-    )
-    events = await fetch_scoreboard_window(sport_key, target_date_utc=date_utc)
-    if not events:
-        return None, None
-    aw = _normalize_abbr(away)
-    hm = _normalize_abbr(home)
-    date_window = _date_set_pm1(date_utc)
-    for ev in events:
-        c = parse_competition(ev)
-        if not c:
-            continue
-        ca = _normalize_abbr(c["away"]["abbr"])
-        ch = _normalize_abbr(c["home"]["abbr"])
-        if not ((ca == aw and ch == hm) or (ca == hm and ch == aw)):
-            continue
-        if date_window:
-            ev_date = (ev.get("date") or "")[:10]
-            if ev_date and ev_date not in date_window:
-                continue
-        return c, ev
-    return None, None
-
-
 @dataclass
 class SportsModel:
     enabled: bool = False
 
     def __post_init__(self) -> None:
         self.enabled = file_config().models.sports.enabled
-        # Tennis is a separate model with its own ticker format and
-        # provider path. We instantiate it once and dispatch when the
-        # market ticker matches a tennis series.
+        # Tennis is a separate model with its own provider path.
+        # We instantiate it once and dispatch when the series matches.
         from .tennis import TennisModel
         self._tennis = TennisModel(enabled=self.enabled)
 
@@ -211,93 +76,107 @@ class SportsModel:
         if not self.enabled:
             return None
 
+        ticker = market.ticker or ""
+        series = series_prefix(ticker)
+
         # Dispatch tennis markets to the tennis model
         from .tennis import TENNIS_SERIES
-        ticker = market.ticker or ""
-        for series in TENNIS_SERIES:
-            if ticker.startswith(series + "-"):
-                return await self._tennis.estimate(market)
+        if series in TENNIS_SERIES:
+            return await self._tennis.estimate(market)
 
-        parsed = parse_ticker(market)
-        if not parsed:
-            log.info("sports.skip.parse_failed",
-                     ticker=market.ticker,
-                     event_ticker=market.raw.get("event_ticker", ""))
+        sport = SERIES_REGISTRY.get(series)
+        if not sport:
+            log.info("sports.skip.unknown_series", ticker=ticker, series=series)
             return None
 
-        comp, raw_ev = await _find_event_with_raw(
-            parsed.sport,
-            away=parsed.away_abbr,
-            home=parsed.home_abbr,
-            date_utc=parsed.game_date_utc,
-        )
-        if not comp:
-            log.info("sports.skip.no_espn_game",
-                     ticker=market.ticker,
-                     away=parsed.away_abbr, home=parsed.home_abbr,
-                     date=parsed.game_date_utc)
+        # ----- Read structured fields (no ticker decoding!) -----
+        title = market.raw.get("title") or ""
+        rules = market.raw.get("rules_primary") or ""
+        teams = teams_from_title(title) or teams_from_rules(rules)
+        if not teams:
+            log.info("sports.skip.no_team_names",
+                     ticker=ticker, title=title[:80])
+            return None
+        away_name, home_name = teams  # Kalshi convention: "Away vs Home"
+
+        our_name = yes_side_name(market.raw)
+        if not our_name:
+            log.info("sports.skip.no_yes_side", ticker=ticker)
             return None
 
-        # Pregame-only filter
-        if comp["state"] != "pre":
-            log.info("sports.skip.not_pregame",
-                     ticker=market.ticker, state=comp["state"], period=comp["period"])
+        tip_utc = event_start_utc(market.raw)
+        if not tip_utc:
+            log.info("sports.skip.no_start_time", ticker=ticker)
             return None
+        mins_to_tip = (tip_utc - datetime.now(timezone.utc)).total_seconds() / 60
 
-        mins_to_tip = _minutes_to_tip(comp, raw_ev)
-        if mins_to_tip is None:
-            log.info("sports.skip.no_start_time", ticker=market.ticker)
-            return None
+        # ----- Pregame trading window -----
         if mins_to_tip < PREGAME_MIN_MIN:
             log.info("sports.skip.too_close_to_tip",
-                     ticker=market.ticker, mins_to_tip=round(mins_to_tip, 1))
+                     ticker=ticker, mins_to_tip=round(mins_to_tip, 1))
             return None
         if mins_to_tip > PREGAME_MAX_MIN:
             log.info("sports.skip.too_far_from_tip",
-                     ticker=market.ticker, mins_to_tip=round(mins_to_tip, 1))
+                     ticker=ticker, mins_to_tip=round(mins_to_tip, 1))
             return None
 
-        # Injury / news sanity check (skip if any active risky-status player)
-        risky, listed = await has_risky_injury(parsed.sport, comp["id"])
-        if risky:
-            log.info("sports.skip.injuries_listed",
-                     ticker=market.ticker, count=len(listed),
-                     sample=listed[:3])
-            return None
+        # ----- ESPN lookup (only for injury check + pickcenter fallback) -----
+        date_utc_str = tip_utc.strftime("%Y-%m-%d")
+        comp, _raw_ev = await find_event_by_names(
+            sport, away_name=away_name, home_name=home_name,
+            target_date_utc=date_utc_str,
+        )
+        espn_event_id = comp["id"] if comp else None
 
-        # Get fair probability from sportsbook(s)
+        # Injury check (NBA/NFL only — disabled internally for MLB/NHL).
+        # Only runs when ESPN has the event; if not, we trust the book.
+        if espn_event_id:
+            risky, listed = await has_risky_injury(sport, espn_event_id)
+            if risky:
+                log.info("sports.skip.injuries_listed",
+                         ticker=ticker, count=len(listed),
+                         sample=listed[:3])
+                return None
+
+        # ----- Fair probability from book consensus -----
         fair = await fair_probability_for_game(
-            sport=parsed.sport,
-            espn_event_id=comp["id"],
-            kalshi_away=parsed.away_abbr,
-            kalshi_home=parsed.home_abbr,
-            date_utc=parsed.game_date_utc,
+            sport=sport,
+            espn_event_id=espn_event_id,
+            away_name=away_name,
+            home_name=home_name,
+            date_utc=date_utc_str,
         )
         if not fair:
             log.info("sports.skip.no_sportsbook_odds",
-                     ticker=market.ticker, sport=parsed.sport)
+                     ticker=ticker, sport=sport,
+                     away=away_name, home=home_name)
             return None
         fair_home, fair_away, provider = fair
 
-        # Map to our side
-        our_is_home = (parsed.our_team_abbr.upper() == comp["home"]["abbr"].upper())
-        # Translate via ESPN abbrev map for the comparison
-        from ..espn_client import _normalize_abbr
-        if not our_is_home:
-            our_is_home = _normalize_abbr(parsed.our_team_abbr) == _normalize_abbr(comp["home"]["abbr"])
+        # ----- Map our YES side to home/away probability -----
+        # Match yes_sub_title against home/away names from the title.
+        if name_match(our_name, home_name):
+            our_is_home = True
+        elif name_match(our_name, away_name):
+            our_is_home = False
+        else:
+            log.info("sports.skip.our_side_unmatched",
+                     ticker=ticker, our=our_name,
+                     away=away_name, home=home_name)
+            return None
+
         p_yes = fair_home if our_is_home else fair_away
         p_yes = max(0.02, min(0.98, p_yes))
 
         # Confidence: sportsbook consensus is reasonably tight for major
-        # leagues. Cap at 0.8 so the Kelly fraction stays restrained.
+        # leagues. Cap at 0.75 so the Kelly fraction stays restrained.
         confidence = 0.75
 
         side = "home" if our_is_home else "away"
-        score = f"{comp['away']['abbr']}@{comp['home']['abbr']}"
         reason = (
-            f"{parsed.sport.upper()} pregame {score} | "
+            f"{sport.upper()} pregame {away_name}@{home_name} | "
             f"book[{provider}] fair_home={fair_home:.3f} fair_away={fair_away:.3f} | "
-            f"our={parsed.our_team_abbr}({side}) p_yes={p_yes:.3f} | "
+            f"our={our_name}({side}) p_yes={p_yes:.3f} | "
             f"tip in {mins_to_tip:.0f}min"
         )
         return ProbabilityEstimate(p_yes=p_yes, confidence=confidence, reason=reason)
