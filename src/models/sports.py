@@ -165,14 +165,21 @@ async def _find_event_with_raw(
 ) -> tuple[dict | None, dict | None]:
     """Like find_live_game but also returns the raw event dict so we
     can pull the start time. Returns (parsed_competition, raw_event).
+
+    Fetches ESPN's scoreboard for the explicit date (and date+1) so we
+    can see upcoming-evening games even when scanning earlier in the
+    day. Date filter then accepts ±1 day to bridge the ET vs UTC shift.
     """
-    sb = await fetch_scoreboard(sport_key)
-    if not sb:
+    from ..espn_client import (
+        _normalize_abbr, _date_set_pm1, fetch_scoreboard_window,
+    )
+    events = await fetch_scoreboard_window(sport_key, target_date_utc=date_utc)
+    if not events:
         return None, None
-    from ..espn_client import _normalize_abbr  # local import to keep API clean
     aw = _normalize_abbr(away)
     hm = _normalize_abbr(home)
-    for ev in sb.get("events", []):
+    date_window = _date_set_pm1(date_utc)
+    for ev in events:
         c = parse_competition(ev)
         if not c:
             continue
@@ -180,9 +187,9 @@ async def _find_event_with_raw(
         ch = _normalize_abbr(c["home"]["abbr"])
         if not ((ca == aw and ch == hm) or (ca == hm and ch == aw)):
             continue
-        if date_utc:
+        if date_window:
             ev_date = (ev.get("date") or "")[:10]
-            if ev_date and ev_date != date_utc:
+            if ev_date and ev_date not in date_window:
                 continue
         return c, ev
     return None, None

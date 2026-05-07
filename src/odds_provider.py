@@ -138,10 +138,12 @@ async def _odds_api_fair_prob(
         if not (away_match and home_match):
             continue
 
-        # Optional date filter
+        # Optional date filter (±1 day to bridge ET-vs-UTC shift)
         if date_utc:
+            from .espn_client import _date_set_pm1
+            date_window = _date_set_pm1(date_utc)
             ev_date = (ev.get("commence_time") or "")[:10]
-            if ev_date and ev_date != date_utc:
+            if date_window and ev_date and ev_date not in date_window:
                 continue
 
         # Aggregate de-vigged probabilities across all books, take median

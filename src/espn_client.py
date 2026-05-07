@@ -55,25 +55,38 @@ async def _get_json(url: str) -> dict | None:
         return None
 
 
-async def fetch_scoreboard(sport_key: str) -> dict | None:
-    """Return the raw scoreboard JSON for a sport. Cached ~20s."""
+async def fetch_scoreboard(
+    sport_key: str, *, date_yyyymmdd: str | None = None,
+) -> dict | None:
+    """Return the raw scoreboard JSON for a sport. Cached ~20s.
+
+    If date_yyyymmdd is provided (e.g. "20260507"), fetches the
+    scoreboard for that specific league-local date via ESPN's `dates`
+    parameter. Otherwise falls back to the rolling "current" scoreboard,
+    which only includes games near the current moment and misses
+    upcoming evening games when the bot runs in the morning.
+    """
     if sport_key not in SPORTS:
         return None
-    cached = _scoreboard_cache.get(sport_key)
+
+    cache_key = f"{sport_key}:{date_yyyymmdd or 'now'}"
+    cached = _scoreboard_cache.get(cache_key)
     now = time.time()
     if cached and (now - cached[0]) < _SCOREBOARD_TTL:
         return cached[1]
 
-    lock = _locks.setdefault(f"sb-{sport_key}", asyncio.Lock())
+    lock = _locks.setdefault(f"sb-{cache_key}", asyncio.Lock())
     async with lock:
-        cached = _scoreboard_cache.get(sport_key)
+        cached = _scoreboard_cache.get(cache_key)
         if cached and (time.time() - cached[0]) < _SCOREBOARD_TTL:
             return cached[1]
         sport, league = SPORTS[sport_key]
         url = f"{_BASE}/{sport}/{league}/scoreboard"
+        if date_yyyymmdd:
+            url = f"{url}?dates={date_yyyymmdd}"
         data = await _get_json(url)
         if data is not None:
-            _scoreboard_cache[sport_key] = (time.time(), data)
+            _scoreboard_cache[cache_key] = (time.time(), data)
         return data
 
 
@@ -171,25 +184,91 @@ def _normalize_abbr(abbr: str) -> str:
     return KALSHI_TO_ESPN_ABBR.get(a, a)
 
 
+def _date_set_pm1(target_date_utc: str | None) -> set[str] | None:
+    """Return {date-1, date, date+1} as YYYY-MM-DD strings.
+
+    Kalshi tickers use ET dates; ESPN events are UTC. A 9pm ET tip is
+    01:00 UTC the next day, so an exact UTC date match would miss it.
+    Accept ±1 day to bridge the timezone shift.
+    """
+    if not target_date_utc:
+        return None
+    from datetime import date, timedelta
+    try:
+        y, m, d = (int(p) for p in target_date_utc.split("-"))
+        d0 = date(y, m, d)
+        return {
+            (d0 - timedelta(days=1)).isoformat(),
+            d0.isoformat(),
+            (d0 + timedelta(days=1)).isoformat(),
+        }
+    except (ValueError, AttributeError):
+        return None
+
+
+def _yyyymmdd_window(target_date_utc: str | None) -> list[str]:
+    """Return [date, date+1] in YYYYMMDD form for ESPN's `dates=` param.
+
+    We fetch both because ESPN's league-local "slate date" sometimes
+    follows the team's home timezone — e.g., a 7pm Pacific NHL game on
+    May 7 ET may show under May 8's slate. Fetching both is cheap.
+    Returns [] if the date is unparseable.
+    """
+    if not target_date_utc:
+        return []
+    from datetime import date, timedelta
+    try:
+        y, m, d = (int(p) for p in target_date_utc.split("-"))
+        d0 = date(y, m, d)
+        return [d0.strftime("%Y%m%d"), (d0 + timedelta(days=1)).strftime("%Y%m%d")]
+    except (ValueError, AttributeError):
+        return []
+
+
+async def fetch_scoreboard_window(
+    sport_key: str, *, target_date_utc: str | None,
+) -> list[dict]:
+    """Fetch ESPN scoreboard events for a date window. Returns the
+    flattened list of events from {date, date+1} so callers can match
+    across the ET/UTC slate boundary. Falls back to the rolling
+    "current" scoreboard if no date is provided.
+    """
+    dates = _yyyymmdd_window(target_date_utc)
+    if not dates:
+        sb = await fetch_scoreboard(sport_key)
+        return (sb or {}).get("events", []) or []
+    out: list[dict] = []
+    seen_ids: set[str] = set()
+    for d in dates:
+        sb = await fetch_scoreboard(sport_key, date_yyyymmdd=d)
+        if not sb:
+            continue
+        for ev in sb.get("events", []) or []:
+            ev_id = str(ev.get("id") or "")
+            if ev_id and ev_id not in seen_ids:
+                seen_ids.add(ev_id)
+                out.append(ev)
+    return out
+
+
 async def find_live_game(
     sport_key: str, *, away_abbr: str, home_abbr: str,
     target_date_utc: str | None = None,
 ) -> dict | None:
-    """Find a specific game on today's scoreboard.
+    """Find a specific game on the slate.
 
     Match logic: team abbreviations (with Kalshi->ESPN translation) AND,
-    if target_date_utc is provided, the game date in UTC. The date filter
-    prevents matching tomorrow's same-teams game when both appear on the
-    rolling scoreboard window.
-
-    target_date_utc format: 'YYYY-MM-DD'.
+    if target_date_utc is provided, the game date in UTC ±1 day to
+    handle the ET vs UTC shift. We fetch ESPN's scoreboard explicitly
+    by date so upcoming-evening games are visible during morning scans.
     """
-    sb = await fetch_scoreboard(sport_key)
-    if not sb:
+    events = await fetch_scoreboard_window(sport_key, target_date_utc=target_date_utc)
+    if not events:
         return None
     aw = _normalize_abbr(away_abbr)
     hm = _normalize_abbr(home_abbr)
-    for ev in sb.get("events", []):
+    date_window = _date_set_pm1(target_date_utc)
+    for ev in events:
         c = parse_competition(ev)
         if not c:
             continue
@@ -197,10 +276,10 @@ async def find_live_game(
         ch = _normalize_abbr(c["home"]["abbr"])
         if not ((ca == aw and ch == hm) or (ca == hm and ch == aw)):
             continue
-        # Optional date filter
-        if target_date_utc:
+        # Optional date filter (±1 day window)
+        if date_window:
             ev_date = (ev.get("date") or "")[:10]  # ISO 'YYYY-MM-DDT...'
-            if ev_date and ev_date != target_date_utc:
+            if ev_date and ev_date not in date_window:
                 continue
         return c
     return None
