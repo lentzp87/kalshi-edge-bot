@@ -60,10 +60,13 @@ class Journal:
     def __init__(self) -> None:
         env = env_config()
         Path(env.data_dir).mkdir(parents=True, exist_ok=True)
-        # v2 DB = fresh slate after weather pivot. The old trades.db is
-        # left on disk (Render persistent volume) but no longer read or
-        # written, so the dashboard shows only sports-era trades.
-        self.path = Path(env.data_dir) / "trades_sports.db"
+        # DB version log:
+        #   trades.db          (v1) — pre-weather-pivot, abandoned
+        #   trades_sports.db   (v2) — pre P&L sign-flip fix; data corrupted
+        #                              by inverted NO-side P&L. Abandoned.
+        #   trades_sports_v3.db — current. Started after the NO-side fix.
+        # Old DBs remain on disk for archaeology but are no longer read.
+        self.path = Path(env.data_dir) / "trades_sports_v3.db"
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.executescript(SCHEMA)
         self.conn.commit()

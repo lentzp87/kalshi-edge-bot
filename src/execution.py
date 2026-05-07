@@ -24,6 +24,7 @@ import structlog
 
 from .config import env_config, file_config
 from .decision import TradeSignal
+from .fee_model import fee_per_contract_dollars
 from .journal import Journal
 from .kalshi_client import KalshiClient, Market
 from .risk import RiskEngine
@@ -108,8 +109,11 @@ class Executor:
             try:
                 ob = await self.client.get_orderbook(ticker)
                 mid = self._mid_from_orderbook(ob, pos.signal.side)
-                pnl_pct = (mid - pos.fill_price) / pos.fill_price if pos.signal.side == "yes" \
-                    else (pos.fill_price - mid) / pos.fill_price
+                # `mid` is already side-adjusted (NO mid for NO bets). So
+                # profit is mid - fill regardless of side. The previous
+                # branching here flipped the sign on every NO position,
+                # making take_profit trigger on losses and vice versa.
+                pnl_pct = (mid - pos.fill_price) / pos.fill_price
                 if pnl_pct >= self.cfg.take_profit_pct:
                     await self._exit(ticker, mid, reason="take_profit")
                     return
@@ -161,13 +165,19 @@ class Executor:
         pos = self.open.pop(ticker, None)
         if not pos:
             return
-        # P&L per contract is the price move in dollars. Contracts settle at
+        # P&L per contract is the price move in dollars. `exit_price` is
+        # already side-adjusted (NO mid for NO bets, YES mid for YES bets),
+        # and `fill_price` is in the same units (the side we bought).
+        # So profit = exit - fill regardless of side. Contracts settle at
         # $1, so dollar P&L = (price_move) * contracts. NO extra * 100.
-        pnl_per_contract = (exit_price - pos.fill_price) if pos.signal.side == "yes" \
-            else (pos.fill_price - exit_price)
+        pnl_per_contract = exit_price - pos.fill_price
         pnl_usd = pnl_per_contract * pos.contracts
-        # Approximate Kalshi fee (verify against current schedule).
-        fees_usd = 0.07 * pos.contracts
+        # Kalshi fee = 0.07 * p * (1-p) per contract, ceiled to next cent,
+        # charged on BOTH entry and exit. The old 0.07 * contracts flat was
+        # 4-7x too aggressive and made every paper trade look like a loss.
+        entry_fee = fee_per_contract_dollars(pos.fill_price) * pos.contracts
+        exit_fee = fee_per_contract_dollars(exit_price) * pos.contracts
+        fees_usd = entry_fee + exit_fee
         pnl_usd -= fees_usd
         # Sanity clamp: a long position can never lose more than its size.
         # Catches any residual unit-conversion bug before it trips the
