@@ -54,9 +54,16 @@ scanner:
     - KXLOWTNYC     # NYC
 
 decision:
-  min_edge: 0.12             # 12pp minimum (raised from 6 — realized edge was 30-60% of predicted)
+  # PAPER-MODE TUNING — these thresholds are intentionally loose so the
+  # full pipeline (scan -> opinion -> signal -> fill -> exit) gets
+  # exercised. Tighten before flipping mode=live.
+  #   min_edge 0.03  -> fires 3pp+ net-of-fees edges, gives real volume
+  #   min_entry_price 0.40 -> allow dog buys + coin-flips, not just favorites
+  # When you have 30+ closed paper trades and CLV data, raise these to
+  # whatever your realized-edge analysis supports (likely 0.05-0.08).
+  min_edge: 0.03
   kelly_fraction: 0.25       # fraction of full Kelly to size by
-  min_entry_price: 0.55      # only enter when our side is priced >= 55c (favored)
+  min_entry_price: 0.40
 
 risk:
   max_position_size_usd: 40
