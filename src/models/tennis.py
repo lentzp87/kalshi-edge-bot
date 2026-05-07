@@ -38,7 +38,8 @@ from ..config import file_config
 from ..kalshi_client import Market
 from ..market_fields import (
     event_start_utc, name_match,
-    teams_from_rules, teams_from_title, yes_side_name,
+    teams_from_rules, teams_from_tennis_title, teams_from_title,
+    yes_side_name,
 )
 from ..odds_provider import fair_probability_for_tennis
 from .base import ProbabilityEstimate
@@ -51,9 +52,9 @@ TENNIS_SERIES: set[str] = {"KXWTAMATCH", "KXATPMATCH"}
 
 
 # Pregame / live trading window in minutes-to-start.
-# Tennis matches can shift schedule by hours when prior matches run
-# long, so we tolerate a wide window.
-TENNIS_MAX_MIN = 360  # 6 hours
+# Tomorrow's tennis slate posts ~24h ahead and lines are stable for
+# major events. We accept anything from 5 minutes to 36 hours out.
+TENNIS_MAX_MIN = 36 * 60  # 36 hours — covers tomorrow's full slate
 TENNIS_MIN_MIN = 5
 
 
@@ -72,10 +73,17 @@ class TennisModel:
         rules = market.raw.get("rules_primary") or ""
 
         # ----- Read structured fields -----
-        teams = teams_from_title(title) or teams_from_rules(rules)
+        # Tennis titles are sentence-shaped ("Will X win the A vs B..."),
+        # so try the tennis-specific parser first; fall back to the
+        # generic title / rules parsers for unusual formats.
+        teams = (
+            teams_from_tennis_title(title)
+            or teams_from_title(title)
+            or teams_from_rules(rules)
+        )
         if not teams:
             log.info("tennis.skip.no_player_names",
-                     ticker=ticker, title=title[:80])
+                     ticker=ticker, title=title[:120])
             return None
         player_a, player_b = teams
 

@@ -46,9 +46,12 @@ log = structlog.get_logger(__name__)
 
 
 # Trading window in minutes-to-tipoff:
-#   too early (>240 min)  -> sportsbook lines still volatile
-#   too late  (<5 min)    -> live lineup chaos / liquidity drain
-PREGAME_MAX_MIN = 240
+#   too late  (<5 min)     -> live lineup chaos / liquidity drain
+#   too early (>1440 min)  -> book lines may shift before close;
+#                              widening lets us pick up tomorrow's slate
+# A 24-hour window covers tonight's MLB + tomorrow's NBA/NFL/MLB/NHL
+# without leaning so far out that the book consensus is unreliable.
+PREGAME_MAX_MIN = 24 * 60  # 24 hours
 PREGAME_MIN_MIN = 5
 
 

@@ -18,31 +18,102 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-# "Pittsburgh vs San Francisco Winner?" -> ("Pittsburgh", "San Francisco")
-# Tolerates: 'vs' or 'vs.', optional trailing 'Winner', optional '?'.
-# For team sports the convention is "Away vs Home"; for tennis it's just
-# the two players in seeding/alphabetical order.
-_TITLE_VS_RE = re.compile(
-    r"""^\s*
-        (?P<a>.+?)
-        \s+vs\.?\s+
-        (?P<b>.+?)
-        (?:\s+Winner)?
-        \s*\??\s*$""",
+# Sentence-fragment words that strongly suggest we matched mid-sentence
+# (e.g. tennis title "Will X win the A vs B: ..."). If a captured group
+# contains any of these as a whole word, the split is rejected.
+_SENTENCE_WORDS = (
+    "win", "wins", "won", "beat", "beats", "the", "will", "match",
+    "round", "professional", "game",
+)
+_SENTENCE_WORD_RE = re.compile(
+    r"\b(?:" + "|".join(_SENTENCE_WORDS) + r")\b", re.IGNORECASE,
+)
+
+# Splitters in priority order. Most Kalshi titles use ' vs ' (regular
+# season), 'Game N: X at Y' (playoffs), or sometimes ' v ' or ' v. '.
+_TITLE_SPLITTERS: tuple[str, ...] = (
+    r"\s+vs\.?\s+",
+    r"\s+at\s+",
+    r"\s+v\.?\s+",
+)
+
+
+def _looks_like_team_name(s: str) -> bool:
+    """Heuristic: a real team / player name shouldn't contain sentence
+    words like 'win', 'the', 'match', and shouldn't be more than 4 words.
+    """
+    if not s:
+        return False
+    if _SENTENCE_WORD_RE.search(s):
+        return False
+    if len(s.split()) > 4:
+        return False
+    return True
+
+
+def teams_from_title(title: str) -> tuple[str, str] | None:
+    """Parse a Kalshi market title into (team_a, team_b).
+
+    Handles the three observed formats:
+      * 'Pittsburgh vs San Francisco Winner?'    (regular-season MLB)
+      * 'Game 2: Cleveland at Detroit Winner?'   (NBA/NHL playoffs)
+      * 'Carolina at Philadelphia Winner?'        (some sports use 'at')
+
+    Sentence-style titles (tennis: 'Will X win the A vs B...') are
+    rejected here — the tennis model uses teams_from_tennis_title for
+    those. For team sports the convention is (away, home).
+    """
+    if not title:
+        return None
+    t = title.strip()
+    # Strip trailing '?'
+    t = re.sub(r"\s*\?+\s*$", "", t)
+    # Strip trailing ' Winner'
+    t = re.sub(r"\s+Winner\s*$", "", t, flags=re.IGNORECASE)
+    # Strip 'Game N: ' playoff prefix
+    t = re.sub(r"^Game\s+\d+\s*:\s*", "", t, flags=re.IGNORECASE)
+    if not t:
+        return None
+
+    for pat in _TITLE_SPLITTERS:
+        parts = re.split(pat, t, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) != 2:
+            continue
+        a, b = parts[0].strip(), parts[1].strip()
+        if not a or not b:
+            continue
+        # Reject obvious sentence captures (tennis-style titles)
+        if not _looks_like_team_name(a) or not _looks_like_team_name(b):
+            continue
+        return a, b
+    return None
+
+
+# Tennis titles like:
+#   'Will Taylor Townsend win the Bouzkova vs Townsend: Round Of 64 match?'
+#   'Will Carlos Alcaraz win the Alcaraz/Sinner match?'
+# We extract the bit after 'win the' and split on ' vs ' / '/'.
+_TENNIS_TITLE_RE = re.compile(
+    r"""win\s+the\s+
+        (?P<a>[\w'.\-]+(?:\s+[\w'.\-]+){0,3})
+        \s*(?:vs\.?|/)\s*
+        (?P<b>[\w'.\-]+(?:\s+[\w'.\-]+){0,3})
+        (?=\s*[:,.]|\s+(?:match|round)|\s*$)
+    """,
     re.IGNORECASE | re.VERBOSE,
 )
 
 
-def teams_from_title(title: str) -> tuple[str, str] | None:
-    """Parse 'X vs Y Winner?' into (X, Y).
+def teams_from_tennis_title(title: str) -> tuple[str, str] | None:
+    """Tennis-specific title parser.
 
-    For team sports the order is (away, home). For tennis it's just the
-    two players — order isn't meaningful for matching since we use
-    yes_sub_title to know which side is YES.
+    Tennis markets use sentence-shaped titles that confuse the regular
+    teams_from_title parser. Pattern is "Will <our> win the <A> [vs|/] <B>:
+    Round Of N match?". Returns (player_a_surname, player_b_surname).
     """
     if not title:
         return None
-    m = _TITLE_VS_RE.match(title)
+    m = _TENNIS_TITLE_RE.search(title)
     if not m:
         return None
     a = m.group("a").strip()
