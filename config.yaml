@@ -54,15 +54,16 @@ scanner:
     - KXLOWTNYC     # NYC
 
 decision:
-  # PAPER-MODE TUNING — these thresholds are intentionally loose so the
-  # full pipeline (scan -> opinion -> signal -> fill -> exit) gets
-  # exercised. Tighten before flipping mode=live.
-  #   min_edge 0.01  -> fires 1pp+ net-of-fees edges (very loose, paper only)
-  #   min_entry_price 0.30 -> allow most prices through
-  # When you have 30+ closed paper trades and CLV data, raise these to
-  # whatever your realized-edge analysis supports (likely 0.05-0.08).
-  min_edge: 0.01
-  kelly_fraction: 0.25       # fraction of full Kelly to size by
+  # PAPER-MODE TUNING — these thresholds are intentionally aggressive
+  # so the full pipeline (scan -> opinion -> signal -> fill -> exit)
+  # gets exercised volumetrically. The Kalshi fee buffer is 5-7pp of
+  # stake at low prices, so against multi-book consensus, true positive
+  # net_edge is rare. Setting min_edge negative fires on positive
+  # GROSS edges that fees would eat in real life — fine for paper.
+  # BEFORE LIVE: raise min_edge to at least 0.03, ideally to whatever
+  # your realized CLV analysis supports.
+  min_edge: -0.03
+  kelly_fraction: 0.25
   min_entry_price: 0.30
 
 risk:

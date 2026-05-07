@@ -30,9 +30,10 @@ from .models.base import ProbabilityEstimate
 log = structlog.get_logger(__name__)
 
 
-# Conservative slippage buffer — accounts for top-of-book moving against us
-# between signal and fill. 0.005 = 0.5pp.
-_SLIPPAGE_BUFFER = 0.005
+# Conservative slippage buffer — accounts for top-of-book moving against
+# us between signal and fill. Set to 0 in paper mode (no real fills, no
+# real slippage). Bump back to 0.005-0.010 before going live.
+_SLIPPAGE_BUFFER = 0.0
 
 
 @dataclass
