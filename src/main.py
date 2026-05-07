@@ -112,9 +112,12 @@ async def amain() -> None:
     discovered: list[str] = []
     if cfg.models.sports.enabled:
         from .models.sports import SERIES_REGISTRY as SPORTS_SERIES
+        from .models.tennis import TENNIS_SERIES
         sports = list(SPORTS_SERIES.keys())
+        tennis = sorted(TENNIS_SERIES)
         log.info("scanner.dynamic_series.sports", count=len(sports), series=sports)
-        discovered += sports
+        log.info("scanner.dynamic_series.tennis", count=len(tennis), series=tennis)
+        discovered += sports + tennis
 
     if discovered:
         cfg.scanner.series_tickers = discovered

@@ -201,10 +201,22 @@ class SportsModel:
 
     def __post_init__(self) -> None:
         self.enabled = file_config().models.sports.enabled
+        # Tennis is a separate model with its own ticker format and
+        # provider path. We instantiate it once and dispatch when the
+        # market ticker matches a tennis series.
+        from .tennis import TennisModel
+        self._tennis = TennisModel(enabled=self.enabled)
 
     async def estimate(self, market: Market) -> ProbabilityEstimate | None:
         if not self.enabled:
             return None
+
+        # Dispatch tennis markets to the tennis model
+        from .tennis import TENNIS_SERIES
+        ticker = market.ticker or ""
+        for series in TENNIS_SERIES:
+            if ticker.startswith(series + "-"):
+                return await self._tennis.estimate(market)
 
         parsed = parse_ticker(market)
         if not parsed:

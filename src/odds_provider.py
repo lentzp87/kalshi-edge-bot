@@ -228,3 +228,213 @@ async def fair_probability_for_game(
 
     # Tier 2: ESPN pickcenter
     return await _espn_fair_prob(sport=sport, espn_event_id=espn_event_id)
+
+
+# ============================================================================
+# Tennis support
+# ============================================================================
+#
+# Tennis is structured differently from team sports in The Odds API:
+#   * Each TOURNAMENT has its own sport_key (e.g. tennis_atp_french_open,
+#     tennis_wta_madrid_open). There can be a dozen active at once across
+#     ATP, WTA, ITF, and Challenger circuits.
+#   * No ESPN pickcenter fallback — tennis pickcenter coverage is spotty.
+#   * Players are matched by name substring against the Kalshi player
+#     token (typically 3 letters from the last name).
+#
+# Quota note: hitting all active tennis sport keys every loop will burn
+# the free tier fast. We cache aggressively (10 min per tournament) and
+# only fetch a tournament when a Kalshi market actually needs it.
+
+_TENNIS_TTL_SEC = 600  # 10 min — tennis lines move slower than team sports
+_TENNIS_SPORTS_TTL_SEC = 3600  # 1 hour — tournament list rarely changes
+
+
+async def _fetch_active_tennis_sport_keys() -> list[str]:
+    """Return The Odds API sport keys for currently-active tennis tournaments.
+
+    Hits /v4/sports?all=false (active only) and filters group=="Tennis".
+    Cached 1h since tournaments don't start/end frequently.
+    """
+    api_key = _odds_api_key()
+    if not api_key:
+        return []
+    cache_key = "_tennis_active_sports"
+    cached = _odds_api_cache.get(cache_key)
+    now = time.time()
+    if cached and (now - cached[0]) < _TENNIS_SPORTS_TTL_SEC:
+        return cached[1]
+
+    lock = _odds_api_locks.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        cached = _odds_api_cache.get(cache_key)
+        if cached and (time.time() - cached[0]) < _TENNIS_SPORTS_TTL_SEC:
+            return cached[1]
+        url = f"{_ODDS_API_BASE}/sports"
+        params = {"apiKey": api_key, "all": "false"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                data = r.json() or []
+        except Exception as e:
+            log.warning("odds_api.tennis_sports_failed", err=str(e)[:120])
+            return []
+        keys = [
+            s["key"] for s in data
+            if (s.get("group") or "").lower() == "tennis"
+            and s.get("active") is not False
+        ]
+        _odds_api_cache[cache_key] = (time.time(), keys)
+        log.info("odds_api.tennis_sports", count=len(keys), keys=keys[:8])
+        return keys
+
+
+async def _fetch_tennis_odds(sport_key: str) -> list[dict] | None:
+    """Fetch h2h odds for a specific tennis tournament. Cached 10 min."""
+    api_key = _odds_api_key()
+    if not api_key:
+        return None
+    cache_key = f"tennis:{sport_key}"
+    cached = _odds_api_cache.get(cache_key)
+    now = time.time()
+    if cached and (now - cached[0]) < _TENNIS_TTL_SEC:
+        return cached[1]
+
+    lock = _odds_api_locks.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        cached = _odds_api_cache.get(cache_key)
+        if cached and (time.time() - cached[0]) < _TENNIS_TTL_SEC:
+            return cached[1]
+        url = f"{_ODDS_API_BASE}/sports/{sport_key}/odds"
+        params = {
+            "apiKey": api_key,
+            "regions": "us,eu,uk",  # tennis books skew European
+            "markets": "h2h",
+            "oddsFormat": "american",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+        except Exception as e:
+            log.warning("odds_api.tennis_odds_failed",
+                        err=str(e)[:120], sport_key=sport_key)
+            return None
+        _odds_api_cache[cache_key] = (time.time(), data)
+        return data
+
+
+def _player_match(token: str, full_name: str) -> bool:
+    """True if a 2-4 char Kalshi player token matches a full player name.
+
+    Tries: substring anywhere, prefix of any whitespace-separated name
+    segment (handles 'TOW' -> 'Townsend' or 'Taylor Townsend').
+    """
+    t = (token or "").upper().strip()
+    n = (full_name or "").upper().strip()
+    if not t or not n:
+        return False
+    if t in n:
+        return True
+    parts = [p for p in n.replace("-", " ").replace(".", " ").split() if p]
+    return any(p.startswith(t) for p in parts)
+
+
+async def fair_probability_for_tennis(
+    *, player_a_token: str, player_b_token: str,
+    date_utc: str | None = None,
+) -> tuple[float, float, str, str, str] | None:
+    """Find the matching tennis match across all active tennis tournaments.
+
+    Returns (fair_a, fair_b, provider, player_a_full, player_b_full) or
+    None if no match is found.
+
+    Player A is whichever of (home_team, away_team) matches player_a_token;
+    fair_a is its de-vigged probability.
+    """
+    sport_keys = await _fetch_active_tennis_sport_keys()
+    if not sport_keys:
+        return None
+
+    a_token = (player_a_token or "").upper()
+    b_token = (player_b_token or "").upper()
+    if not a_token or not b_token:
+        return None
+
+    date_window = None
+    if date_utc:
+        try:
+            from datetime import date, timedelta
+            y, m, d = (int(p) for p in date_utc.split("-"))
+            d0 = date(y, m, d)
+            date_window = {
+                (d0 - timedelta(days=1)).isoformat(),
+                d0.isoformat(),
+                (d0 + timedelta(days=1)).isoformat(),
+            }
+        except (ValueError, AttributeError):
+            date_window = None
+
+    for sport_key in sport_keys:
+        events = await _fetch_tennis_odds(sport_key)
+        if not events:
+            continue
+        for ev in events:
+            home = ev.get("home_team") or ""
+            away = ev.get("away_team") or ""
+
+            # Determine which Odds-API slot is player_a
+            if _player_match(a_token, home) and _player_match(b_token, away):
+                a_full, b_full = home, away
+                a_is_home = True
+            elif _player_match(a_token, away) and _player_match(b_token, home):
+                a_full, b_full = away, home
+                a_is_home = False
+            else:
+                continue
+
+            # Date filter (±1 day)
+            if date_window:
+                ev_date = (ev.get("commence_time") or "")[:10]
+                if ev_date and ev_date not in date_window:
+                    continue
+
+            # Aggregate de-vigged probs across books, take median
+            home_probs: list[float] = []
+            away_probs: list[float] = []
+            for book in ev.get("bookmakers") or []:
+                for mkt in book.get("markets") or []:
+                    if mkt.get("key") != "h2h":
+                        continue
+                    home_odds = away_odds = None
+                    for o in mkt.get("outcomes") or []:
+                        name = o.get("name") or ""
+                        if name == home:
+                            home_odds = o.get("price")
+                        elif name == away:
+                            away_odds = o.get("price")
+                    if home_odds is None or away_odds is None:
+                        continue
+                    pair = devig_two_way(home_odds, away_odds)
+                    if pair:
+                        home_probs.append(pair[0])
+                        away_probs.append(pair[1])
+
+            if not home_probs:
+                continue
+            home_probs.sort()
+            away_probs.sort()
+            n = len(home_probs)
+            median_home = home_probs[n // 2]
+            median_away = away_probs[n // 2]
+
+            if a_is_home:
+                fair_a, fair_b = median_home, median_away
+            else:
+                fair_a, fair_b = median_away, median_home
+            provider = f"odds_api:{sport_key} ({n} books)"
+            return fair_a, fair_b, provider, a_full, b_full
+
+    return None
