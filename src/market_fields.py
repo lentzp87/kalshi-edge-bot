@@ -194,22 +194,95 @@ def yes_side_name(market_raw: dict) -> str:
     return m.group("who").strip() if m else ""
 
 
+# Aliases for team / player nicknames that don't share letters with
+# their canonical name. These come up when Kalshi uses a colloquial
+# display name (e.g. "A's") but ESPN / The Odds API use the official
+# city + nickname ("Oakland Athletics"). Add entries here when a
+# sports.skip.our_side_unmatched / no_sportsbook_odds log reveals one.
+# Keys / values are lowercase, alphanumeric only. Direction-symmetric.
+_NICKNAME_ALIASES: dict[str, set[str]] = {
+    # MLB nicknames
+    "as": {"athletics", "oakland", "ath"},      # Kalshi "A's" ↔ Athletics
+    "athletics": {"as", "ath"},
+    "ath": {"as", "athletics", "oakland"},
+    # NBA acronyms (yes_sub_title prefix doesn't match city)
+    "okc": {"oklahoma"},
+    "lal": {"lakers"},                           # but LA Lakers usually OK via "Los"
+    "nyk": {"knicks", "york"},
+    "gsw": {"warriors", "golden", "state"},
+    "nop": {"pelicans"},
+    "sas": {"spurs"},
+    # NHL acronyms
+    "tbl": {"lightning", "tampa"},
+    "nyr": {"rangers", "york"},
+    "nyi": {"islanders"},
+    "njd": {"devils", "jersey"},
+    "vgk": {"vegas", "knights"},
+    "lak": {"kings"},
+    "sjs": {"sharks"},
+    # NFL acronyms (when these come up)
+    "lar": {"rams"},
+    "lac": {"chargers"},
+}
+
+
+def _alias_match(a: str, b: str) -> bool:
+    """True if a and b are linked via the nickname-alias graph."""
+    return b in _NICKNAME_ALIASES.get(a, set()) or a in _NICKNAME_ALIASES.get(b, set())
+
+
 def name_match(target: str, candidate: str) -> bool:
     """Loose name-equality used for matching team / player names across
-    Kalshi titles and book / ESPN responses.
+    Kalshi titles, ESPN responses, and The Odds API.
 
-    Match is symmetric and case-insensitive: returns True if either name
-    contains the other after normalizing whitespace and punctuation.
+    Match strategy (in order):
+      1. Whole-string substring (after stripping punctuation)
+         — handles "Pittsburgh" vs "Pittsburgh Pirates".
+      2. Tokenized prefix match
+         — handles "PHI Flyers" vs "Philadelphia" via PHI→PHIladelphia.
+      3. Nickname alias lookup
+         — handles "A's" vs "Oakland Athletics" via the alias table.
+
+    Both args are normalized: punctuation stripped, uppercased, and
+    split on whitespace. Substring matches require >=3 chars on the
+    short side to avoid 1-2 char false positives.
     """
     if not target or not candidate:
         return False
-    t = re.sub(r"[^\w\s]", "", target).upper().strip()
-    c = re.sub(r"[^\w\s]", "", candidate).upper().strip()
+    # Apostrophes contract (A's -> As, not A s) — keep neighboring chars
+    # together. Other punctuation becomes whitespace.
+    def _norm(s: str) -> str:
+        s = re.sub(r"[‘’']", "", s)
+        s = re.sub(r"[^\w\s]", " ", s).upper().strip()
+        return s
+    t = _norm(target)
+    c = _norm(candidate)
     if not t or not c:
         return False
-    if t == c:
+    # 1) Whole-string substring (collapsed whitespace)
+    t_join = re.sub(r"\s+", " ", t)
+    c_join = re.sub(r"\s+", " ", c)
+    if t_join == c_join:
         return True
-    return t in c or c in t
+    if t_join in c_join or c_join in t_join:
+        return True
+
+    # 2) Tokenized: any token from one side prefix-matches a token from
+    #    the other. Tokens shorter than 2 chars are dropped to avoid
+    #    pathological matches; prefix match requires >= 3 chars.
+    t_tokens = [tok for tok in t.split() if len(tok) >= 2]
+    c_tokens = [tok for tok in c.split() if len(tok) >= 2]
+    for tt in t_tokens:
+        for ct in c_tokens:
+            if tt == ct:
+                return True
+            short, long_ = (tt, ct) if len(tt) <= len(ct) else (ct, tt)
+            if len(short) >= 3 and long_.startswith(short):
+                return True
+            # 3) Alias check at the token level
+            if _alias_match(tt.lower(), ct.lower()):
+                return True
+    return False
 
 
 def series_prefix(ticker: str) -> str:
