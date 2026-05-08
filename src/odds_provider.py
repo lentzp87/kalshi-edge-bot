@@ -60,16 +60,11 @@ ODDS_API_SPORTS: dict[str, str] = {
 }
 
 
-# SECURITY NOTE: This key is checked into source code. The repo at
-# github.com/lentzp87/kalshi-edge-bot was public at one point — if it
-# is still public, anyone can read this key and burn through the free
-# tier. Either flip the repo to private or rotate this key after the
-# trial period:
-#   1. https://the-odds-api.com -> dashboard -> regenerate
-#   2. gh repo edit lentzp87/kalshi-edge-bot --visibility private
-# Setting the ODDS_API_KEY env var on Render takes precedence, which
-# is the right way to handle this once the repo is in stable use.
-_BAKED_ODDS_API_KEY = "3add2c265b411520b11f2370c4bbcf08"
+# Baked-in fallback key was burned through and is now dead. Removing
+# entirely so the bot's ONLY source for the Odds API key is the
+# ODDS_API_KEY env var. If the env var isn't set, Tier 2 is skipped
+# and the bot falls through to ESPN pickcenter (Tier 3).
+_BAKED_ODDS_API_KEY: str | None = None
 
 
 def _odds_api_key() -> str | None:
