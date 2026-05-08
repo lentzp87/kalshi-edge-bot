@@ -229,6 +229,11 @@ def stats() -> dict:
             "by_exit_reason": [], "by_series": [], "by_hold": [],
             "n_clv": 0, "avg_clv_bp": 0.0, "pct_positive_clv": 0.0,
             "by_sport_clv": [],
+            "settlement": {
+                "n_resolved": 0, "actual_total": 0.0, "settlement_total": 0.0,
+                "delta": 0.0, "better_held_pct": 0.0,
+                "stop_loss_n": 0, "stop_loss_actual": 0.0, "stop_loss_settlement": 0.0,
+            },
         }
 
     chronological = sorted(enriched, key=lambda t: t["closed_ts"])
@@ -309,6 +314,10 @@ def stats() -> dict:
         # CLV per trade: clv_price - fill_price (>0 if line moved our way).
         # Aggregated across trades with a non-null clv_price.
         **_clv_summary(chronological),
+        # ---- Settlement backtest ---------------------------------------
+        # "What if we held to settlement?" — populated by the periodic
+        # settlement_backfill task. Tells us whether exits cost us money.
+        "settlement": _journal.settlement_summary(),
     }
 
 
@@ -577,6 +586,26 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
         </table>
       </div>
     </div>
+  </div>
+
+  <div class="panel" style="margin-top:16px; border-color:#334155;">
+    <div class="title">Settlement Backtest <span class="meta">would we have made more money holding to game end?</span></div>
+    <div class="grid cols-3" style="gap:24px;padding:12px 0">
+      <div>
+        <div class="muted" style="font-size:12px">Actual P&amp;L (with exits)</div>
+        <div id="bt-actual" style="font-size:24px;font-weight:600">—</div>
+      </div>
+      <div>
+        <div class="muted" style="font-size:12px">If Held to Settlement</div>
+        <div id="bt-settle" style="font-size:24px;font-weight:600">—</div>
+      </div>
+      <div>
+        <div class="muted" style="font-size:12px">Delta (held − actual)</div>
+        <div id="bt-delta" style="font-size:24px;font-weight:600">—</div>
+        <div id="bt-delta-sub" class="muted" style="font-size:11px"></div>
+      </div>
+    </div>
+    <div id="bt-stoploss" class="muted" style="font-size:12px;padding:0 0 8px 0"></div>
   </div>
 
   <div class="grid cols-2" style="margin-top:16px">
@@ -938,6 +967,34 @@ function renderKpis(s) {{
   document.getElementById('curve-meta').textContent = s.pnl_curve.length
     ? `${{s.n_trades}} trades · range ${{fmt$(s.worst_trade)}} ... ${{fmt$(s.best_trade)}}`
     : 'no closed trades yet';
+
+  // Settlement backtest panel
+  const bt = s.settlement || {{}};
+  if (bt.n_resolved > 0) {{
+    document.getElementById('bt-actual').textContent = fmt$(bt.actual_total);
+    document.getElementById('bt-actual').className = cls(bt.actual_total);
+    document.getElementById('bt-settle').textContent = fmt$(bt.settlement_total);
+    document.getElementById('bt-settle').className = cls(bt.settlement_total);
+    document.getElementById('bt-delta').textContent = fmt$(bt.delta);
+    document.getElementById('bt-delta').className = cls(bt.delta);
+    document.getElementById('bt-delta-sub').textContent =
+      `${{bt.n_resolved}} resolved · holding beat exit on ${{bt.better_held_pct}}%`;
+    if (bt.stop_loss_n > 0) {{
+      const slDelta = (bt.stop_loss_settlement || 0) - (bt.stop_loss_actual || 0);
+      document.getElementById('bt-stoploss').innerHTML =
+        `Of ${{bt.stop_loss_n}} stop_loss exits: actual ${{fmt$(bt.stop_loss_actual)}}, ` +
+        `if held to settlement ${{fmt$(bt.stop_loss_settlement)}} ` +
+        `(<span class="${{cls(slDelta)}}">${{fmt$(slDelta)}}</span> left on the table)`;
+    }} else {{
+      document.getElementById('bt-stoploss').textContent = '';
+    }}
+  }} else {{
+    document.getElementById('bt-actual').textContent = '—';
+    document.getElementById('bt-settle').textContent = '—';
+    document.getElementById('bt-delta').textContent = '—';
+    document.getElementById('bt-delta-sub').textContent = 'awaiting Kalshi resolutions';
+    document.getElementById('bt-stoploss').textContent = '';
+  }}
 }}
 
 async function refresh() {{

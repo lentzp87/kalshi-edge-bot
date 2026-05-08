@@ -23,6 +23,7 @@ from .kalshi_client import KalshiClient
 from .models import model_for_category
 from .risk import RiskEngine
 from .scanner import Scanner
+from .settlement_backfill import backfill_loop as settlement_loop
 
 log = structlog.get_logger(__name__)
 
@@ -146,6 +147,11 @@ async def amain() -> None:
         await asyncio.gather(
             trading_loop(scanner, executor, journal),
             dashboard_server(),
+            # Periodic settlement backfill: for each closed trade, look up
+            # the Kalshi market's resolution and compute "what if held to
+            # settlement" P&L. Surfaces whether our exits are leaving
+            # money on the table.
+            settlement_loop(client, journal, interval_seconds=600),
         )
     finally:
         await client.aclose()

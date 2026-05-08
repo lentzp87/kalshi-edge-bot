@@ -63,10 +63,17 @@ CREATE TABLE IF NOT EXISTS trades (
 """
 
 
-# Schema migration for existing v3 DBs that pre-date the clv_price column.
+# Schema migration for existing v3 DBs that pre-date newer columns.
 # Idempotent: try to add the column, ignore the error if it already exists.
 _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN clv_price REAL",
+    # Settlement backtest columns: lets us compute "what if we'd held to
+    # game resolution instead of stop_loss/take_profit". settled_outcome
+    # is 1 if our side won, 0 if it lost, NULL if not yet resolved.
+    # settlement_pnl_usd is the counterfactual P&L net of entry fee.
+    "ALTER TABLE trades ADD COLUMN settled_outcome INTEGER",
+    "ALTER TABLE trades ADD COLUMN settlement_pnl_usd REAL",
+    "ALTER TABLE trades ADD COLUMN settled_checked_ts TEXT",
 ]
 
 
@@ -128,6 +135,70 @@ class Journal:
             (self._now(), exit_price, pnl_usd, fees_usd, reason, ticker),
         )
         self.conn.commit()
+
+    def trades_pending_settlement(self, limit: int = 500) -> list[dict]:
+        """Closed trades whose Kalshi market hasn't been resolved yet
+        (or hasn't been checked). Used by the settlement backfill task."""
+        cur = self.conn.execute(
+            "SELECT * FROM trades "
+            "WHERE closed_ts IS NOT NULL AND settled_outcome IS NULL "
+            "ORDER BY closed_ts DESC LIMIT ?",
+            (limit,),
+        )
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def update_settlement(
+        self, *, ticker: str, opened_ts: str,
+        settled_outcome: int, settlement_pnl_usd: float,
+    ) -> None:
+        """Record the counterfactual 'held to settlement' P&L."""
+        self.conn.execute(
+            "UPDATE trades "
+            "SET settled_outcome=?, settlement_pnl_usd=?, settled_checked_ts=? "
+            "WHERE ticker=? AND opened_ts=?",
+            (settled_outcome, settlement_pnl_usd, self._now(), ticker, opened_ts),
+        )
+        self.conn.commit()
+
+    def settlement_summary(self) -> dict:
+        """Aggregate stats: actual P&L vs held-to-settlement P&L."""
+        cur = self.conn.execute(
+            "SELECT pnl_usd, settlement_pnl_usd, exit_reason FROM trades "
+            "WHERE closed_ts IS NOT NULL AND settled_outcome IS NOT NULL"
+        )
+        n = 0
+        actual_total = 0.0
+        settle_total = 0.0
+        better_held = 0  # n trades where holding would have beaten exit
+        worse_held = 0   # n trades where exit was better than holding
+        sl_actual = 0.0
+        sl_settle = 0.0
+        sl_n = 0
+        for actual, settle, reason in cur.fetchall():
+            if actual is None or settle is None:
+                continue
+            n += 1
+            actual_total += actual
+            settle_total += settle
+            if settle > actual:
+                better_held += 1
+            elif settle < actual:
+                worse_held += 1
+            if reason == "stop_loss":
+                sl_n += 1
+                sl_actual += actual
+                sl_settle += settle
+        return {
+            "n_resolved": n,
+            "actual_total": round(actual_total, 2),
+            "settlement_total": round(settle_total, 2),
+            "delta": round(settle_total - actual_total, 2),
+            "better_held_pct": round(100 * better_held / n, 1) if n else 0.0,
+            "stop_loss_n": sl_n,
+            "stop_loss_actual": round(sl_actual, 2),
+            "stop_loss_settlement": round(sl_settle, 2),
+        }
 
     def update_clv_price(self, *, ticker: str, opened_ts: str, clv_price: float) -> None:
         """Record the Kalshi mid price near tipoff for CLV measurement.

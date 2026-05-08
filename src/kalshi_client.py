@@ -193,6 +193,14 @@ class KalshiClient:
             "GET", f"/trade-api/v2/markets/{ticker}/orderbook"
         )
 
+    async def get_market_raw(self, ticker: str) -> dict:
+        """Fetch a single market's full payload (for settlement lookups, etc).
+        Returns the inner `market` object — includes `result`, `status`,
+        `expiration_value`, etc.
+        """
+        data = await self._request("GET", f"/trade-api/v2/markets/{ticker}")
+        return data.get("market", {}) or {}
+
     async def list_series(self) -> list[dict]:
         """Fetch the full series catalog. Public endpoint, no auth needed."""
         data = await self._request("GET", "/trade-api/v2/series")
