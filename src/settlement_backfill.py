@@ -86,29 +86,54 @@ async def _check_one(client: KalshiClient, journal: Journal, trade: dict) -> boo
     return True
 
 
+async def _run_one_batch(client: KalshiClient, journal: Journal, *, label: str) -> None:
+    """One pass over pending trades. Always logs start + end so the bot
+    is observably doing work even if there's nothing to update."""
+    pending = journal.trades_pending_settlement(limit=500)
+    log.info(f"settlement.{label}.start", pending=len(pending))
+    if not pending:
+        return
+    updated = 0
+    skipped_unresolved = 0
+    for trade in pending:
+        try:
+            ok = await _check_one(client, journal, trade)
+            if ok:
+                updated += 1
+            else:
+                skipped_unresolved += 1
+        except Exception:
+            log.exception("settlement.check_error", ticker=trade.get("ticker"))
+        # 50ms between calls — gentle on the rate limiter
+        await asyncio.sleep(0.05)
+    log.info(f"settlement.{label}.done",
+             checked=len(pending), updated=updated,
+             still_unresolved=skipped_unresolved)
+
+
 async def backfill_loop(
     client: KalshiClient, journal: Journal, *, interval_seconds: int = 600,
 ) -> None:
-    """Run forever, checking pending settlements every `interval_seconds`.
+    """Run forever, checking pending settlements.
 
-    Default is 10 min — settlements happen ~hourly on game completion,
-    so this keeps the journal fresh without hammering Kalshi.
+    Pattern:
+      1. Immediately on startup: one full pass (loud logging) so the
+         dashboard populates within seconds of deploy.
+      2. Then every `interval_seconds` (default 10 min): another pass
+         to catch newly-resolved games.
+
+    Settlements happen ~hourly as games finish, so 10 min cadence keeps
+    the journal fresh without hammering Kalshi.
     """
+    # Startup: drain anything that's already resolved from the journal.
+    try:
+        await _run_one_batch(client, journal, label="startup")
+    except Exception:
+        log.exception("settlement.startup_error")
+
     while True:
+        await asyncio.sleep(interval_seconds)
         try:
-            pending = journal.trades_pending_settlement(limit=500)
-            if pending:
-                log.info("settlement.batch_start", count=len(pending))
-                updated = 0
-                # Sequentially to avoid spamming Kalshi; fast enough.
-                for trade in pending:
-                    ok = await _check_one(client, journal, trade)
-                    if ok:
-                        updated += 1
-                    # 50ms between calls — gentle on the rate limiter
-                    await asyncio.sleep(0.05)
-                log.info("settlement.batch_done",
-                         checked=len(pending), updated=updated)
+            await _run_one_batch(client, journal, label="periodic")
         except Exception:
             log.exception("settlement.loop_error")
-        await asyncio.sleep(interval_seconds)
