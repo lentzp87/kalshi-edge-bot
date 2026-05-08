@@ -207,6 +207,8 @@ def stats() -> dict:
             "by_sport": [], "by_provider": [], "by_our_side": [],
             "by_fav_dog": [], "by_entry_bucket": [], "by_tip_bucket": [],
             "by_exit_reason": [], "by_series": [],
+            "n_clv": 0, "avg_clv_bp": 0.0, "pct_positive_clv": 0.0,
+            "by_sport_clv": [],
         }
 
     chronological = sorted(enriched, key=lambda t: t["closed_ts"])
@@ -275,6 +277,50 @@ def stats() -> dict:
             chronological,
             lambda r: (r.get("ticker") or "").split("-", 1)[0] or "?"
         ),
+        # ---- CLV summary -----------------------------------------------
+        # CLV per trade: clv_price - fill_price (>0 if line moved our way).
+        # Aggregated across trades with a non-null clv_price.
+        **_clv_summary(chronological),
+    }
+
+
+def _clv_summary(trades: list[dict]) -> dict:
+    """Compute CLV stats: avg, win rate, by-sport breakdown."""
+    sampled = [
+        t for t in trades
+        if t.get("clv_price") is not None and t.get("fill_price") is not None
+    ]
+    if not sampled:
+        return {
+            "n_clv": 0, "avg_clv_bp": 0.0, "pct_positive_clv": 0.0,
+            "by_sport_clv": [],
+        }
+    deltas = [(t["clv_price"] - t["fill_price"]) for t in sampled]
+    n = len(deltas)
+    avg = sum(deltas) / n
+    positives = sum(1 for d in deltas if d > 0)
+    # Aggregate CLV per sport
+    by_sport: dict[str, list[float]] = {}
+    for t, d in zip(sampled, deltas):
+        s = t.get("_sport") or "?"
+        by_sport.setdefault(s, []).append(d)
+    by_sport_clv = sorted(
+        (
+            {
+                "key": k,
+                "n": len(v),
+                "avg_clv_bp": round(sum(v) * 100 / len(v), 2),
+                "pct_positive": round(100 * sum(1 for d in v if d > 0) / len(v), 1),
+            }
+            for k, v in by_sport.items()
+        ),
+        key=lambda r: -r["n"],
+    )
+    return {
+        "n_clv": n,
+        "avg_clv_bp": round(avg * 100, 2),
+        "pct_positive_clv": round(100 * positives / n, 1),
+        "by_sport_clv": by_sport_clv,
     }
 
 
@@ -412,6 +458,7 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
     <div class="kpi"><div class="label">Avg Edge</div><div class="value" id="kpi-edge">—</div><div class="sub">predicted</div></div>
     <div class="kpi"><div class="label">Open Positions</div><div class="value" id="kpi-open">—</div><div class="sub">capacity 15</div></div>
     <div class="kpi"><div class="label">Best / Worst</div><div class="value" id="kpi-bestworst" style="font-size:14px">—</div><div class="sub">single-trade range</div></div>
+    <div class="kpi"><div class="label">Avg CLV</div><div class="value" id="kpi-clv">—</div><div class="sub" id="kpi-clv-sub">closing-line value</div></div>
   </div>
 
   <div class="panel">
@@ -504,6 +551,16 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
     </div>
   </div>
 
+  <div class="grid cols-1" style="margin-top:16px">
+    <div class="panel">
+      <div class="title">CLV by Sport <span class="meta">closing-line value: did the line move our way after we entered?</span></div>
+      <table>
+        <thead><tr><th>Sport</th><th class="num">N</th><th class="num">Avg CLV</th><th class="num">% Positive</th></tr></thead>
+        <tbody id="tbody-clv-sport"><tr><td colspan="4" class="empty">awaiting tipoff samples</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
   <div class="section-header">Recent activity</div>
 
   <div class="panel">
@@ -511,7 +568,7 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
     <div class="scroll">
       <table>
         <thead><tr><th>Ticker</th><th>Sport</th><th>Side</th><th class="num">Edge</th><th class="num">Fill</th><th class="num">Exit</th><th class="num">CLV</th><th class="num">P&amp;L</th><th>Why</th></tr></thead>
-        <tbody id="tbody-trades"><tr><td colspan="8" class="empty">loading...</td></tr></tbody>
+        <tbody id="tbody-trades"><tr><td colspan="9" class="empty">loading...</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -626,6 +683,20 @@ function renderBucketTable(tbodyId, rows) {{
     </tr>`).join('');
 }}
 
+function renderClvTable(tbodyId, rows) {{
+  const tb = document.getElementById(tbodyId);
+  if (!rows || !rows.length) {{
+    tb.innerHTML = '<tr><td colspan="4" class="empty">awaiting tipoff samples</td></tr>'; return;
+  }}
+  tb.innerHTML = rows.map(r => `
+    <tr>
+      <td>${{r.key}}</td>
+      <td class="num">${{r.n}}</td>
+      <td class="num ${{cls(r.avg_clv_bp)}}">${{(r.avg_clv_bp>=0?'+':'')}}${{r.avg_clv_bp.toFixed(1)}}bp</td>
+      <td class="num">${{r.pct_positive.toFixed(0)}}%</td>
+    </tr>`).join('');
+}}
+
 function renderOpen(positions) {{
   document.getElementById('open-count').textContent = positions.length + ' open';
   const tb = document.getElementById('tbody-open');
@@ -696,6 +767,19 @@ function renderKpis(s) {{
   document.getElementById('kpi-edge').textContent = (s.avg_edge_bp||0).toFixed(0) + 'bp';
   document.getElementById('kpi-open').textContent = s.open_positions;
   document.getElementById('kpi-bestworst').textContent = `${{fmt$(s.best_trade)}} / ${{fmt$(s.worst_trade)}}`;
+  // CLV KPI: green if avg CLV > 0 (you got better entries than the close on average)
+  const clvBp = s.avg_clv_bp || 0;
+  const clvEl = document.getElementById('kpi-clv');
+  if (s.n_clv > 0) {{
+    clvEl.textContent = (clvBp >= 0 ? '+' : '') + clvBp.toFixed(1) + 'bp';
+    clvEl.parentElement.classList.toggle('pos', clvBp > 0);
+    clvEl.parentElement.classList.toggle('neg', clvBp < 0);
+    document.getElementById('kpi-clv-sub').textContent =
+      `${{s.n_clv}} samples · ${{(s.pct_positive_clv||0).toFixed(0)}}% positive`;
+  }} else {{
+    clvEl.textContent = '—';
+    document.getElementById('kpi-clv-sub').textContent = 'awaiting tipoff samples';
+  }}
   document.getElementById('curve-meta').textContent = s.pnl_curve.length
     ? `${{s.n_trades}} trades · range ${{fmt$(s.worst_trade)}} ... ${{fmt$(s.best_trade)}}`
     : 'no closed trades yet';
@@ -720,6 +804,7 @@ async function refresh() {{
     renderBucketTable('tbody-tip',      stats.by_tip_bucket);
     renderBucketTable('tbody-exit',     stats.by_exit_reason);
     renderBucketTable('tbody-series',   stats.by_series);
+    renderClvTable('tbody-clv-sport',   stats.by_sport_clv);
     renderOpen(openPos);
     renderTrades(tradesRows);
     renderDaily(daily);
