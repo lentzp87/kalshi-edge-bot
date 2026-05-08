@@ -75,7 +75,13 @@ class SportsModel:
         # Tennis is a separate model with its own provider path.
         # We instantiate it once and dispatch when the series matches.
         from .tennis import TennisModel
+        from .sports_in_game import InGameSportsModel
         self._tennis = TennisModel(enabled=self.enabled)
+        # In-game model targets a different edge: ESPN winprob updating
+        # 2-5s after plays vs Kalshi taking 30-90s. Try it first; if the
+        # game is pregame (state != "in") it returns None and we fall
+        # through to the pregame book-consensus model.
+        self._in_game = InGameSportsModel(enabled=self.enabled)
 
     async def estimate(self, market: Market) -> ProbabilityEstimate | None:
         if not self.enabled:
@@ -88,6 +94,13 @@ class SportsModel:
         from .tennis import TENNIS_SERIES
         if series in TENNIS_SERIES:
             return await self._tennis.estimate(market)
+
+        # Try the in-game (ESPN winprob lag) model first. Returns None
+        # when the game isn't in progress / not late enough — then the
+        # pregame book-consensus path below runs.
+        ig_result = await self._in_game.estimate(market)
+        if ig_result:
+            return ig_result
 
         sport = SERIES_REGISTRY.get(series)
         if not sport:
