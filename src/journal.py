@@ -145,8 +145,11 @@ class Journal:
     # ---------- read helpers used by dashboard ----------
 
     def open_positions(self) -> list[dict]:
+        # Include `reason` so the dashboard can show team names, game,
+        # provider, etc. Parsing happens client-side via parseReason().
         cur = self.conn.execute(
-            "SELECT ticker, side, contracts, size_usd, fill_price, opened_ts, edge "
+            "SELECT ticker, side, contracts, size_usd, fill_price, opened_ts, "
+            "edge, reason "
             "FROM trades WHERE closed_ts IS NULL ORDER BY opened_ts DESC"
         )
         cols = [c[0] for c in cur.description]

@@ -475,8 +475,8 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
       <div class="title">Open Positions <span class="meta" id="open-count"></span></div>
       <div class="scroll">
         <table>
-          <thead><tr><th>Ticker</th><th>Side</th><th class="num">Size</th><th class="num">Fill</th><th class="num">Edge</th></tr></thead>
-          <tbody id="tbody-open"><tr><td colspan="5" class="empty">loading...</td></tr></tbody>
+          <thead><tr><th>Bet</th><th>Sport</th><th>Side</th><th class="num">Size</th><th class="num">Fill</th><th class="num">Edge</th><th>Tip</th><th>Provider</th><th>Opened</th><th class="num">Held</th></tr></thead>
+          <tbody id="tbody-open"><tr><td colspan="10" class="empty">loading...</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -567,8 +567,8 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
     <div class="title">Recent Trades <span class="meta" id="trades-count"></span></div>
     <div class="scroll">
       <table>
-        <thead><tr><th>Ticker</th><th>Sport</th><th>Side</th><th class="num">Size</th><th class="num">Edge</th><th class="num">Fill</th><th class="num">Exit</th><th class="num">CLV</th><th class="num">P&amp;L</th><th>Opened</th><th class="num">Held</th><th class="num">Tip</th><th>Provider</th><th>Why</th></tr></thead>
-        <tbody id="tbody-trades"><tr><td colspan="14" class="empty">loading...</td></tr></tbody>
+        <thead><tr><th>Ticker</th><th>Sport</th><th>Side</th><th class="num">Size</th><th class="num">Edge</th><th class="num">Fill</th><th class="num">Exit</th><th class="num">CLV</th><th class="num">P&amp;L</th><th class="num">Fees</th><th>Opened</th><th class="num">Held</th><th class="num">Tip</th><th>Provider</th><th>Why</th></tr></thead>
+        <tbody id="tbody-trades"><tr><td colspan="15" class="empty">loading...</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -619,14 +619,17 @@ const fmtHeld = (openIso, closeIso) => {{
   return m === 0 ? `${{h}}h` : `${{h}}h ${{m}}m`;
 }};
 // Extract bits we care about from the reason string the model writes.
-// Format example: "MLB pregame Pittsburgh@SF | book[odds_api (8 books)] ... | tip in 145min"
+// Format examples:
+//   "MLB pregame Pittsburgh@SF | book[odds_api (8 books)] ... |
+//    our=San Francisco(home) p_yes=0.532 | tip in 145min"
+//   "TENNIS pregame Taylor Townsend vs Sara Errani | book[pinnacle] ...
+//    our=Townsend p_yes=0.612 | start in 60min"
 const parseReason = reason => {{
   if (!reason) return {{}};
   const out = {{}};
   let m;
   if ((m = reason.match(/book\[([^\]]+)\]/))) {{
     const provider = m[1];
-    // pinnacle / odds_api (N books) / espn:DraftKings — pull out the simple tag
     if (provider.startsWith('pinnacle')) out.provider = 'pinnacle';
     else if (provider.startsWith('odds_api')) {{
       out.provider = 'odds_api';
@@ -635,8 +638,33 @@ const parseReason = reason => {{
     }} else if (provider.startsWith('espn')) out.provider = 'espn';
     else out.provider = provider;
   }}
-  if ((m = reason.match(/tip in (-?\d+)min/))) out.minsToTip = parseInt(m[1]);
+  if ((m = reason.match(/tip in (-?\d+)min/)) || (m = reason.match(/start in (-?\d+)min/))) {{
+    out.minsToTip = parseInt(m[1]);
+  }}
+  // Matchup — take everything between "pregame" and the first " | "
+  if ((m = reason.match(/pregame\s+(.+?)\s+\|/))) {{
+    out.matchup = m[1].trim();
+  }}
+  // Our side (team or player name)
+  if ((m = reason.match(/our=([^()|]+?)(?:\(|\s+p_yes|\s*\|)/))) {{
+    out.ourSide = m[1].trim();
+  }}
+  // Home/away tag for team sports (in parens after our=)
+  if ((m = reason.match(/our=[^()|]+\((home|away)\)/))) {{
+    out.ourLoc = m[1];
+  }}
+  // Model probability we computed for our side
+  if ((m = reason.match(/p_yes=([\d.]+)/))) out.pYes = parseFloat(m[1]);
   return out;
+}};
+// Build a human-readable trade label like "PHI 76ers (home) vs NYK"
+const fmtMatchup = (r) => {{
+  const meta = parseReason(r.reason);
+  if (meta.matchup && meta.ourSide) {{
+    const loc = meta.ourLoc ? ` (${{meta.ourLoc}})` : '';
+    return `${{meta.ourSide}}${{loc}} — ${{meta.matchup}}`;
+  }}
+  return '';
 }};
 
 let curveChart, calibChart;
@@ -737,15 +765,35 @@ function renderClvTable(tbodyId, rows) {{
 function renderOpen(positions) {{
   document.getElementById('open-count').textContent = positions.length + ' open';
   const tb = document.getElementById('tbody-open');
-  if (!positions.length) {{ tb.innerHTML = '<tr><td colspan="5" class="empty">none</td></tr>'; return; }}
-  tb.innerHTML = positions.map(p => `
-    <tr>
-      <td class="ticker">${{p.ticker}}</td>
+  if (!positions.length) {{ tb.innerHTML = '<tr><td colspan="10" class="empty">none</td></tr>'; return; }}
+  const nowIso = new Date().toISOString();
+  tb.innerHTML = positions.map(p => {{
+    const meta = parseReason(p.reason);
+    // Bet label: "Phillies (home)" or "Townsend" — what we actually backed.
+    let betLabel = meta.ourSide || p.ticker.split('-').pop() || '?';
+    if (meta.ourLoc) betLabel += ` <span class="muted">(${{meta.ourLoc}})</span>`;
+    if (meta.matchup) betLabel += `<br><span class="muted" style="font-size:11px">${{meta.matchup}}</span>`;
+    const tipCell = (meta.minsToTip != null)
+      ? (meta.minsToTip < 60 ? meta.minsToTip + 'm' : (meta.minsToTip/60).toFixed(1)+'h')
+      : '<span class="muted">—</span>';
+    const provCell = meta.provider
+      ? (meta.books ? `${{meta.provider}} <span class="muted">(${{meta.books}})</span>` : meta.provider)
+      : '<span class="muted">—</span>';
+    const reasonAttr = p.reason ? ` title="${{(p.reason||'').replace(/"/g,'&quot;')}}"` : '';
+    return `
+    <tr${{reasonAttr}}>
+      <td>${{betLabel}}</td>
+      <td>${{sportFromTicker(p.ticker)}}</td>
       <td>${{p.side}}</td>
       <td class="num">$${{(p.size_usd||0).toFixed(0)}}</td>
       <td class="num">${{(p.fill_price||0).toFixed(2)}}</td>
       <td class="num">${{((p.edge||0)*100).toFixed(1)}}bp</td>
-    </tr>`).join('');
+      <td class="num">${{tipCell}}</td>
+      <td class="muted">${{provCell}}</td>
+      <td class="muted">${{fmtClock(p.opened_ts)}}</td>
+      <td class="num muted">${{fmtHeld(p.opened_ts, nowIso)}}</td>
+    </tr>`;
+  }}).join('');
 }}
 
 function renderTrades(rows) {{
@@ -798,6 +846,7 @@ function renderTrades(rows) {{
       <td class="num">${{(r.exit_price||0).toFixed(2)}}</td>
       <td class="num">${{clvCell}}</td>
       <td class="num ${{cls(r.pnl_usd)}}">${{fmt$(r.pnl_usd)}}</td>
+      <td class="num muted">$${{(r.fees_usd||0).toFixed(2)}}</td>
       <td class="muted">${{fmtClock(r.opened_ts)}}</td>
       <td class="num muted">${{fmtHeld(r.opened_ts, r.closed_ts)}}</td>
       <td class="num muted">${{tipCell}}</td>
