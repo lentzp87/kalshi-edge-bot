@@ -102,6 +102,21 @@ async def amain() -> None:
     env = env_config()
     log.info("bot.start", mode=env.mode, kalshi_env=env.kalshi_env, bankroll=cfg.bankroll_usd)
 
+    # Observability: where is the journal writing? Which odds key is in use?
+    import os as _os
+    from pathlib import Path as _Path
+    data_dir_resolved = _Path(env.data_dir).resolve()
+    log.info("bot.data_dir",
+             value=env.data_dir, resolved=str(data_dir_resolved),
+             exists=data_dir_resolved.exists())
+    odds_key_env = _os.environ.get("ODDS_API_KEY")
+    if odds_key_env:
+        masked = odds_key_env[:4] + "..." + odds_key_env[-4:] if len(odds_key_env) >= 8 else "***"
+        log.info("bot.odds_api_key", source="env", masked=masked)
+    else:
+        log.warning("bot.odds_api_key", source="baked",
+                    note="ODDS_API_KEY env var not set — using baked-in key (likely dead)")
+
     client = KalshiClient()
     # Pull Kalshi's full series catalog ONCE at startup so every market
     # we see can be categorized by Kalshi's own taxonomy ("Sports",

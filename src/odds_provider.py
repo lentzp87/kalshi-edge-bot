@@ -294,9 +294,15 @@ async def _pinnacle_fair_prob(
         return None
     data = await _fetch_pinnacle_league(league_id)
     if not data:
+        # _fetch_pinnacle_league logged the actual error; just note we missed
+        log.info("pinnacle.no_data", sport=sport, league_id=league_id,
+                 away=away_name, home=home_name)
         return None
     matchups = data.get("matchups") or []
     markets = data.get("markets") or []
+    if not matchups:
+        log.info("pinnacle.empty_matchups", sport=sport, league_id=league_id)
+        return None
 
     # Build a matchupId -> (away_name, home_name) lookup
     mu_by_id: dict[int, tuple[str, str]] = {}
@@ -319,6 +325,12 @@ async def _pinnacle_fair_prob(
             pin_away, pin_home = a_pin, h_pin
             break
     if target_mu_id is None:
+        # Log a sample of available teams so we can see why match failed
+        sample_teams = [t for t in list(mu_by_id.values())[:5]]
+        log.info("pinnacle.no_team_match",
+                 sport=sport, kalshi_away=away_name, kalshi_home=home_name,
+                 pinnacle_sample=sample_teams,
+                 total_matchups=len(mu_by_id))
         return None
 
     # Find the moneyline market for that matchup
