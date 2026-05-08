@@ -117,6 +117,26 @@ def _tip_bucket(mins: float | None) -> str:
     return "4h+"
 
 
+def _hold_bucket(opened_ts: str | None, closed_ts: str | None) -> str | None:
+    """Bucket the trade's hold duration. Mirrors what we'd want to see
+    if short-hold trades cluster around stop_losses on noise."""
+    if not opened_ts or not closed_ts:
+        return None
+    try:
+        from datetime import datetime as _dt
+        o = _dt.fromisoformat(opened_ts.replace("Z", "+00:00"))
+        c = _dt.fromisoformat(closed_ts.replace("Z", "+00:00"))
+        mins = (c - o).total_seconds() / 60
+    except (ValueError, AttributeError):
+        return None
+    if mins < 2:    return "<2m"
+    if mins < 5:    return "2-5m"
+    if mins < 15:   return "5-15m"
+    if mins < 60:   return "15-60m"
+    if mins < 240:  return "1-4h"
+    return "4h+"
+
+
 def _bucket_aggregate(rows: list[dict], key_fn) -> list[dict]:
     """Group rows by key_fn(row) and return [{key, n, wins, pnl, avg_pnl, win_rate}]."""
     bucket: dict = defaultdict(lambda: {"n": 0, "wins": 0, "pnl": 0.0})
@@ -206,7 +226,7 @@ def stats() -> dict:
             "pnl_curve": [], "edge_calibration": [],
             "by_sport": [], "by_provider": [], "by_our_side": [],
             "by_fav_dog": [], "by_entry_bucket": [], "by_tip_bucket": [],
-            "by_exit_reason": [], "by_series": [],
+            "by_exit_reason": [], "by_series": [], "by_hold": [],
             "n_clv": 0, "avg_clv_bp": 0.0, "pct_positive_clv": 0.0,
             "by_sport_clv": [],
         }
@@ -276,6 +296,14 @@ def stats() -> dict:
         "by_series": _bucket_aggregate(
             chronological,
             lambda r: (r.get("ticker") or "").split("-", 1)[0] or "?"
+        ),
+        # Hold-duration buckets answer "did we exit too early?". If
+        # <2m and 2-5m buckets dominate stop_losses with negative P&L,
+        # we're being whipped out on noise and should widen SL or
+        # delay it (e.g. no SL in first 30 min after entry).
+        "by_hold": _bucket_aggregate(
+            chronological,
+            lambda r: _hold_bucket(r.get("opened_ts"), r.get("closed_ts"))
         ),
         # ---- CLV summary -----------------------------------------------
         # CLV per trade: clv_price - fill_price (>0 if line moved our way).
@@ -551,9 +579,16 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
     </div>
   </div>
 
-  <div class="grid cols-1" style="margin-top:16px">
+  <div class="grid cols-2" style="margin-top:16px">
     <div class="panel">
-      <div class="title">CLV by Sport <span class="meta">closing-line value: did the line move our way after we entered?</span></div>
+      <div class="title">By Hold Duration <span class="meta">are we exiting too early on stop_loss noise?</span></div>
+      <table>
+        <thead><tr><th>Hold</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="tbody-hold"><tr><td colspan="4" class="empty">no data yet</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <div class="title">CLV by Sport <span class="meta">did the line move our way after we entered?</span></div>
       <table>
         <thead><tr><th>Sport</th><th class="num">N</th><th class="num">Avg CLV</th><th class="num">% Positive</th></tr></thead>
         <tbody id="tbody-clv-sport"><tr><td colspan="4" class="empty">awaiting tipoff samples</td></tr></tbody>
@@ -567,7 +602,7 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
     <div class="title">Recent Trades <span class="meta" id="trades-count"></span></div>
     <div class="scroll">
       <table>
-        <thead><tr><th>Ticker</th><th>Sport</th><th>Side</th><th class="num">Size</th><th class="num">Edge</th><th class="num">Fill</th><th class="num">Exit</th><th class="num">CLV</th><th class="num">P&amp;L</th><th class="num">Fees</th><th>Opened</th><th class="num">Held</th><th class="num">Tip</th><th>Provider</th><th>Why</th></tr></thead>
+        <thead><tr><th>Bet</th><th>Sport</th><th>Side</th><th class="num">Size</th><th class="num">Edge</th><th class="num">Fill</th><th class="num">Exit</th><th class="num">CLV</th><th class="num">P&amp;L</th><th class="num">Fees</th><th>Opened</th><th class="num">Held</th><th class="num">Tip</th><th>Provider</th><th>Why</th></tr></thead>
         <tbody id="tbody-trades"><tr><td colspan="15" class="empty">loading...</td></tr></tbody>
       </table>
     </div>
@@ -835,9 +870,14 @@ function renderTrades(rows) {{
       : '<span class="muted">—</span>';
     // Full reason string available on row hover for deep-dive
     const reasonAttr = r.reason ? ` title="${{(r.reason||'').replace(/"/g,'&quot;')}}"` : '';
+    // Bet label same as open positions: parsed team/player + matchup subtitle
+    let betLabel = meta.ourSide || r.ticker.split('-').pop() || '?';
+    if (meta.ourLoc) betLabel += ` <span class="muted">(${{meta.ourLoc}})</span>`;
+    if (meta.matchup) betLabel += `<br><span class="muted" style="font-size:11px">${{meta.matchup}}</span>`;
+    if (r._dup > 1) betLabel += ` <span class="muted">×${{r._dup}}</span>`;
     return `
     <tr${{reasonAttr}}>
-      <td class="ticker">${{r.ticker}}${{dupBadge}}</td>
+      <td>${{betLabel}}</td>
       <td>${{sportFromTicker(r.ticker)}}</td>
       <td>${{r.side}}</td>
       <td class="num">$${{(r.size_usd||0).toFixed(0)}}</td>
@@ -919,6 +959,7 @@ async function refresh() {{
     renderBucketTable('tbody-tip',      stats.by_tip_bucket);
     renderBucketTable('tbody-exit',     stats.by_exit_reason);
     renderBucketTable('tbody-series',   stats.by_series);
+    renderBucketTable('tbody-hold',     stats.by_hold);
     renderClvTable('tbody-clv-sport',   stats.by_sport_clv);
     renderOpen(openPos);
     renderTrades(tradesRows);
