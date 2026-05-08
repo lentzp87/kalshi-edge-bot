@@ -1,17 +1,23 @@
 """Sportsbook odds provider.
 
-Two-tier strategy:
+Three-tier strategy (best to worst):
 
-  Tier 1 (preferred): The Odds API (https://the-odds-api.com)
+  Tier 1 (preferred): Pinnacle direct (guest API)
+    - Sharp single book — Pinnacle is widely considered the truest line
+      and is the standard for professional CLV measurement.
+    - Free, no auth (uses public guest API key)
+    - Endpoint can rate-limit or return 401 if Pinnacle changes terms
+
+  Tier 2: The Odds API (https://the-odds-api.com)
     - Multi-book consensus (typically 5-15 books per game)
     - Free tier: 500 req/month, paid tiers from $30/mo for 100k req/mo
-    - Set ODDS_API_KEY env var to enable
-    - Far better than single-book — averages out sportsbook-specific lean
+    - Set ODDS_API_KEY env var or use the baked-in key
+    - Includes Pinnacle in most regions, plus DraftKings, FanDuel, etc.
 
-  Tier 2 (fallback): ESPN pickcenter
+  Tier 3 (fallback): ESPN pickcenter
     - Single book (typically DraftKings)
     - Free, already in our ESPN summary fetch
-    - Better than nothing; weaker than multi-book
+    - Better than nothing; soft book, weaker than Pinnacle / multi-book
 
 The model calls `fair_probability_for_game(...)` and we transparently
 pick the best available source. Provider name is returned alongside so
@@ -195,6 +201,152 @@ async def _espn_fair_prob(*, sport: str, espn_event_id: str) -> tuple[float, flo
     return pair[0], pair[1], f"espn:{book}"
 
 
+# ---- Pinnacle direct (Tier 1) ----
+#
+# Pinnacle's guest API is what their public website uses. The X-API-Key
+# below is their published guest key — it's not a secret. Pinnacle has
+# been changing terms occasionally, so we treat 401/403 as "fall through
+# to Tier 2" without alarming the caller.
+
+_PINNACLE_BASE = "https://guest.api.arcadia.pinnacle.com/0.1"
+_PINNACLE_GUEST_KEY = "CmX2KcMrXuFmNg6YFbmTxE0y9CIrOi0R"
+_PINNACLE_TTL_SEC = 300  # 5 min cache; same as Odds API
+
+# Pinnacle league IDs. These are stable for major leagues but verify
+# via /sports/{sport_id}/leagues if a sport stops returning matchups.
+PINNACLE_LEAGUE_IDS: dict[str, int] = {
+    "nba": 487,
+    "nfl": 889,
+    "mlb": 246,
+    "nhl": 1456,
+}
+
+_pinnacle_cache: dict[str, tuple[float, dict]] = {}
+_pinnacle_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _fetch_pinnacle_league(league_id: int) -> dict | None:
+    """Fetch matchups + markets for one Pinnacle league.
+
+    Returns a combined dict {"matchups": [...], "markets": [...]} or
+    None on auth/network failure (the caller falls through to Tier 2).
+    """
+    cache_key = f"pinnacle:{league_id}"
+    cached = _pinnacle_cache.get(cache_key)
+    now = time.time()
+    if cached and (now - cached[0]) < _PINNACLE_TTL_SEC:
+        return cached[1]
+
+    lock = _pinnacle_locks.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        cached = _pinnacle_cache.get(cache_key)
+        if cached and (time.time() - cached[0]) < _PINNACLE_TTL_SEC:
+            return cached[1]
+
+        headers = {
+            "X-API-Key": _PINNACLE_GUEST_KEY,
+            "Accept": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+                m_url = f"{_PINNACLE_BASE}/leagues/{league_id}/matchups"
+                k_url = f"{_PINNACLE_BASE}/leagues/{league_id}/markets/straight"
+                r_m = await client.get(m_url)
+                r_k = await client.get(k_url)
+                r_m.raise_for_status()
+                r_k.raise_for_status()
+                data = {"matchups": r_m.json() or [], "markets": r_k.json() or []}
+        except Exception as e:
+            log.warning("pinnacle.fetch_failed",
+                        err=str(e)[:120], league_id=league_id)
+            return None
+        _pinnacle_cache[cache_key] = (time.time(), data)
+        return data
+
+
+def _pinnacle_participants(matchup: dict) -> tuple[str, str] | None:
+    """Pull (away_name, home_name) from a Pinnacle matchup record."""
+    parts = matchup.get("participants") or []
+    if len(parts) < 2:
+        return None
+    away = home = None
+    for p in parts:
+        align = (p.get("alignment") or "").lower()
+        nm = p.get("name") or ""
+        if align == "home":
+            home = nm
+        elif align == "away":
+            away = nm
+    if away and home:
+        return away, home
+    # Some Pinnacle records don't tag alignment — fall back to order
+    if len(parts) >= 2 and parts[0].get("name") and parts[1].get("name"):
+        return parts[0]["name"], parts[1]["name"]
+    return None
+
+
+async def _pinnacle_fair_prob(
+    *, sport: str, away_name: str, home_name: str, date_utc: str | None,
+) -> tuple[float, float, str] | None:
+    """Pinnacle moneyline -> de-vigged fair (home_prob, away_prob, provider)."""
+    league_id = PINNACLE_LEAGUE_IDS.get(sport)
+    if not league_id:
+        return None
+    data = await _fetch_pinnacle_league(league_id)
+    if not data:
+        return None
+    matchups = data.get("matchups") or []
+    markets = data.get("markets") or []
+
+    # Build a matchupId -> (away_name, home_name) lookup
+    mu_by_id: dict[int, tuple[str, str]] = {}
+    for mu in matchups:
+        mid = mu.get("id")
+        if not mid:
+            continue
+        teams = _pinnacle_participants(mu)
+        if teams:
+            mu_by_id[int(mid)] = teams
+
+    # Find the matchup whose teams match Kalshi's
+    target_mu_id = None
+    pin_away = pin_home = None
+    for mid, (a_pin, h_pin) in mu_by_id.items():
+        forward = name_match(away_name, a_pin) and name_match(home_name, h_pin)
+        reverse = name_match(away_name, h_pin) and name_match(home_name, a_pin)
+        if forward or reverse:
+            target_mu_id = mid
+            pin_away, pin_home = a_pin, h_pin
+            break
+    if target_mu_id is None:
+        return None
+
+    # Find the moneyline market for that matchup
+    home_odds = away_odds = None
+    for mk in markets:
+        if mk.get("matchupId") != target_mu_id:
+            continue
+        if (mk.get("type") or "").lower() != "moneyline":
+            continue
+        for price in mk.get("prices") or []:
+            d = price.get("designation") or ""
+            label = price.get("label") or ""
+            # Pinnacle uses designation home/away, sometimes label
+            if d == "home" or label == pin_home:
+                home_odds = price.get("price")
+            elif d == "away" or label == pin_away:
+                away_odds = price.get("price")
+        if home_odds is not None and away_odds is not None:
+            break
+
+    if home_odds is None or away_odds is None:
+        return None
+    pair = devig_two_way(home_odds, away_odds)
+    if not pair:
+        return None
+    return pair[0], pair[1], "pinnacle"
+
+
 # ---- Public API used by the sports model ----
 
 async def fair_probability_for_game(
@@ -204,12 +356,18 @@ async def fair_probability_for_game(
 ) -> tuple[float, float, str] | None:
     """Return (fair_home_prob, fair_away_prob, provider_name).
 
-    Tries The Odds API (multi-book median) first, falls back to ESPN
-    pickcenter. away_name / home_name are full team names from Kalshi's
-    title (e.g. "Pittsburgh", "San Francisco"). espn_event_id is
-    optional — only used for the ESPN fallback.
+    Tries Pinnacle first (sharpest book, free), then The Odds API
+    (multi-book median), then ESPN pickcenter. away_name / home_name
+    are full team names from Kalshi's title.
     """
-    # Tier 1: multi-book consensus (only if API key set)
+    # Tier 1: Pinnacle direct
+    r = await _pinnacle_fair_prob(
+        sport=sport, away_name=away_name, home_name=home_name, date_utc=date_utc,
+    )
+    if r:
+        return r
+
+    # Tier 2: The Odds API multi-book consensus (only if API key set)
     if _odds_api_key():
         r = await _odds_api_fair_prob(
             sport=sport,
@@ -220,7 +378,7 @@ async def fair_probability_for_game(
         if r:
             return r
 
-    # Tier 2: ESPN pickcenter (only if we have an ESPN event id)
+    # Tier 3: ESPN pickcenter (only if we have an ESPN event id)
     if espn_event_id:
         return await _espn_fair_prob(sport=sport, espn_event_id=espn_event_id)
     return None

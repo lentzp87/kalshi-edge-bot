@@ -510,7 +510,7 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
     <div class="title">Recent Trades <span class="meta" id="trades-count"></span></div>
     <div class="scroll">
       <table>
-        <thead><tr><th>Ticker</th><th>Sport</th><th>Side</th><th class="num">Edge</th><th class="num">Fill</th><th class="num">Exit</th><th class="num">P&amp;L</th><th>Why</th></tr></thead>
+        <thead><tr><th>Ticker</th><th>Sport</th><th>Side</th><th class="num">Edge</th><th class="num">Fill</th><th class="num">Exit</th><th class="num">CLV</th><th class="num">P&amp;L</th><th>Why</th></tr></thead>
         <tbody id="tbody-trades"><tr><td colspan="8" class="empty">loading...</td></tr></tbody>
       </table>
     </div>
@@ -644,9 +644,18 @@ function renderTrades(rows) {{
   document.getElementById('trades-count').textContent = rows.length + ' shown';
   const tb = document.getElementById('tbody-trades');
   const closed = rows.filter(r => r.closed_ts && r.pnl_usd != null);
-  if (!closed.length) {{ tb.innerHTML = '<tr><td colspan="8" class="empty">no closed trades yet</td></tr>'; return; }}
+  if (!closed.length) {{ tb.innerHTML = '<tr><td colspan="9" class="empty">no closed trades yet</td></tr>'; return; }}
   const safe = closed.filter(r => Math.abs(r.pnl_usd) <= Math.max(3 * (r.size_usd||0), 200));
-  tb.innerHTML = safe.slice(0, 50).map(r => `
+  tb.innerHTML = safe.slice(0, 50).map(r => {{
+    // CLV = (clv_price - fill_price). Positive when the line moved
+    // toward our fill (good — we got a better entry than close). null
+    // until the sampler runs ~5 min before tipoff.
+    const clvDelta = (r.clv_price != null && r.fill_price != null)
+      ? (r.clv_price - r.fill_price) : null;
+    const clvCell = (clvDelta != null)
+      ? `<span class="${{cls(clvDelta)}}">${{(clvDelta*100>=0?'+':'')}}${{(clvDelta*100).toFixed(1)}}bp</span>`
+      : '<span class="muted">—</span>';
+    return `
     <tr>
       <td class="ticker">${{r.ticker}}</td>
       <td>${{sportFromTicker(r.ticker)}}</td>
@@ -654,9 +663,11 @@ function renderTrades(rows) {{
       <td class="num">${{((r.edge||0)*100).toFixed(1)}}bp</td>
       <td class="num">${{(r.fill_price||0).toFixed(2)}}</td>
       <td class="num">${{(r.exit_price||0).toFixed(2)}}</td>
+      <td class="num">${{clvCell}}</td>
       <td class="num ${{cls(r.pnl_usd)}}">${{fmt$(r.pnl_usd)}}</td>
       <td class="muted">${{r.exit_reason||''}}</td>
-    </tr>`).join('');
+    </tr>`;
+  }}).join('');
 }}
 
 function renderDaily(dailyMap) {{

@@ -27,6 +27,7 @@ from .decision import TradeSignal
 from .fee_model import fee_per_contract_dollars
 from .journal import Journal
 from .kalshi_client import KalshiClient, Market
+from .market_fields import event_start_utc
 from .risk import RiskEngine
 
 log = structlog.get_logger(__name__)
@@ -138,6 +139,46 @@ class Executor:
         self.risk.record_open(signal)
         self.journal.log_open(signal=signal, market=market, fill_price=fill_price, contracts=contracts)
         pos.children.append(asyncio.create_task(self._watch(signal.ticker)))
+        # Schedule a CLV sampler — captures Kalshi's mid price ~5 min
+        # before tipoff so we can measure closing-line value even when
+        # the position has already exited via TP/SL.
+        tip_utc = event_start_utc(market.raw)
+        if tip_utc:
+            opened_ts = pos.opened_at.isoformat()
+            pos.children.append(asyncio.create_task(
+                self._sample_clv(signal.ticker, signal.side, tip_utc, opened_ts)
+            ))
+
+    async def _sample_clv(
+        self, ticker: str, side: str, tip_utc: datetime, opened_ts: str,
+    ) -> None:
+        """Wait until ~5 min before tipoff, then record Kalshi mid as CLV.
+
+        Runs independently of the position lifecycle — even if we exit
+        via TP/SL hours before tip, we still capture the closing-line
+        proxy for that ticker. The journal row is matched by
+        (ticker, opened_ts) so concurrent positions on the same ticker
+        across the session don't collide.
+        """
+        target = tip_utc - timedelta(minutes=5)
+        wait_seconds = (target - datetime.now(timezone.utc)).total_seconds()
+        # Cap at 36 hours so a far-future tip doesn't pin the task forever
+        wait_seconds = max(0.0, min(wait_seconds, 36 * 3600))
+        try:
+            await asyncio.sleep(wait_seconds)
+        except asyncio.CancelledError:
+            return
+        try:
+            ob = await self.client.get_orderbook(ticker)
+            mid = self._mid_from_orderbook(ob, side)
+            if 0 < mid < 1:
+                self.journal.update_clv_price(
+                    ticker=ticker, opened_ts=opened_ts, clv_price=mid,
+                )
+                log.info("clv.recorded", ticker=ticker, side=side,
+                         clv_price=round(mid, 4))
+        except Exception:
+            log.exception("clv.sample_failed", ticker=ticker)
 
     async def _watch(self, ticker: str) -> None:
         pos = self.open.get(ticker)

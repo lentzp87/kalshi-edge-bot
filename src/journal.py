@@ -51,9 +51,23 @@ CREATE TABLE IF NOT EXISTS trades (
     fees_usd REAL,
     exit_reason TEXT,
     edge REAL,
-    reason TEXT
+    reason TEXT,
+    -- Kalshi mid price ~5 min before tipoff, captured even if we
+    -- already exited via TP/SL. Lets us measure CLV (closing-line
+    -- value) against our own fill price without needing an external
+    -- book API. CLV = clv_price - fill_price (positive if line moved
+    -- our way regardless of side, since `fill_price` and `clv_price`
+    -- are both stored in the side we bought).
+    clv_price REAL
 );
 """
+
+
+# Schema migration for existing v3 DBs that pre-date the clv_price column.
+# Idempotent: try to add the column, ignore the error if it already exists.
+_MIGRATIONS = [
+    "ALTER TABLE trades ADD COLUMN clv_price REAL",
+]
 
 
 class Journal:
@@ -69,6 +83,13 @@ class Journal:
         self.path = Path(env.data_dir) / "trades_sports_v3.db"
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.executescript(SCHEMA)
+        # Apply additive migrations idempotently — SQLite ALTER fails if
+        # the column already exists; we swallow that and move on.
+        for stmt in _MIGRATIONS:
+            try:
+                self.conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
         self.conn.commit()
 
     @staticmethod
@@ -105,6 +126,19 @@ class Journal:
             "UPDATE trades SET closed_ts=?, exit_price=?, pnl_usd=?, fees_usd=?, exit_reason=? "
             "WHERE ticker=? AND closed_ts IS NULL",
             (self._now(), exit_price, pnl_usd, fees_usd, reason, ticker),
+        )
+        self.conn.commit()
+
+    def update_clv_price(self, *, ticker: str, opened_ts: str, clv_price: float) -> None:
+        """Record the Kalshi mid price near tipoff for CLV measurement.
+
+        Matches by (ticker, opened_ts) so we update the right row even
+        when the same ticker has been traded multiple times across the
+        session (rare with the executor's event lock + cooldown).
+        """
+        self.conn.execute(
+            "UPDATE trades SET clv_price=? WHERE ticker=? AND opened_ts=?",
+            (clv_price, ticker, opened_ts),
         )
         self.conn.commit()
 
