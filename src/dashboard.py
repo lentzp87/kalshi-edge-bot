@@ -567,8 +567,8 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
     <div class="title">Recent Trades <span class="meta" id="trades-count"></span></div>
     <div class="scroll">
       <table>
-        <thead><tr><th>Ticker</th><th>Sport</th><th>Side</th><th class="num">Edge</th><th class="num">Fill</th><th class="num">Exit</th><th class="num">CLV</th><th class="num">P&amp;L</th><th>Why</th></tr></thead>
-        <tbody id="tbody-trades"><tr><td colspan="9" class="empty">loading...</td></tr></tbody>
+        <thead><tr><th>Ticker</th><th>Sport</th><th>Side</th><th class="num">Size</th><th class="num">Edge</th><th class="num">Fill</th><th class="num">Exit</th><th class="num">CLV</th><th class="num">P&amp;L</th><th>Opened</th><th class="num">Held</th><th class="num">Tip</th><th>Provider</th><th>Why</th></tr></thead>
+        <tbody id="tbody-trades"><tr><td colspan="14" class="empty">loading...</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -599,7 +599,44 @@ const fmtTime = iso => {{
 const cls = n => n > 0 ? 'pos' : (n < 0 ? 'neg' : 'muted');
 const sportFromTicker = t => {{
   const s = (t || '').split('-')[0].toUpperCase();
-  return ({{KXNBAGAME:'NBA',KXNFLGAME:'NFL',KXMLBGAME:'MLB',KXNHLGAME:'NHL'}})[s] || s;
+  return ({{KXNBAGAME:'NBA',KXNFLGAME:'NFL',KXMLBGAME:'MLB',KXNHLGAME:'NHL',KXATPMATCH:'ATP',KXWTAMATCH:'WTA'}})[s] || s;
+}};
+// HH:MM in user's local TZ (drops date so the column stays narrow)
+const fmtClock = iso => {{
+  if (!iso) return '';
+  try {{
+    return new Date(iso).toLocaleTimeString(undefined, {{hour:'2-digit',minute:'2-digit'}});
+  }} catch {{ return ''; }}
+}};
+// Compact duration between two ISO timestamps: "47m", "1h 12m", "3h"
+const fmtHeld = (openIso, closeIso) => {{
+  if (!openIso || !closeIso) return '';
+  const ms = new Date(closeIso) - new Date(openIso);
+  if (!isFinite(ms) || ms < 0) return '';
+  const mins = Math.round(ms / 60000);
+  if (mins < 60) return mins + 'm';
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return m === 0 ? `${{h}}h` : `${{h}}h ${{m}}m`;
+}};
+// Extract bits we care about from the reason string the model writes.
+// Format example: "MLB pregame Pittsburgh@SF | book[odds_api (8 books)] ... | tip in 145min"
+const parseReason = reason => {{
+  if (!reason) return {{}};
+  const out = {{}};
+  let m;
+  if ((m = reason.match(/book\[([^\]]+)\]/))) {{
+    const provider = m[1];
+    // pinnacle / odds_api (N books) / espn:DraftKings — pull out the simple tag
+    if (provider.startsWith('pinnacle')) out.provider = 'pinnacle';
+    else if (provider.startsWith('odds_api')) {{
+      out.provider = 'odds_api';
+      const bm = provider.match(/(\d+)\s+books/);
+      if (bm) out.books = bm[1];
+    }} else if (provider.startsWith('espn')) out.provider = 'espn';
+    else out.provider = provider;
+  }}
+  if ((m = reason.match(/tip in (-?\d+)min/))) out.minsToTip = parseInt(m[1]);
+  return out;
 }};
 
 let curveChart, calibChart;
@@ -741,16 +778,30 @@ function renderTrades(rows) {{
       ? `<span class="${{cls(clvDelta)}}">${{(clvDelta*100>=0?'+':'')}}${{(clvDelta*100).toFixed(1)}}bp</span>`
       : '<span class="muted">—</span>';
     const dupBadge = (r._dup > 1) ? ` <span class="muted">×${{r._dup}}</span>` : '';
+    const meta = parseReason(r.reason);
+    const tipCell = (meta.minsToTip != null)
+      ? (meta.minsToTip < 60 ? meta.minsToTip + 'm' : (meta.minsToTip/60).toFixed(1)+'h')
+      : '<span class="muted">—</span>';
+    const provCell = meta.provider
+      ? (meta.books ? `${{meta.provider}} <span class="muted">(${{meta.books}})</span>` : meta.provider)
+      : '<span class="muted">—</span>';
+    // Full reason string available on row hover for deep-dive
+    const reasonAttr = r.reason ? ` title="${{(r.reason||'').replace(/"/g,'&quot;')}}"` : '';
     return `
-    <tr>
+    <tr${{reasonAttr}}>
       <td class="ticker">${{r.ticker}}${{dupBadge}}</td>
       <td>${{sportFromTicker(r.ticker)}}</td>
       <td>${{r.side}}</td>
+      <td class="num">$${{(r.size_usd||0).toFixed(0)}}</td>
       <td class="num">${{((r.edge||0)*100).toFixed(1)}}bp</td>
       <td class="num">${{(r.fill_price||0).toFixed(2)}}</td>
       <td class="num">${{(r.exit_price||0).toFixed(2)}}</td>
       <td class="num">${{clvCell}}</td>
       <td class="num ${{cls(r.pnl_usd)}}">${{fmt$(r.pnl_usd)}}</td>
+      <td class="muted">${{fmtClock(r.opened_ts)}}</td>
+      <td class="num muted">${{fmtHeld(r.opened_ts, r.closed_ts)}}</td>
+      <td class="num muted">${{tipCell}}</td>
+      <td class="muted">${{provCell}}</td>
       <td class="muted">${{r.exit_reason||''}}</td>
     </tr>`;
   }}).join('');
