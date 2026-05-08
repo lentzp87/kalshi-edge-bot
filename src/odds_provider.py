@@ -242,18 +242,30 @@ async def _fetch_pinnacle_league(league_id: int) -> dict | None:
             "X-API-Key": _PINNACLE_GUEST_KEY,
             "Accept": "application/json",
         }
+        m_url = f"{_PINNACLE_BASE}/leagues/{league_id}/matchups"
+        k_url = f"{_PINNACLE_BASE}/leagues/{league_id}/markets/straight"
         try:
             async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
-                m_url = f"{_PINNACLE_BASE}/leagues/{league_id}/matchups"
-                k_url = f"{_PINNACLE_BASE}/leagues/{league_id}/markets/straight"
                 r_m = await client.get(m_url)
                 r_k = await client.get(k_url)
+                # Log status codes so we can see auth issues vs empty data
+                log.info("pinnacle.fetch",
+                         league_id=league_id,
+                         matchups_status=r_m.status_code,
+                         markets_status=r_k.status_code)
                 r_m.raise_for_status()
                 r_k.raise_for_status()
-                data = {"matchups": r_m.json() or [], "markets": r_k.json() or []}
+                matchups_json = r_m.json() or []
+                markets_json = r_k.json() or []
+                data = {"matchups": matchups_json, "markets": markets_json}
+                log.info("pinnacle.fetched",
+                         league_id=league_id,
+                         matchups=len(matchups_json),
+                         markets=len(markets_json))
         except Exception as e:
             log.warning("pinnacle.fetch_failed",
-                        err=str(e)[:120], league_id=league_id)
+                        err=str(e)[:200], league_id=league_id,
+                        m_url=m_url, k_url=k_url)
             return None
         _pinnacle_cache[cache_key] = (time.time(), data)
         return data
@@ -286,7 +298,11 @@ async def _pinnacle_fair_prob(
     """Pinnacle moneyline -> de-vigged fair (home_prob, away_prob, provider)."""
     league_id = PINNACLE_LEAGUE_IDS.get(sport)
     if not league_id:
+        log.info("pinnacle.skip.no_league_id", sport=sport,
+                 known_sports=list(PINNACLE_LEAGUE_IDS.keys()))
         return None
+    log.debug("pinnacle.try", sport=sport, league_id=league_id,
+              away=away_name, home=home_name)
     data = await _fetch_pinnacle_league(league_id)
     if not data:
         # _fetch_pinnacle_league logged the actual error; just note we missed

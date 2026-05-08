@@ -77,13 +77,14 @@ risk:
   cooldown_minutes_after_kill: 60
 
 execution:
-  # Dashboard told us TP avg +$6.56, SL avg -$18.12 — 5x asymmetric.
-  # Tighten SL to 12% to clip losses sooner; widen TP to 30% to let
-  # winners run further before exiting (approximates "ride to close").
-  take_profit_pct: 0.30
+  # Settlement backtest revealed: stops SAVED $153 over 29 SL exits, but
+  # take_profits COST $195 over 45 TP exits. TP at 0.30 was capping
+  # winners — held-to-settlement winners average +$10.91 vs +$6.56
+  # actual. Widen TP so only big moves trigger; let time_exit handle
+  # the rest. Stops stay tight (working as designed).
+  take_profit_pct: 0.50
   stop_loss_pct: 0.12
-  # 90 min was right for late-game; for pregame CLV, hold longer so
-  # we capture the line drift toward truth before tipoff.
+  # Long hold for pregame CLV: line drifts toward truth as tipoff nears.
   time_exit_minutes: 240
   order_type: limit
   scale_in_chunks: 2

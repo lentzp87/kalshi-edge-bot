@@ -981,10 +981,16 @@ function renderKpis(s) {{
       `${{bt.n_resolved}} resolved · holding beat exit on ${{bt.better_held_pct}}%`;
     if (bt.stop_loss_n > 0) {{
       const slDelta = (bt.stop_loss_settlement || 0) - (bt.stop_loss_actual || 0);
+      // slDelta > 0: holding would have made MORE money → stops cost us
+      // slDelta < 0: holding would have lost MORE money → stops saved us
+      // The negation matches an intuitive "stop verdict" P&L: positive
+      // = stops were good, negative = stops cost us.
+      const stopVerdict = -slDelta;
+      const verdictWord = stopVerdict >= 0 ? 'saved' : 'cost';
       document.getElementById('bt-stoploss').innerHTML =
         `Of ${{bt.stop_loss_n}} stop_loss exits: actual ${{fmt$(bt.stop_loss_actual)}}, ` +
-        `if held to settlement ${{fmt$(bt.stop_loss_settlement)}} ` +
-        `(<span class="${{cls(slDelta)}}">${{fmt$(slDelta)}}</span> left on the table)`;
+        `if held to settlement ${{fmt$(bt.stop_loss_settlement)}} — ` +
+        `<span class="${{cls(stopVerdict)}}">stops ${{verdictWord}} ${{fmt$(Math.abs(stopVerdict))}}</span>`;
     }} else {{
       document.getElementById('bt-stoploss').textContent = '';
     }}
