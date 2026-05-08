@@ -46,13 +46,15 @@ log = structlog.get_logger(__name__)
 
 
 # Trading window in minutes-to-tipoff:
-#   too late  (<5 min)     -> live lineup chaos / liquidity drain
-#   too early (>1440 min)  -> book lines may shift before close;
-#                              widening lets us pick up tomorrow's slate
-# A 24-hour window covers tonight's MLB + tomorrow's NBA/NFL/MLB/NHL
-# without leaning so far out that the book consensus is unreliable.
+#   too late  (<120 min)   -> dashboard data shows 1-2h window has
+#                              25% win rate and -$355 P&L on 28 trades.
+#                              Late-pregame news (lineup scratches,
+#                              weather, sharp volume) moves the book
+#                              faster than our cached probabilities.
+#   too early (>1440 min)  -> book lines may shift before close.
+# 2-24h is the empirically-best window: 81% wr / +$96 in 2-4h, 100% in 4h+.
 PREGAME_MAX_MIN = 24 * 60  # 24 hours
-PREGAME_MIN_MIN = 5
+PREGAME_MIN_MIN = 120      # 2 hours (was 5)
 
 
 SERIES_REGISTRY: dict[str, str] = {

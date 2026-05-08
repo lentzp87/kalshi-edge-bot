@@ -712,12 +712,26 @@ function renderOpen(positions) {{
 }}
 
 function renderTrades(rows) {{
-  document.getElementById('trades-count').textContent = rows.length + ' shown';
   const tb = document.getElementById('tbody-trades');
   const closed = rows.filter(r => r.closed_ts && r.pnl_usd != null);
-  if (!closed.length) {{ tb.innerHTML = '<tr><td colspan="9" class="empty">no closed trades yet</td></tr>'; return; }}
+  if (!closed.length) {{
+    document.getElementById('trades-count').textContent = '0 shown';
+    tb.innerHTML = '<tr><td colspan="9" class="empty">no closed trades yet</td></tr>'; return;
+  }}
   const safe = closed.filter(r => Math.abs(r.pnl_usd) <= Math.max(3 * (r.size_usd||0), 200));
-  tb.innerHTML = safe.slice(0, 50).map(r => {{
+  // Dedup churn: collapse exact-duplicate rows (same ticker/side/fill/exit/pnl)
+  // into one row with a count. Pre-fix data had this happen ~13x per game.
+  const seen = new Map();
+  for (const r of safe) {{
+    const key = [r.ticker, r.side, r.fill_price, r.exit_price, r.pnl_usd, r.exit_reason].join('|');
+    const prev = seen.get(key);
+    if (prev) {{ prev._dup += 1; }}
+    else {{ seen.set(key, {{ ...r, _dup: 1 }}); }}
+  }}
+  const deduped = [...seen.values()];
+  document.getElementById('trades-count').textContent =
+    deduped.length + ' unique · ' + safe.length + ' total';
+  tb.innerHTML = deduped.slice(0, 50).map(r => {{
     // CLV = (clv_price - fill_price). Positive when the line moved
     // toward our fill (good — we got a better entry than close). null
     // until the sampler runs ~5 min before tipoff.
@@ -726,9 +740,10 @@ function renderTrades(rows) {{
     const clvCell = (clvDelta != null)
       ? `<span class="${{cls(clvDelta)}}">${{(clvDelta*100>=0?'+':'')}}${{(clvDelta*100).toFixed(1)}}bp</span>`
       : '<span class="muted">—</span>';
+    const dupBadge = (r._dup > 1) ? ` <span class="muted">×${{r._dup}}</span>` : '';
     return `
     <tr>
-      <td class="ticker">${{r.ticker}}</td>
+      <td class="ticker">${{r.ticker}}${{dupBadge}}</td>
       <td>${{sportFromTicker(r.ticker)}}</td>
       <td>${{r.side}}</td>
       <td class="num">${{((r.edge||0)*100).toFixed(1)}}bp</td>

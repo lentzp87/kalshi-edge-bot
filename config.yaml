@@ -62,9 +62,11 @@ decision:
   # GROSS edges that fees would eat in real life — fine for paper.
   # BEFORE LIVE: raise min_edge to at least 0.03, ideally to whatever
   # your realized CLV analysis supports.
+  # Dashboard data: dogs at <50c lost $265 over 52 trades. Favorites at
+  # 50c+ won $35 over 22 trades (77% wr). Fee curve crushes dogs.
   min_edge: -0.03
   kelly_fraction: 0.25
-  min_entry_price: 0.30
+  min_entry_price: 0.50
 
 risk:
   max_position_size_usd: 40
@@ -75,11 +77,16 @@ risk:
   cooldown_minutes_after_kill: 60
 
 execution:
-  take_profit_pct: 0.20      # exit at +20% on the position
-  stop_loss_pct: 0.20        # raised from 12 — weather markets noise out 10-15% then mean-revert
-  time_exit_minutes: 90      # if neither hit, kill the position after 90 min
-  order_type: limit          # never market orders
-  scale_in_chunks: 2         # split each entry into 2 child orders
+  # Dashboard told us TP avg +$6.56, SL avg -$18.12 — 5x asymmetric.
+  # Tighten SL to 12% to clip losses sooner; widen TP to 30% to let
+  # winners run further before exiting (approximates "ride to close").
+  take_profit_pct: 0.30
+  stop_loss_pct: 0.12
+  # 90 min was right for late-game; for pregame CLV, hold longer so
+  # we capture the line drift toward truth before tipoff.
+  time_exit_minutes: 240
+  order_type: limit
+  scale_in_chunks: 2
 
 # Per-category enables.
 models:
