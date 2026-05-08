@@ -49,12 +49,47 @@ class Executor:
         self.cfg = file_config().execution
         self.mode = env_config().mode
         self.open: dict[str, OpenPosition] = {}
+        # Event-level dedup: BOS-yes and TB-no on the same Kalshi event
+        # are the same bet (both win if Boston wins). Locking by
+        # event_ticker prevents double-exposure across mirror tickers.
+        self.open_events: set[str] = set()
+        # Post-close cooldown: after an exit, lock the event for 60 min
+        # so we don't immediately re-enter when the model still sees an
+        # edge. Without this we churn through fees firing the same trade
+        # every loop after each take_profit / stop_loss.
+        self.cooldown_until: dict[str, datetime] = {}
+
+    _COOLDOWN_MINUTES = 60
+
+    @staticmethod
+    def _event_ticker(market: Market) -> str:
+        """Kalshi events group mirror tickers (TEAM-A-yes ≡ TEAM-B-no).
+        Falls back to the market ticker if event_ticker isn't present.
+        """
+        return (market.raw.get("event_ticker") or market.ticker or "").strip()
 
     async def submit(self, signal: TradeSignal, market: Market) -> None:
-        # One position per ticker — never stack 5x exposure on the same thesis.
+        # 1) One position per ticker (existing dedup)
         if signal.ticker in self.open:
             log.debug("exec.skip.already_open", ticker=signal.ticker)
             return
+
+        # 2) One position per EVENT — blocks the mirror-side ticker
+        ev = self._event_ticker(market)
+        if ev and ev in self.open_events:
+            log.info("exec.skip.event_already_open",
+                     ticker=signal.ticker, event=ev)
+            return
+
+        # 3) Cooldown after a recent close on this event
+        cd_until = self.cooldown_until.get(ev) if ev else None
+        if cd_until and datetime.now(timezone.utc) < cd_until:
+            mins_left = (cd_until - datetime.now(timezone.utc)).total_seconds() / 60
+            log.info("exec.skip.event_cooldown",
+                     ticker=signal.ticker, event=ev,
+                     mins_left=round(mins_left, 1))
+            return
+
         if not self.risk.approve(signal):
             return
 
@@ -95,6 +130,11 @@ class Executor:
             opened_at=datetime.now(timezone.utc),
         )
         self.open[signal.ticker] = pos
+        ev = self._event_ticker(market)
+        if ev:
+            self.open_events.add(ev)
+            # Stash event_ticker on the position so _exit can release the lock
+            pos.event_ticker = ev  # type: ignore[attr-defined]
         self.risk.record_open(signal)
         self.journal.log_open(signal=signal, market=market, fill_price=fill_price, contracts=contracts)
         pos.children.append(asyncio.create_task(self._watch(signal.ticker)))
@@ -195,4 +235,13 @@ class Executor:
             fees_usd=fees_usd,
             reason=reason,
         )
-        log.info("exec.exit", ticker=ticker, reason=reason, pnl=round(pnl_usd, 2))
+        # Release event lock and start cooldown so we don't immediately
+        # re-enter the same trade after a take_profit / stop_loss.
+        ev = getattr(pos, "event_ticker", None)
+        if ev:
+            self.open_events.discard(ev)
+            self.cooldown_until[ev] = (
+                datetime.now(timezone.utc) + timedelta(minutes=self._COOLDOWN_MINUTES)
+            )
+        log.info("exec.exit", ticker=ticker, reason=reason, pnl=round(pnl_usd, 2),
+                 event=ev)

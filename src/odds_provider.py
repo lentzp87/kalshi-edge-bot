@@ -37,7 +37,10 @@ log = structlog.get_logger(__name__)
 # ---- The Odds API integration ----
 
 _ODDS_API_BASE = "https://api.the-odds-api.com/v4"
-_ODDS_API_TTL_SEC = 90
+# Cache TTL was 90s — burned the free tier (500 req/mo) in ~4 hours
+# at a 30-second scan interval. 5 min is enough resolution for pregame
+# CLV — book lines on major leagues don't move meaningfully faster.
+_ODDS_API_TTL_SEC = 300
 _odds_api_cache: dict[str, tuple[float, list[dict]]] = {}
 _odds_api_locks: dict[str, asyncio.Lock] = {}
 
@@ -239,8 +242,8 @@ async def fair_probability_for_game(
 # the free tier fast. We cache aggressively (10 min per tournament) and
 # only fetch a tournament when a Kalshi market actually needs it.
 
-_TENNIS_TTL_SEC = 600  # 10 min — tennis lines move slower than team sports
-_TENNIS_SPORTS_TTL_SEC = 3600  # 1 hour — tournament list rarely changes
+_TENNIS_TTL_SEC = 1800  # 30 min — tennis lines move slowly, tournaments often have many matches
+_TENNIS_SPORTS_TTL_SEC = 21600  # 6 hours — tournament list barely changes day-to-day
 
 
 async def _fetch_active_tennis_sport_keys() -> list[str]:
