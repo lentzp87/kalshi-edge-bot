@@ -89,27 +89,36 @@ def teams_from_title(title: str) -> tuple[str, str] | None:
     return None
 
 
-# Tennis titles like:
+# Sentence-shaped titles (tennis, UFC, soccer phrasings):
 #   'Will Taylor Townsend win the Bouzkova vs Townsend: Round Of 64 match?'
 #   'Will Carlos Alcaraz win the Alcaraz/Sinner match?'
-# We extract the bit after 'win the' and split on ' vs ' / '/'.
+#   'Will Jeremy Stephens win the Green vs Stephens professional MMA fight ...'
+#   'Will San Diego win the St. Louis vs San Diego game ...'
+#
+# We extract the bit after 'win the' and split on ' vs ' / '/'. Trailing
+# context word can be: match, round, fight, game, bout, tournament, ...
+# or punctuation, or end-of-string.
 _TENNIS_TITLE_RE = re.compile(
     r"""win\s+the\s+
-        (?P<a>[\w'.\-]+(?:\s+[\w'.\-]+){0,3})
+        (?P<a>[\w'.\-]+(?:\s+[\w'.\-]+){0,3}?)
         \s*(?:vs\.?|/)\s*
-        (?P<b>[\w'.\-]+(?:\s+[\w'.\-]+){0,3})
-        (?=\s*[:,.]|\s+(?:match|round)|\s*$)
+        (?P<b>[\w'.\-]+(?:\s+[\w'.\-]+){0,3}?)
+        \s*
+        (?=
+            [:,.]
+            | \s+(?:match|round|fight|game|bout|tournament|professional|MMA|scheduled)
+            | \s*$
+        )
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
 
 def teams_from_tennis_title(title: str) -> tuple[str, str] | None:
-    """Tennis-specific title parser.
+    """Sentence-shaped title parser. Used for tennis, UFC, and any sport
+    where Kalshi phrases markets as 'Will X win the A vs B ... match/fight'.
 
-    Tennis markets use sentence-shaped titles that confuse the regular
-    teams_from_title parser. Pattern is "Will <our> win the <A> [vs|/] <B>:
-    Round Of N match?". Returns (player_a_surname, player_b_surname).
+    Returns (side_a_surname, side_b_surname).
     """
     if not title:
         return None

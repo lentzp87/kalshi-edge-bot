@@ -50,6 +50,13 @@ _ODDS_API_TTL_SEC = 300
 _odds_api_cache: dict[str, tuple[float, list[dict]]] = {}
 _odds_api_locks: dict[str, asyncio.Lock] = {}
 
+# Sport keys that returned 401 / 403 / 422 don't get retried for this
+# long. Eliminates per-loop hammering on tier-restricted sports (e.g.
+# soccer leagues your Odds API plan doesn't include). 24h is safe —
+# subscription tier doesn't change mid-day.
+_ODDS_API_BLOCKED_TTL_SEC = 24 * 3600
+_odds_api_blocked: dict[str, float] = {}
+
 # Map our internal sport key to The Odds API sport_key.
 # https://the-odds-api.com/sports-odds-data/sports-apis.html
 ODDS_API_SPORTS: dict[str, str] = {
@@ -91,7 +98,12 @@ async def _fetch_odds_api(sport_key: str) -> list[dict] | None:
         cached = _odds_api_cache.get(cache_key)
         if cached and (time.time() - cached[0]) < _ODDS_API_TTL_SEC:
             return cached[1]
-        url = f"{_ODDS_API_BASE}/sports/{ODDS_API_SPORTS[sport_key]}/odds"
+        odds_api_key_for_sport = ODDS_API_SPORTS[sport_key]
+        # Skip if this sport has been blocked (401/403/422 from Odds API)
+        blocked_until = _odds_api_blocked.get(odds_api_key_for_sport)
+        if blocked_until and time.time() < blocked_until:
+            return None
+        url = f"{_ODDS_API_BASE}/sports/{odds_api_key_for_sport}/odds"
         params = {
             "apiKey": api_key,
             "regions": "us",
@@ -101,6 +113,14 @@ async def _fetch_odds_api(sport_key: str) -> list[dict] | None:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 r = await client.get(url, params=params)
+                if r.status_code in (401, 403, 422):
+                    _odds_api_blocked[odds_api_key_for_sport] = (
+                        time.time() + _ODDS_API_BLOCKED_TTL_SEC
+                    )
+                    log.warning("odds_api.sport_blocked_24h",
+                                sport=sport_key, status=r.status_code,
+                                reason="subscription tier doesn't include this sport")
+                    return None
                 r.raise_for_status()
                 data = r.json()
         except Exception as e:
@@ -507,14 +527,21 @@ async def _fetch_h2h_odds_by_key(sport_key: str, *, ttl: int = 1800) -> list[dic
 
     Used by tennis, MMA, soccer, golf — any sport where we discover the
     sport_key dynamically rather than hard-coding it. Cached per-key
-    so each tournament burns its own quota slot.
+    so each tournament burns its own quota slot. Sport keys that fail
+    with 401 / 422 (subscription doesn't include them) are blacklisted
+    for 24h to prevent per-loop hammering.
     """
     api_key = _odds_api_key()
     if not api_key:
         return None
+    # Skip if recently blocked (401/422 from this key)
+    blocked_until = _odds_api_blocked.get(sport_key)
+    now = time.time()
+    if blocked_until and now < blocked_until:
+        return None
+
     cache_key = f"h2h:{sport_key}"
     cached = _odds_api_cache.get(cache_key)
-    now = time.time()
     if cached and (now - cached[0]) < ttl:
         return cached[1]
 
@@ -533,6 +560,16 @@ async def _fetch_h2h_odds_by_key(sport_key: str, *, ttl: int = 1800) -> list[dic
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 r = await client.get(url, params=params)
+                # Treat 401 / 403 / 422 as "we don't have access" and
+                # blacklist the sport_key for the day. Other errors are
+                # transient — retry next time.
+                if r.status_code in (401, 403, 422):
+                    _odds_api_blocked[sport_key] = time.time() + _ODDS_API_BLOCKED_TTL_SEC
+                    log.warning("odds_api.sport_blocked_24h",
+                                sport_key=sport_key,
+                                status=r.status_code,
+                                reason="subscription tier doesn't include this sport")
+                    return None
                 r.raise_for_status()
                 data = r.json()
         except Exception as e:
