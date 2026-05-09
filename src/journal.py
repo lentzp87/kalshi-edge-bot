@@ -74,6 +74,11 @@ _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN settled_outcome INTEGER",
     "ALTER TABLE trades ADD COLUMN settlement_pnl_usd REAL",
     "ALTER TABLE trades ADD COLUMN settled_checked_ts TEXT",
+    # Live mark-to-market: watcher writes the current mid every 15s for
+    # each open position so the dashboard can show current P&L without
+    # having to make Kalshi API calls itself.
+    "ALTER TABLE trades ADD COLUMN current_mid REAL",
+    "ALTER TABLE trades ADD COLUMN current_mid_ts TEXT",
 ]
 
 
@@ -200,6 +205,16 @@ class Journal:
             "stop_loss_settlement": round(sl_settle, 2),
         }
 
+    def update_current_mid(self, *, ticker: str, opened_ts: str, mid: float) -> None:
+        """Record the latest mark-to-market mid for an open position.
+        Called every 15s by the executor's watcher loop."""
+        self.conn.execute(
+            "UPDATE trades SET current_mid=?, current_mid_ts=? "
+            "WHERE ticker=? AND opened_ts=? AND closed_ts IS NULL",
+            (mid, self._now(), ticker, opened_ts),
+        )
+        self.conn.commit()
+
     def update_clv_price(self, *, ticker: str, opened_ts: str, clv_price: float) -> None:
         """Record the Kalshi mid price near tipoff for CLV measurement.
 
@@ -218,9 +233,11 @@ class Journal:
     def open_positions(self) -> list[dict]:
         # Include `reason` so the dashboard can show team names, game,
         # provider, etc. Parsing happens client-side via parseReason().
+        # current_mid is updated by the watcher every 15s, lets the
+        # dashboard mark-to-market without making its own Kalshi calls.
         cur = self.conn.execute(
             "SELECT ticker, side, contracts, size_usd, fill_price, opened_ts, "
-            "edge, reason "
+            "edge, reason, current_mid, current_mid_ts "
             "FROM trades WHERE closed_ts IS NULL ORDER BY opened_ts DESC"
         )
         cols = [c[0] for c in cur.description]

@@ -136,13 +136,18 @@ class Executor:
             self.open_events.add(ev)
             # Stash event_ticker on the position so _exit can release the lock
             pos.event_ticker = ev  # type: ignore[attr-defined]
+        # Stash the game's tip time so the watcher can use it for the
+        # CLV-aligned exit (5 min before tipoff). Without this we'd
+        # exit on a flat 4h timer that fires hours before the close.
+        tip_utc = event_start_utc(market.raw)
+        if tip_utc:
+            pos.tip_utc = tip_utc  # type: ignore[attr-defined]
         self.risk.record_open(signal)
         self.journal.log_open(signal=signal, market=market, fill_price=fill_price, contracts=contracts)
         pos.children.append(asyncio.create_task(self._watch(signal.ticker)))
         # Schedule a CLV sampler — captures Kalshi's mid price ~5 min
         # before tipoff so we can measure closing-line value even when
         # the position has already exited via TP/SL.
-        tip_utc = event_start_utc(market.raw)
         if tip_utc:
             opened_ts = pos.opened_at.isoformat()
             pos.children.append(asyncio.create_task(
@@ -184,12 +189,35 @@ class Executor:
         pos = self.open.get(ticker)
         if not pos:
             return
-        deadline = pos.opened_at + timedelta(minutes=self.cfg.time_exit_minutes)
+        # CLV-aligned deadline: prefer "tip_utc - 5min" so we hold through
+        # the closing-line move (sharps + late lineup news + weather hit
+        # most prices in the final hour). Fall back to the flat
+        # time_exit_minutes config if we don't have a tip time. Cap at
+        # opened + time_exit_minutes only as a sanity bound when tip is
+        # absurdly far out (e.g. multi-day outright markets we shouldn't
+        # be holding anyway).
+        tip_utc = getattr(pos, "tip_utc", None)
+        flat_deadline = pos.opened_at + timedelta(minutes=self.cfg.time_exit_minutes)
+        if tip_utc:
+            tip_deadline = tip_utc - timedelta(minutes=5)
+            # Use the LATER of (tip-5min, flat) — for short-fuse trades
+            # we want at least a few minutes; for long-fuse trades we
+            # want to ride to close.
+            deadline = max(tip_deadline, pos.opened_at + timedelta(minutes=15))
+        else:
+            deadline = flat_deadline
+        opened_ts = pos.opened_at.isoformat()
         while ticker in self.open:
             await asyncio.sleep(15)
             try:
                 ob = await self.client.get_orderbook(ticker)
                 mid = self._mid_from_orderbook(ob, pos.signal.side)
+                # Persist the latest mid so the dashboard can show
+                # mark-to-market P&L without making its own API calls.
+                if 0 < mid < 1:
+                    self.journal.update_current_mid(
+                        ticker=ticker, opened_ts=opened_ts, mid=mid,
+                    )
                 # `mid` is already side-adjusted (NO mid for NO bets). So
                 # profit is mid - fill regardless of side. The previous
                 # branching here flipped the sign on every NO position,

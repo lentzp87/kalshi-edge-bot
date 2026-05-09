@@ -512,8 +512,8 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
       <div class="title">Open Positions <span class="meta" id="open-count"></span></div>
       <div class="scroll">
         <table>
-          <thead><tr><th>Bet</th><th>Sport</th><th>Side</th><th class="num">Size</th><th class="num">Fill</th><th class="num">Edge</th><th>Tip</th><th>Provider</th><th>Opened</th><th class="num">Held</th></tr></thead>
-          <tbody id="tbody-open"><tr><td colspan="10" class="empty">loading...</td></tr></tbody>
+          <thead><tr><th>Bet</th><th>Sport</th><th>Side</th><th class="num">Size</th><th class="num">Fill</th><th class="num">Now</th><th class="num">P&amp;L Now</th><th class="num">Max Win</th><th class="num">Edge</th><th>Tip</th><th>Provider</th><th>Opened</th><th class="num">Held</th></tr></thead>
+          <tbody id="tbody-open"><tr><td colspan="13" class="empty">loading...</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -826,10 +826,18 @@ function renderClvTable(tbodyId, rows) {{
     </tr>`).join('');
 }}
 
+// Kalshi fee = ceil(0.07 * p * (1-p) * 100) / 100 per contract.
+// Used to estimate P&L net of fees for open positions.
+function feePerContract(price) {{
+  const p = Math.max(0.01, Math.min(0.99, price));
+  const raw = 0.07 * p * (1 - p);
+  return Math.ceil(raw * 100) / 100;
+}}
+
 function renderOpen(positions) {{
   document.getElementById('open-count').textContent = positions.length + ' open';
   const tb = document.getElementById('tbody-open');
-  if (!positions.length) {{ tb.innerHTML = '<tr><td colspan="10" class="empty">none</td></tr>'; return; }}
+  if (!positions.length) {{ tb.innerHTML = '<tr><td colspan="13" class="empty">none</td></tr>'; return; }}
   const nowIso = new Date().toISOString();
   tb.innerHTML = positions.map(p => {{
     const meta = parseReason(p.reason);
@@ -843,6 +851,28 @@ function renderOpen(positions) {{
     const provCell = meta.provider
       ? (meta.books ? `${{meta.provider}} <span class="muted">(${{meta.books}})</span>` : meta.provider)
       : '<span class="muted">—</span>';
+
+    // P&L math — both fill_price and current_mid are side-adjusted, so
+    // pnl = (mid - fill) * contracts regardless of yes/no. Fees are
+    // estimated for both entry and (would-be) exit.
+    const fill = p.fill_price || 0;
+    const ctr  = p.contracts || 0;
+    const entryFee = feePerContract(fill) * ctr;
+    let nowCell, pnlNowCell, maxCell;
+    if (p.current_mid != null && p.current_mid > 0 && p.current_mid < 1) {{
+      const mid = p.current_mid;
+      const exitFee = feePerContract(mid) * ctr;
+      const pnlNow = (mid - fill) * ctr - entryFee - exitFee;
+      nowCell = mid.toFixed(2);
+      pnlNowCell = `<span class="${{cls(pnlNow)}}">${{fmt$(pnlNow)}}</span>`;
+    }} else {{
+      nowCell = '<span class="muted">—</span>';
+      pnlNowCell = '<span class="muted">—</span>';
+    }}
+    // Max win = if our side resolves YES at $1, no exit fee.
+    const maxProfit = (1 - fill) * ctr - entryFee;
+    maxCell = `<span class="pos">${{fmt$(maxProfit)}}</span>`;
+
     const reasonAttr = p.reason ? ` title="${{(p.reason||'').replace(/"/g,'&quot;')}}"` : '';
     return `
     <tr${{reasonAttr}}>
@@ -850,7 +880,10 @@ function renderOpen(positions) {{
       <td>${{sportFromTicker(p.ticker)}}</td>
       <td>${{p.side}}</td>
       <td class="num">$${{(p.size_usd||0).toFixed(0)}}</td>
-      <td class="num">${{(p.fill_price||0).toFixed(2)}}</td>
+      <td class="num">${{fill.toFixed(2)}}</td>
+      <td class="num">${{nowCell}}</td>
+      <td class="num">${{pnlNowCell}}</td>
+      <td class="num">${{maxCell}}</td>
       <td class="num">${{((p.edge||0)*100).toFixed(1)}}bp</td>
       <td class="num">${{tipCell}}</td>
       <td class="muted">${{provCell}}</td>
