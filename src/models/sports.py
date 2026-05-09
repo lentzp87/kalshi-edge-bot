@@ -59,10 +59,16 @@ PREGAME_MIN_MIN = 120      # 2 hours (was 5)
 
 SERIES_REGISTRY: dict[str, str] = {
     # Pregame-only model. Kalshi series -> ESPN sport key.
-    "KXNBAGAME":   "nba",
-    "KXNFLGAME":   "nfl",
-    "KXMLBGAME":   "mlb",   # supported but the spec recommends NBA/NFL first
-    "KXNHLGAME":   "nhl",
+    "KXNBAGAME":    "nba",
+    "KXNFLGAME":    "nfl",
+    "KXMLBGAME":    "mlb",
+    "KXNHLGAME":    "nhl",
+    # WNBA — same template, different ESPN sport key
+    "KXWNBAGAME":   "wnba",
+    # NCAA basketball / football (verified series names may differ —
+    # bot will log unknown series so we can confirm)
+    "KXNCAABGAME":  "ncaab",
+    "KXNCAAFGAME":  "ncaaf",
 }
 
 
@@ -72,15 +78,18 @@ class SportsModel:
 
     def __post_init__(self) -> None:
         self.enabled = file_config().models.sports.enabled
-        # Tennis is a separate model with its own provider path.
-        # We instantiate it once and dispatch when the series matches.
+        # Per-sport sub-models. Each handles a specific series-prefix
+        # family. SportsModel acts as a dispatcher.
         from .tennis import TennisModel
         from .sports_in_game import InGameSportsModel
+        from .ufc import UFCModel
+        from .soccer import SoccerModel
+        from .golf import GolfModel
         self._tennis = TennisModel(enabled=self.enabled)
-        # In-game model targets a different edge: ESPN winprob updating
-        # 2-5s after plays vs Kalshi taking 30-90s. Try it first; if the
-        # game is pregame (state != "in") it returns None and we fall
-        # through to the pregame book-consensus model.
+        self._ufc = UFCModel(enabled=self.enabled)
+        self._soccer = SoccerModel(enabled=self.enabled)
+        self._golf = GolfModel(enabled=self.enabled)
+        # In-game targets ESPN winprob lag for team sports.
         self._in_game = InGameSportsModel(enabled=self.enabled)
 
     async def estimate(self, market: Market) -> ProbabilityEstimate | None:
@@ -90,14 +99,23 @@ class SportsModel:
         ticker = market.ticker or ""
         series = series_prefix(ticker)
 
-        # Dispatch tennis markets to the tennis model
+        # Dispatch by series prefix to the right specialized model
         from .tennis import TENNIS_SERIES
+        from .ufc import UFC_SERIES
+        from .soccer import SOCCER_SERIES
+        from .golf import GOLF_SERIES
         if series in TENNIS_SERIES:
             return await self._tennis.estimate(market)
+        if series in UFC_SERIES:
+            return await self._ufc.estimate(market)
+        if series in SOCCER_SERIES:
+            return await self._soccer.estimate(market)
+        if series in GOLF_SERIES:
+            return await self._golf.estimate(market)
 
-        # Try the in-game (ESPN winprob lag) model first. Returns None
-        # when the game isn't in progress / not late enough — then the
-        # pregame book-consensus path below runs.
+        # Team sports (NBA/NFL/MLB/NHL/WNBA/NCAA): try in-game first
+        # (ESPN winprob lag during late-game phase), then fall through
+        # to the pregame book-consensus model below.
         ig_result = await self._in_game.estimate(market)
         if ig_result:
             return ig_result

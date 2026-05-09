@@ -25,12 +25,13 @@ log = structlog.get_logger(__name__)
 
 # Maps a friendly sport key to ESPN's URL components.
 SPORTS = {
-    "mlb": ("baseball", "mlb"),
-    "nba": ("basketball", "nba"),
-    "nhl": ("hockey", "nhl"),
-    "nfl": ("football", "nfl"),
-    "ncaab": ("basketball", "mens-college-basketball"),
-    "ncaaf": ("football", "college-football"),
+    "mlb":    ("baseball", "mlb"),
+    "nba":    ("basketball", "nba"),
+    "wnba":   ("basketball", "wnba"),
+    "nhl":    ("hockey", "nhl"),
+    "nfl":    ("football", "nfl"),
+    "ncaab":  ("basketball", "mens-college-basketball"),
+    "ncaaf":  ("football", "college-football"),
 }
 
 _BASE = "https://site.api.espn.com/apis/site/v2/sports"

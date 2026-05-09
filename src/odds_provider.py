@@ -53,10 +53,13 @@ _odds_api_locks: dict[str, asyncio.Lock] = {}
 # Map our internal sport key to The Odds API sport_key.
 # https://the-odds-api.com/sports-odds-data/sports-apis.html
 ODDS_API_SPORTS: dict[str, str] = {
-    "nba":  "basketball_nba",
-    "nfl":  "americanfootball_nfl",
-    "mlb":  "baseball_mlb",
-    "nhl":  "icehockey_nhl",
+    "nba":   "basketball_nba",
+    "wnba":  "basketball_wnba",
+    "nfl":   "americanfootball_nfl",
+    "mlb":   "baseball_mlb",
+    "nhl":   "icehockey_nhl",
+    "ncaab": "basketball_ncaab",
+    "ncaaf": "americanfootball_ncaaf",
 }
 
 
@@ -210,10 +213,13 @@ _PINNACLE_TTL_SEC = 300  # 5 min cache; same as Odds API
 # Pinnacle league IDs. These are stable for major leagues but verify
 # via /sports/{sport_id}/leagues if a sport stops returning matchups.
 PINNACLE_LEAGUE_IDS: dict[str, int] = {
-    "nba": 487,
-    "nfl": 889,
-    "mlb": 246,
-    "nhl": 1456,
+    "nba":   487,
+    "nfl":   889,
+    "mlb":   246,
+    "nhl":   1456,
+    "wnba":  578,
+    # NCAA IDs vary by season; safe to omit (Pinnacle returns None,
+    # we fall through to Odds API which has solid NCAA coverage).
 }
 
 _pinnacle_cache: dict[str, tuple[float, dict]] = {}
@@ -427,66 +433,100 @@ _TENNIS_TTL_SEC = 1800  # 30 min — tennis lines move slowly, tournaments often
 _TENNIS_SPORTS_TTL_SEC = 21600  # 6 hours — tournament list barely changes day-to-day
 
 
-async def _fetch_active_tennis_sport_keys() -> list[str]:
-    """Return The Odds API sport keys for currently-active tennis tournaments.
+async def _fetch_sport_keys_in_group(group_name: str, *, ttl: int) -> list[str]:
+    """Generic discovery: return all Odds API sport keys in a group
+    (e.g. 'Tennis', 'Mixed Martial Arts', 'Soccer', 'Golf'). Cached
+    aggressively since the active list doesn't change often.
 
-    Hits /v4/sports?all=false (active only) and filters group=="Tennis".
-    Cached 1h since tournaments don't start/end frequently.
+    Hits /v4/sports?all=true so we see everything (including currently-
+    inactive tournaments). The `_fetch_*_odds` callers will discover
+    which ones actually have data.
     """
     api_key = _odds_api_key()
     if not api_key:
         return []
-    cache_key = "_tennis_active_sports"
+    cache_key = f"_sports_in_group:{group_name.lower()}"
     cached = _odds_api_cache.get(cache_key)
     now = time.time()
-    if cached and (now - cached[0]) < _TENNIS_SPORTS_TTL_SEC:
+    if cached and (now - cached[0]) < ttl:
         return cached[1]
 
     lock = _odds_api_locks.setdefault(cache_key, asyncio.Lock())
     async with lock:
         cached = _odds_api_cache.get(cache_key)
-        if cached and (time.time() - cached[0]) < _TENNIS_SPORTS_TTL_SEC:
+        if cached and (time.time() - cached[0]) < ttl:
             return cached[1]
         url = f"{_ODDS_API_BASE}/sports"
-        params = {"apiKey": api_key, "all": "false"}
+        # all=true returns inactive sports too. We'll filter on `active`
+        # below so we hit what's likely to have data, but still log the
+        # full universe so we can see what coverage exists.
+        params = {"apiKey": api_key, "all": "true"}
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 r = await client.get(url, params=params)
                 r.raise_for_status()
                 data = r.json() or []
         except Exception as e:
-            log.warning("odds_api.tennis_sports_failed", err=str(e)[:120])
+            log.warning("odds_api.sports_failed",
+                        group=group_name, err=str(e)[:120])
             return []
-        keys = [
-            s["key"] for s in data
-            if (s.get("group") or "").lower() == "tennis"
-            and s.get("active") is not False
-        ]
-        _odds_api_cache[cache_key] = (time.time(), keys)
-        log.info("odds_api.tennis_sports", count=len(keys), keys=keys[:8])
-        return keys
+        gn = group_name.lower()
+        all_in_group = [s for s in data if (s.get("group") or "").lower() == gn]
+        active_keys = [s["key"] for s in all_in_group if s.get("active") is True]
+        inactive_keys = [s["key"] for s in all_in_group if s.get("active") is not True]
+        log.info("odds_api.sports_in_group",
+                 group=group_name,
+                 active=len(active_keys), active_keys=active_keys[:10],
+                 inactive=len(inactive_keys), inactive_sample=inactive_keys[:5])
+        _odds_api_cache[cache_key] = (time.time(), active_keys)
+        return active_keys
 
 
-async def _fetch_tennis_odds(sport_key: str) -> list[dict] | None:
-    """Fetch h2h odds for a specific tennis tournament. Cached 10 min."""
+async def _fetch_active_tennis_sport_keys() -> list[str]:
+    """Tennis tournament keys currently active on The Odds API."""
+    return await _fetch_sport_keys_in_group("Tennis", ttl=_TENNIS_SPORTS_TTL_SEC)
+
+
+async def _fetch_active_mma_sport_keys() -> list[str]:
+    """MMA / UFC sport keys."""
+    return await _fetch_sport_keys_in_group("Mixed Martial Arts", ttl=_TENNIS_SPORTS_TTL_SEC)
+
+
+async def _fetch_active_soccer_sport_keys() -> list[str]:
+    """Soccer league keys (EPL, MLS, Champions League, etc.)."""
+    return await _fetch_sport_keys_in_group("Soccer", ttl=_TENNIS_SPORTS_TTL_SEC)
+
+
+async def _fetch_active_golf_sport_keys() -> list[str]:
+    """Golf tournament keys (PGA Tour weekly events, majors)."""
+    return await _fetch_sport_keys_in_group("Golf", ttl=_TENNIS_SPORTS_TTL_SEC)
+
+
+async def _fetch_h2h_odds_by_key(sport_key: str, *, ttl: int = 1800) -> list[dict] | None:
+    """Generic h2h odds fetcher for any Odds API sport_key.
+
+    Used by tennis, MMA, soccer, golf — any sport where we discover the
+    sport_key dynamically rather than hard-coding it. Cached per-key
+    so each tournament burns its own quota slot.
+    """
     api_key = _odds_api_key()
     if not api_key:
         return None
-    cache_key = f"tennis:{sport_key}"
+    cache_key = f"h2h:{sport_key}"
     cached = _odds_api_cache.get(cache_key)
     now = time.time()
-    if cached and (now - cached[0]) < _TENNIS_TTL_SEC:
+    if cached and (now - cached[0]) < ttl:
         return cached[1]
 
     lock = _odds_api_locks.setdefault(cache_key, asyncio.Lock())
     async with lock:
         cached = _odds_api_cache.get(cache_key)
-        if cached and (time.time() - cached[0]) < _TENNIS_TTL_SEC:
+        if cached and (time.time() - cached[0]) < ttl:
             return cached[1]
         url = f"{_ODDS_API_BASE}/sports/{sport_key}/odds"
         params = {
             "apiKey": api_key,
-            "regions": "us,eu,uk",  # tennis books skew European
+            "regions": "us,eu,uk",  # cast wide; books vary by sport
             "markets": "h2h",
             "oddsFormat": "american",
         }
@@ -496,11 +536,15 @@ async def _fetch_tennis_odds(sport_key: str) -> list[dict] | None:
                 r.raise_for_status()
                 data = r.json()
         except Exception as e:
-            log.warning("odds_api.tennis_odds_failed",
+            log.warning("odds_api.h2h_odds_failed",
                         err=str(e)[:120], sport_key=sport_key)
             return None
         _odds_api_cache[cache_key] = (time.time(), data)
         return data
+
+
+# Back-compat alias — tennis model still calls _fetch_tennis_odds.
+_fetch_tennis_odds = _fetch_h2h_odds_by_key
 
 
 def _player_match(token: str, full_name: str) -> bool:
@@ -517,6 +561,92 @@ def _player_match(token: str, full_name: str) -> bool:
         return True
     parts = [p for p in n.replace("-", " ").replace(".", " ").split() if p]
     return any(p.startswith(t) for p in parts)
+
+
+async def fair_probability_two_way_dynamic(
+    *, sport_keys: list[str],
+    side_a_name: str, side_b_name: str,
+    date_utc: str | None = None,
+    label_prefix: str = "odds_api",
+) -> tuple[float, float, str, str, str] | None:
+    """Two-way fair probability across a list of sport_keys.
+
+    Used by tennis, UFC, MMA, basically any 2-way market where we
+    discover sport_keys dynamically (one per tournament/event group).
+    Returns (fair_a, fair_b, provider_label, a_full_name, b_full_name).
+
+    Names from Kalshi (e.g. "Tiafoe", "Khabib") are matched via
+    name_match against the book's full names (home_team / away_team).
+    """
+    if not sport_keys or not side_a_name or not side_b_name:
+        return None
+
+    date_window: set[str] | None = None
+    if date_utc:
+        try:
+            from datetime import date, timedelta
+            y, m, d = (int(p) for p in date_utc.split("-"))
+            d0 = date(y, m, d)
+            date_window = {
+                (d0 - timedelta(days=1)).isoformat(),
+                d0.isoformat(),
+                (d0 + timedelta(days=1)).isoformat(),
+            }
+        except (ValueError, AttributeError):
+            date_window = None
+
+    for sport_key in sport_keys:
+        events = await _fetch_h2h_odds_by_key(sport_key)
+        if not events:
+            continue
+        for ev in events:
+            home = ev.get("home_team") or ""
+            away = ev.get("away_team") or ""
+            if name_match(side_a_name, home) and name_match(side_b_name, away):
+                a_full, b_full = home, away
+                a_is_home = True
+            elif name_match(side_a_name, away) and name_match(side_b_name, home):
+                a_full, b_full = away, home
+                a_is_home = False
+            else:
+                continue
+            if date_window:
+                ev_date = (ev.get("commence_time") or "")[:10]
+                if ev_date and ev_date not in date_window:
+                    continue
+            home_probs: list[float] = []
+            away_probs: list[float] = []
+            for book in ev.get("bookmakers") or []:
+                for mkt in book.get("markets") or []:
+                    if mkt.get("key") != "h2h":
+                        continue
+                    home_odds = away_odds = None
+                    for o in mkt.get("outcomes") or []:
+                        n_str = o.get("name") or ""
+                        if n_str == home:
+                            home_odds = o.get("price")
+                        elif n_str == away:
+                            away_odds = o.get("price")
+                    if home_odds is None or away_odds is None:
+                        continue
+                    pair = devig_two_way(home_odds, away_odds)
+                    if pair:
+                        home_probs.append(pair[0])
+                        away_probs.append(pair[1])
+            if not home_probs:
+                continue
+            home_probs.sort()
+            away_probs.sort()
+            n = len(home_probs)
+            mh = home_probs[n // 2]
+            ma = away_probs[n // 2]
+            if a_is_home:
+                fair_a, fair_b = mh, ma
+            else:
+                fair_a, fair_b = ma, mh
+            provider = f"{label_prefix}:{sport_key} ({n} books)"
+            return fair_a, fair_b, provider, a_full, b_full
+    return None
 
 
 async def fair_probability_for_tennis(
@@ -612,4 +742,208 @@ async def fair_probability_for_tennis(
             provider = f"odds_api:{sport_key} ({n} books)"
             return fair_a, fair_b, provider, a_full, b_full
 
+    return None
+
+
+# ============================================================================
+# UFC / MMA — 2-way (fighter A vs fighter B)
+# ============================================================================
+
+async def fair_probability_for_ufc(
+    *, fighter_a_name: str, fighter_b_name: str,
+    date_utc: str | None = None,
+) -> tuple[float, float, str, str, str] | None:
+    sport_keys = await _fetch_active_mma_sport_keys()
+    return await fair_probability_two_way_dynamic(
+        sport_keys=sport_keys,
+        side_a_name=fighter_a_name, side_b_name=fighter_b_name,
+        date_utc=date_utc, label_prefix="odds_api[mma]",
+    )
+
+
+# ============================================================================
+# Soccer — Kalshi markets are 2-way (Will TEAM win?), but the underlying
+# soccer market is 3-way (home / away / draw). We fetch the 3-way book
+# odds, devig across all three outcomes, and return p_home_wins to the
+# caller. Drawing on either side counts as "no win" for that team.
+# ============================================================================
+
+async def _devig_three_way(
+    home_odds, away_odds, draw_odds,
+) -> tuple[float, float, float] | None:
+    """Three-way devig for soccer. Returns (p_home, p_away, p_draw)."""
+    from .devig import american_to_implied
+    h = american_to_implied(home_odds)
+    a = american_to_implied(away_odds)
+    d = american_to_implied(draw_odds)
+    if h is None or a is None or d is None:
+        return None
+    total = h + a + d
+    if total <= 0:
+        return None
+    return h / total, a / total, d / total
+
+
+async def fair_probability_for_soccer(
+    *, home_name: str, away_name: str,
+    date_utc: str | None = None,
+) -> tuple[float, float, str, str, str] | None:
+    """Returns (p_home_wins, p_away_wins, provider, home_full, away_full).
+
+    Note: p_home_wins + p_away_wins != 1 in soccer (because of draws).
+    The Kalshi caller maps "yes for HOME" to p_home_wins and "no for HOME"
+    to (1 - p_home_wins) which absorbs the draw probability.
+    """
+    sport_keys = await _fetch_active_soccer_sport_keys()
+    if not sport_keys or not home_name or not away_name:
+        return None
+
+    date_window: set[str] | None = None
+    if date_utc:
+        try:
+            from datetime import date, timedelta
+            y, m, d = (int(p) for p in date_utc.split("-"))
+            d0 = date(y, m, d)
+            date_window = {
+                (d0 - timedelta(days=1)).isoformat(),
+                d0.isoformat(),
+                (d0 + timedelta(days=1)).isoformat(),
+            }
+        except (ValueError, AttributeError):
+            date_window = None
+
+    for sport_key in sport_keys:
+        events = await _fetch_h2h_odds_by_key(sport_key)
+        if not events:
+            continue
+        for ev in events:
+            home = ev.get("home_team") or ""
+            away = ev.get("away_team") or ""
+            if not (name_match(home_name, home) and name_match(away_name, away)):
+                continue
+            if date_window:
+                ev_date = (ev.get("commence_time") or "")[:10]
+                if ev_date and ev_date not in date_window:
+                    continue
+            home_probs: list[float] = []
+            away_probs: list[float] = []
+            for book in ev.get("bookmakers") or []:
+                for mkt in book.get("markets") or []:
+                    if mkt.get("key") != "h2h":
+                        continue
+                    home_o = away_o = draw_o = None
+                    for o in mkt.get("outcomes") or []:
+                        n_str = (o.get("name") or "")
+                        if n_str == home:
+                            home_o = o.get("price")
+                        elif n_str == away:
+                            away_o = o.get("price")
+                        elif n_str.lower() == "draw":
+                            draw_o = o.get("price")
+                    if home_o is None or away_o is None or draw_o is None:
+                        continue
+                    triple = await _devig_three_way(home_o, away_o, draw_o)
+                    if triple:
+                        home_probs.append(triple[0])
+                        away_probs.append(triple[1])
+            if not home_probs:
+                continue
+            home_probs.sort()
+            away_probs.sort()
+            n = len(home_probs)
+            mh = home_probs[n // 2]
+            ma = away_probs[n // 2]
+            return mh, ma, f"odds_api[soccer]:{sport_key} ({n} books)", home, away
+    return None
+
+
+# ============================================================================
+# Golf — N-way devig for tournament outright winner markets.
+# Each player has implied probability ~ 1-25%. We fetch all players in
+# the tournament's h2h market and normalize so probabilities sum to 1.
+# Trade only mid-tournament (R3/R4) when prices are 0.30+ to clear fees.
+# ============================================================================
+
+async def fair_probability_for_golf(
+    *, player_name: str,
+    date_utc: str | None = None,
+) -> tuple[float, str, str] | None:
+    """Returns (fair_p_yes, provider, matched_player_full_name) for one
+    golf player across all currently-active tournaments.
+
+    Caller passes player_name (e.g. "Scheffler") as the side they're
+    betting YES on. We find which tournament has that player, devig the
+    full field, and return the player's normalized probability.
+    """
+    sport_keys = await _fetch_active_golf_sport_keys()
+    if not sport_keys or not player_name:
+        return None
+    from .devig import american_to_implied
+
+    date_window: set[str] | None = None
+    if date_utc:
+        try:
+            from datetime import date, timedelta
+            y, m, d = (int(p) for p in date_utc.split("-"))
+            d0 = date(y, m, d)
+            date_window = {
+                (d0 - timedelta(days=1)).isoformat(),
+                d0.isoformat(),
+                (d0 + timedelta(days=1)).isoformat(),
+            }
+        except (ValueError, AttributeError):
+            date_window = None
+
+    for sport_key in sport_keys:
+        events = await _fetch_h2h_odds_by_key(sport_key)
+        if not events:
+            continue
+        for ev in events:
+            # Golf "events" are usually a single tournament with all
+            # players as outcomes inside one market. The home/away
+            # fields are typically empty or both set to the tournament
+            # name; what matters is the bookmakers.markets.outcomes list.
+            if date_window:
+                ev_date = (ev.get("commence_time") or "")[:10]
+                if ev_date and ev_date not in date_window:
+                    continue
+            # Aggregate across books; each book has a "h2h" market with
+            # 60+ outcomes. Devig per-book by summing implied and
+            # normalizing.
+            per_book_player_probs: list[float] = []
+            matched_full_name: str | None = None
+            for book in ev.get("bookmakers") or []:
+                for mkt in book.get("markets") or []:
+                    if mkt.get("key") != "h2h":
+                        continue
+                    outcomes = mkt.get("outcomes") or []
+                    implied: list[tuple[str, float]] = []
+                    for o in outcomes:
+                        nm = o.get("name") or ""
+                        price = o.get("price")
+                        ip = american_to_implied(price)
+                        if ip is not None:
+                            implied.append((nm, ip))
+                    if not implied:
+                        continue
+                    total = sum(ip for _, ip in implied)
+                    if total <= 0:
+                        continue
+                    # Find our player
+                    for nm, ip in implied:
+                        if name_match(player_name, nm):
+                            per_book_player_probs.append(ip / total)
+                            matched_full_name = matched_full_name or nm
+                            break
+            if not per_book_player_probs:
+                continue
+            # Median across books
+            per_book_player_probs.sort()
+            n = len(per_book_player_probs)
+            median_p = per_book_player_probs[n // 2]
+            return (
+                median_p,
+                f"odds_api[golf]:{sport_key} ({n} books)",
+                matched_full_name or player_name,
+            )
     return None

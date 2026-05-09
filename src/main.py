@@ -129,11 +129,20 @@ async def amain() -> None:
     if cfg.models.sports.enabled:
         from .models.sports import SERIES_REGISTRY as SPORTS_SERIES
         from .models.tennis import TENNIS_SERIES
+        from .models.ufc import UFC_SERIES
+        from .models.soccer import SOCCER_SERIES
+        from .models.golf import GOLF_SERIES
         sports = list(SPORTS_SERIES.keys())
         tennis = sorted(TENNIS_SERIES)
+        ufc = sorted(UFC_SERIES)
+        soccer = sorted(SOCCER_SERIES)
+        golf = sorted(GOLF_SERIES)
         log.info("scanner.dynamic_series.sports", count=len(sports), series=sports)
         log.info("scanner.dynamic_series.tennis", count=len(tennis), series=tennis)
-        discovered += sports + tennis
+        log.info("scanner.dynamic_series.ufc",    count=len(ufc),    series=ufc)
+        log.info("scanner.dynamic_series.soccer", count=len(soccer), series=soccer)
+        log.info("scanner.dynamic_series.golf",   count=len(golf),   series=golf)
+        discovered += sports + tennis + ufc + soccer + golf
 
     if discovered:
         cfg.scanner.series_tickers = discovered
