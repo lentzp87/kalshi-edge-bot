@@ -435,7 +435,7 @@ def index() -> str:
 
 def _render_dashboard(*, mode: str, kalshi_env: str, bankroll: float,
                      min_edge_bp: int, min_entry_price: float) -> str:
-    return f"""<!doctype html>
+    return rf"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
