@@ -43,13 +43,19 @@ class OpenPosition:
 
 
 class Executor:
-    def __init__(self, client: KalshiClient, risk: RiskEngine, journal: Journal) -> None:
+    def __init__(
+        self, client: KalshiClient, risk: RiskEngine, journal: Journal,
+        *, whale_tracker=None,
+    ) -> None:
         self.client = client
         self.risk = risk
         self.journal = journal
         self.cfg = file_config().execution
         self.mode = env_config().mode
         self.open: dict[str, OpenPosition] = {}
+        # Optional whale tracker — when an aligned whale signal exists for
+        # this ticker, size gets boosted to whale_max_position_size_usd.
+        self.whale_tracker = whale_tracker
         # Event-level dedup: BOS-yes and TB-no on the same Kalshi event
         # are the same bet (both win if Boston wins). Locking by
         # event_ticker prevents double-exposure across mirror tickers.
@@ -93,6 +99,36 @@ class Executor:
 
         if not self.risk.approve(signal):
             return
+
+        # Whale boost: if an aligned whale signal exists for this market,
+        # scale up to whale_max_position_size_usd (default same as normal
+        # cap = no-op). The signal is logged and stamped onto the
+        # journal reason so we can analyze whale-aligned trades on the
+        # dashboard.
+        risk_cfg = file_config().risk
+        whale_signal = None
+        if self.whale_tracker is not None:
+            whale_signal = self.whale_tracker.has_aligned_signal(
+                signal.ticker, signal.side
+            )
+        if whale_signal and risk_cfg.whale_max_position_size_usd > signal.size_usd:
+            old_size = signal.size_usd
+            signal.size_usd = min(
+                risk_cfg.whale_max_position_size_usd,
+                # Cap at 5x the original Kelly so we don't over-bet badly
+                # calibrated signals just because a whale showed up.
+                signal.size_usd * 5,
+            )
+            signal.reason = (
+                f"{signal.reason} | WHALE_ALIGNED dir={whale_signal.direction} "
+                f"conf={whale_signal.confidence:.2f} ({whale_signal.reason}) "
+                f"size_boost ${old_size:.0f}->${signal.size_usd:.0f}"
+            )
+            log.info("exec.whale_boost",
+                     ticker=signal.ticker, side=signal.side,
+                     old_size=round(old_size, 2),
+                     new_size=round(signal.size_usd, 2),
+                     whale=whale_signal.reason)
 
         contracts = max(1, int(signal.size_usd / max(signal.price_cents / 100, 0.01)))
         if self.mode == "paper":

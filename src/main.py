@@ -23,12 +23,17 @@ from .kalshi_client import KalshiClient
 from .models import model_for_category
 from .risk import RiskEngine
 from .scanner import Scanner
+from .orphan_recovery import recover_orphans
 from .settlement_backfill import backfill_loop as settlement_loop
+from .whale_tracker import WhaleTracker
 
 log = structlog.get_logger(__name__)
 
 
-async def loop_once(scanner: Scanner, executor: Executor, journal: Journal) -> None:
+async def loop_once(
+    scanner: Scanner, executor: Executor, journal: Journal,
+    whale_tracker: WhaleTracker,
+) -> None:
     scanned = 0
     by_category: dict[str, int] = {}
     opinions = 0
@@ -37,6 +42,10 @@ async def loop_once(scanner: Scanner, executor: Executor, journal: Journal) -> N
     async for market in scanner.stream_tradeable_markets():
         scanned += 1
         by_category[market.category] = by_category.get(market.category, 0) + 1
+
+        # Feed every market through the whale tracker — it logs whale-
+        # shaped deltas itself, and the executor consults it when sizing.
+        whale_tracker.update(market)
 
         model = model_for_category(market.category)
         if not model or not getattr(model, "enabled", True):
@@ -65,11 +74,14 @@ async def loop_once(scanner: Scanner, executor: Executor, journal: Journal) -> N
     )
 
 
-async def trading_loop(scanner: Scanner, executor: Executor, journal: Journal) -> None:
+async def trading_loop(
+    scanner: Scanner, executor: Executor, journal: Journal,
+    whale_tracker: WhaleTracker,
+) -> None:
     cfg = file_config()
     while True:
         try:
-            await loop_once(scanner, executor, journal)
+            await loop_once(scanner, executor, journal, whale_tracker)
         except Exception:
             log.exception("loop.error")
         await asyncio.sleep(cfg.scanner.loop_interval_seconds)
@@ -150,11 +162,21 @@ async def amain() -> None:
     journal = Journal()
     risk = RiskEngine()
     scanner = Scanner(client)
-    executor = Executor(client, risk, journal)
+    whale_tracker = WhaleTracker()
+    executor = Executor(client, risk, journal, whale_tracker=whale_tracker)
+
+    # Orphan recovery — runs ONCE before the trading loop starts.
+    # Render redeploys kill in-process watchers, leaving open positions
+    # in the journal with no one to close them. This walks the open list,
+    # checks Kalshi for resolution, and settles any whose game has ended.
+    try:
+        await recover_orphans(client, journal)
+    except Exception:
+        log.exception("orphan_recovery.error")
 
     try:
         await asyncio.gather(
-            trading_loop(scanner, executor, journal),
+            trading_loop(scanner, executor, journal, whale_tracker),
             dashboard_server(),
             # Periodic settlement backfill: for each closed trade, look up
             # the Kalshi market's resolution and compute "what if held to

@@ -90,9 +90,13 @@ class Journal:
         #   trades.db          (v1) — pre-weather-pivot, abandoned
         #   trades_sports.db   (v2) — pre P&L sign-flip fix; data corrupted
         #                              by inverted NO-side P&L. Abandoned.
-        #   trades_sports_v3.db — current. Started after the NO-side fix.
+        #   trades_sports_v3.db — pre-whale + pre-min_p_yes filter; mixed
+        #                              data from many strategy iterations.
+        #   trades_sports_v4.db — current. Clean slate to evaluate the
+        #                              new (min_p_yes=0.60, whale boost,
+        #                              tipoff-aligned exits) ruleset.
         # Old DBs remain on disk for archaeology but are no longer read.
-        self.path = Path(env.data_dir) / "trades_sports_v3.db"
+        self.path = Path(env.data_dir) / "trades_sports_v4.db"
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.executescript(SCHEMA)
         # Apply additive migrations idempotently — SQLite ALTER fails if

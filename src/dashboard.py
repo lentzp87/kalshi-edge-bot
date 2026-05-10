@@ -58,6 +58,7 @@ _RE_OUR_SIDE = re.compile(r"our=\w+\((home|away)\)")
 _RE_TIP_MIN = re.compile(r"tip in ([\d.]+)min")
 _RE_NET_EDGE = re.compile(r"net_edge=([+-]?[\d.]+)")
 _RE_GROSS = re.compile(r"gross ([+-]?[\d.]+)")
+_RE_P_YES = re.compile(r"p_yes=([\d.]+)")
 
 
 def _parse_reason(reason: str | None) -> dict:
@@ -93,7 +94,31 @@ def _parse_reason(reason: str | None) -> dict:
             out["gross_edge"] = float(m.group(1))
         except ValueError:
             pass
+    if m := _RE_P_YES.search(reason):
+        try:
+            out["p_yes"] = float(m.group(1))
+        except ValueError:
+            pass
     return out
+
+
+def _confidence_bucket(p_yes: float | None, side: str | None) -> str | None:
+    """Bucket the model's probability for OUR side.
+
+    `p_yes` from the reason string is always the YES side's prob. If we
+    bet NO, our side's prob = 1 - p_yes. Buckets target the user's
+    "65% to win" sweet spot.
+    """
+    if p_yes is None or side not in ("yes", "no"):
+        return None
+    our_p = p_yes if side == "yes" else (1 - p_yes)
+    if our_p < 0.50: return "<50%"
+    if our_p < 0.55: return "50-55%"
+    if our_p < 0.60: return "55-60%"
+    if our_p < 0.65: return "60-65%"
+    if our_p < 0.70: return "65-70%"
+    if our_p < 0.80: return "70-80%"
+    return "80%+"
 
 
 def _entry_price_bucket(fill_price: float | None) -> str:
@@ -209,8 +234,11 @@ def stats() -> dict:
             "_mins_to_tip": meta.get("mins_to_tip"),
             "_net_edge": meta.get("net_edge"),
             "_gross_edge": meta.get("gross_edge"),
+            "_p_yes": meta.get("p_yes"),
             "_entry_bucket": _entry_price_bucket(t.get("fill_price")),
             "_tip_bucket": _tip_bucket(meta.get("mins_to_tip")),
+            "_confidence_bucket": _confidence_bucket(
+                meta.get("p_yes"), t.get("side")),
             "_fav_dog": (
                 "favorite" if (t.get("fill_price") or 0) >= 0.5 else "underdog"
             ),
@@ -227,6 +255,7 @@ def stats() -> dict:
             "by_sport": [], "by_provider": [], "by_our_side": [],
             "by_fav_dog": [], "by_entry_bucket": [], "by_tip_bucket": [],
             "by_exit_reason": [], "by_series": [], "by_hold": [],
+            "by_confidence": [],
             "n_clv": 0, "avg_clv_bp": 0.0, "pct_positive_clv": 0.0,
             "by_sport_clv": [],
             "settlement": {
@@ -309,6 +338,12 @@ def stats() -> dict:
         "by_hold": _bucket_aggregate(
             chronological,
             lambda r: _hold_bucket(r.get("opened_ts"), r.get("closed_ts"))
+        ),
+        # Model-confidence buckets: how does the model's claimed p_yes
+        # for our side correlate with actual win rate? Calibration check.
+        "by_confidence": _bucket_aggregate(
+            chronological,
+            lambda r: r.get("_confidence_bucket")
         ),
         # ---- CLV summary -----------------------------------------------
         # CLV per trade: clv_price - fill_price (>0 if line moved our way).
@@ -617,12 +652,20 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
       </table>
     </div>
     <div class="panel">
-      <div class="title">CLV by Sport <span class="meta">did the line move our way after we entered?</span></div>
+      <div class="title">By Model Confidence <span class="meta">model p(our side wins) vs realized win rate — calibration</span></div>
       <table>
-        <thead><tr><th>Sport</th><th class="num">N</th><th class="num">Avg CLV</th><th class="num">% Positive</th></tr></thead>
-        <tbody id="tbody-clv-sport"><tr><td colspan="4" class="empty">awaiting tipoff samples</td></tr></tbody>
+        <thead><tr><th>p_yes bucket</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="tbody-confidence"><tr><td colspan="4" class="empty">no data yet</td></tr></tbody>
       </table>
     </div>
+  </div>
+
+  <div class="panel" style="margin-top:16px">
+    <div class="title">CLV by Sport <span class="meta">did the line move our way after we entered?</span></div>
+    <table>
+      <thead><tr><th>Sport</th><th class="num">N</th><th class="num">Avg CLV</th><th class="num">% Positive</th></tr></thead>
+      <tbody id="tbody-clv-sport"><tr><td colspan="4" class="empty">awaiting tipoff samples</td></tr></tbody>
+    </table>
   </div>
 
   <div class="section-header">Recent activity</div>
@@ -1053,10 +1096,11 @@ async function refresh() {{
     renderBucketTable('tbody-provider', stats.by_provider);
     renderBucketTable('tbody-entry',    stats.by_entry_bucket);
     renderBucketTable('tbody-tip',      stats.by_tip_bucket);
-    renderBucketTable('tbody-exit',     stats.by_exit_reason);
-    renderBucketTable('tbody-series',   stats.by_series);
-    renderBucketTable('tbody-hold',     stats.by_hold);
-    renderClvTable('tbody-clv-sport',   stats.by_sport_clv);
+    renderBucketTable('tbody-exit',       stats.by_exit_reason);
+    renderBucketTable('tbody-series',     stats.by_series);
+    renderBucketTable('tbody-hold',       stats.by_hold);
+    renderBucketTable('tbody-confidence', stats.by_confidence);
+    renderClvTable('tbody-clv-sport',     stats.by_sport_clv);
     renderOpen(openPos);
     renderTrades(tradesRows);
     renderDaily(daily);

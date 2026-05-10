@@ -93,6 +93,17 @@ def evaluate(market: Market, est: ProbabilityEstimate) -> TradeSignal | None:
                  min=cfg.decision.min_entry_price)
         return None
 
+    # Skip low-probability sides. p_yes is the model's prob that the
+    # YES side wins; if we picked NO, our side's true prob is 1-p_yes.
+    # Filter on the side WE'RE actually betting on.
+    our_side_p = p_yes if side == "yes" else (1 - p_yes)
+    if our_side_p < cfg.decision.min_p_yes:
+        log.info("decision.skip.p_yes_too_low",
+                 ticker=market.ticker, side=side,
+                 our_side_p=round(our_side_p, 3),
+                 min=cfg.decision.min_p_yes)
+        return None
+
     # Subtract fees + slippage. Estimate contract count at our max position
     # size to compute the right fee buffer (fees are per-contract).
     contracts_est = max(1, int(cfg.risk.max_position_size_usd / max(target_price, 0.01)))

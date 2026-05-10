@@ -28,6 +28,11 @@ class DecisionConfig(BaseModel):
     min_edge: float = 0.06
     kelly_fraction: float = 0.25
     min_entry_price: float = 0.55
+    # Minimum model probability for OUR chosen side. If model thinks our
+    # side wins 60%+, fire. If it's a coin flip or worse, skip — even
+    # if the edge looks positive, the variance/fee math is unfriendly.
+    # Setting 0.0 disables this filter (back-compat default).
+    min_p_yes: float = 0.0
 
 
 class RiskConfig(BaseModel):
@@ -37,6 +42,10 @@ class RiskConfig(BaseModel):
     max_daily_loss_usd: float = 100
     max_consecutive_losses: int = 3
     cooldown_minutes_after_kill: int = 60
+    # Larger cap when an aligned whale signal exists for the ticker
+    # (price jumped in our direction, big volume burst, etc.). Set
+    # equal to max_position_size_usd to disable the boost.
+    whale_max_position_size_usd: float = 40
 
 
 class ExecutionConfig(BaseModel):
