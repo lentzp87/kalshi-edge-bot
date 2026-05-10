@@ -46,14 +46,17 @@ log = structlog.get_logger(__name__)
 
 
 # Trading window in minutes-to-tipoff:
-#   too late  (<120 min)   -> 1-2h bucket showed 25% wr, -$355 (data).
-#   too early (>480 min)   -> 4h+ bucket only had 14 trades, +$2 P&L.
-#                              Lines move closer to close, so trading
-#                              earlier just eats more spread/fee drag.
-# 2-8h is the empirically-best window — concentrates on 2-4h sweet spot
-# (was 81% wr / +$96) without the 24h tail that produced no signal.
-PREGAME_MAX_MIN = 8 * 60   # 8 hours (was 24h)
-PREGAME_MIN_MIN = 120      # 2 hours
+#   too late  (<60 min)    -> too close to tip; line is mostly settled
+#                              and we miss the CLV drift we'd want to ride.
+#   too early (>720 min)   -> stale lines; books haven't sharpened up yet.
+# 2026-05-10: widened from 120-480 to 60-720 in paper mode. Live logs
+# showed every same-day MLB / WNBA / NHL game getting cut for being
+# >480min from tip (morning scans seeing evening games at 8-13h out).
+# Lower bound dropped to 1h so late-news evening games still qualify.
+# When live, narrow back to the empirically-best 2-4h window (was
+# showing 81% wr / +$96) once we have enough samples to confirm.
+PREGAME_MAX_MIN = 12 * 60  # 12 hours (was 8h)
+PREGAME_MIN_MIN = 60       # 1 hour (was 2h)
 
 
 SERIES_REGISTRY: dict[str, str] = {

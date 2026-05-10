@@ -54,17 +54,24 @@ scanner:
     - KXLOWTNYC     # NYC
 
 decision:
-  # PAPER-MODE TUNING:
+  # PAPER-MODE TUNING (loosened 2026-05-10 to generate flow — first deploy
+  # with all 5 coroutines + new fee gate produced 0 signals over a full
+  # scan. Rejection counts came from `decision.skip.*` log lines):
   #   min_edge -0.05         — very loose, fires on any positive gross edge
-  #   min_entry_price 0.50   — favorites only (fee math kills dogs)
-  #   min_p_yes 0.60         — only fire when model thinks OUR side wins
-  #     60%+. Targets ~60-70% realized win rate (we win when the favorite
-  #     wins, which they should at this confidence level).
-  # BEFORE LIVE: raise min_edge to >=0.03 and tune from CLV data.
+  #   min_entry_price 0.40   — was 0.50; was rejecting NBA/WNBA coin-flip
+  #     games at $0.37-0.49 where the model still has a clear opinion.
+  #     Fee math is uglier at $0.40 so the per-market `required_edge` gate
+  #     in src/decision.py picks up the slack.
+  #   min_p_yes 0.55         — was 0.60; was rejecting MLB favorites the
+  #     model put at 52-55%. We're paper-trading: cast a wider net, then
+  #     read the by_confidence dashboard panel to see what win rate we
+  #     actually realize per bucket.
+  # BEFORE LIVE: raise min_edge to >=0.03, restore min_p_yes to 0.60, and
+  # tune from CLV / by_confidence calibration data.
   min_edge: -0.05
   kelly_fraction: 0.25
-  min_entry_price: 0.50
-  min_p_yes: 0.60
+  min_entry_price: 0.40
+  min_p_yes: 0.55
   # Per-market gate: gross_edge must exceed
   #   entry_fee + exit_fee + half_spread + slippage + safety_pp
   # safety_pp is the cushion above measured costs. 0.005 = 0.5pp.
