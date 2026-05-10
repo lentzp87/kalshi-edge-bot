@@ -100,11 +100,12 @@ class Executor:
         if not self.risk.approve(signal):
             return
 
-        # Whale boost: if an aligned whale signal exists for this market,
-        # scale up to whale_max_position_size_usd (default same as normal
-        # cap = no-op). The signal is logged and stamped onto the
-        # journal reason so we can analyze whale-aligned trades on the
-        # dashboard.
+        # Whale boost — classified by signal type, not blanket.
+        # ChatGPT pushback: blind whale-following gets you exit-liquidity
+        # cosplay. Different whale shapes deserve different actions:
+        #   price_jump_*  -> aggressive whale through book; full boost
+        #   volume_burst_* -> ambient sharp activity; medium boost
+        #   large_yes_*   -> resting order; could be spoofed; small/no boost
         risk_cfg = file_config().risk
         whale_signal = None
         if self.whale_tracker is not None:
@@ -112,20 +113,39 @@ class Executor:
                 signal.ticker, signal.side
             )
         if whale_signal and risk_cfg.whale_max_position_size_usd > signal.size_usd:
+            # Classify by reason prefix
+            wreason = whale_signal.reason
+            if wreason.startswith("price_jump"):
+                # Aggressive whale ate through the book. Strongest signal.
+                # Full boost: up to 5x or whale_max, whichever is smaller.
+                multiplier = 5.0
+                whale_class = "aggressive"
+            elif wreason.startswith("volume_burst"):
+                # Real $ moved but direction is ambiguous. Medium boost.
+                multiplier = 2.5
+                whale_class = "burst"
+            elif wreason.startswith("large_"):
+                # Resting order. Spoof-prone. Tiny boost only.
+                multiplier = 1.5
+                whale_class = "resting"
+            else:
+                multiplier = 2.0
+                whale_class = "other"
+
             old_size = signal.size_usd
             signal.size_usd = min(
                 risk_cfg.whale_max_position_size_usd,
-                # Cap at 5x the original Kelly so we don't over-bet badly
-                # calibrated signals just because a whale showed up.
-                signal.size_usd * 5,
+                signal.size_usd * multiplier,
             )
             signal.reason = (
-                f"{signal.reason} | WHALE_ALIGNED dir={whale_signal.direction} "
-                f"conf={whale_signal.confidence:.2f} ({whale_signal.reason}) "
-                f"size_boost ${old_size:.0f}->${signal.size_usd:.0f}"
+                f"{signal.reason} | WHALE_ALIGNED class={whale_class} "
+                f"dir={whale_signal.direction} conf={whale_signal.confidence:.2f} "
+                f"({whale_signal.reason}) size_boost "
+                f"${old_size:.0f}->${signal.size_usd:.0f} ({multiplier:.1f}x)"
             )
             log.info("exec.whale_boost",
                      ticker=signal.ticker, side=signal.side,
+                     whale_class=whale_class, multiplier=multiplier,
                      old_size=round(old_size, 2),
                      new_size=round(signal.size_usd, 2),
                      whale=whale_signal.reason)

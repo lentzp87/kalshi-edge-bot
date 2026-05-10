@@ -65,9 +65,16 @@ decision:
   kelly_fraction: 0.25
   min_entry_price: 0.50
   min_p_yes: 0.60
+  # Per-market gate: gross_edge must exceed
+  #   entry_fee + exit_fee + half_spread + slippage + safety_pp
+  # safety_pp is the cushion above measured costs. 0.005 = 0.5pp.
+  required_edge_safety_pp: 0.005
 
 risk:
-  max_position_size_usd: 40
+  # Lowered from $40 to $20 per ChatGPT recommendation: validate edge
+  # at small size before scaling. Whale-aligned trades still go up to
+  # whale_max_position_size_usd (capped at 5x and $200 absolute).
+  max_position_size_usd: 20
   max_concurrent_positions: 15
   max_open_exposure_pct: 0.40   # 40% of bankroll
   max_daily_loss_usd: 100

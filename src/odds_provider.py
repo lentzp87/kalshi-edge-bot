@@ -984,3 +984,90 @@ async def fair_probability_for_golf(
                 matched_full_name or player_name,
             )
     return None
+
+
+# ============================================================================
+# DataGolf — Tier-1 truth source for golf (datagolf.com).
+#
+# DataGolf is widely considered the sharpest publicly-available golf model.
+# We try in-play predictions first (most relevant for R3/R4 trading) and
+# fall back to pre-tournament. If DataGolf misses (no key, no match,
+# network error) the golf model falls through to The Odds API.
+# ============================================================================
+
+async def fair_probability_for_golf_datagolf(
+    *, player_name: str, in_tournament: bool = True,
+) -> tuple[float, str, str] | None:
+    """DataGolf-sourced golf win probability for a player.
+
+    Returns (p_yes, provider_label, matched_full_name) or None if the
+    player can't be found / DataGolf has no key.
+
+    Tries in-play feed first if in_tournament=True (most relevant for
+    R3/R4 trading); falls back to pre-tournament feed.
+    """
+    from .datagolf_client import fetch_in_play, fetch_pre_tournament
+
+    if not player_name:
+        return None
+
+    def _name(p: dict) -> str:
+        # DataGolf typically uses 'player_name' but be defensive.
+        return (
+            p.get("player_name")
+            or p.get("name")
+            or p.get("playerName")
+            or ""
+        )
+
+    def _win_prob(p: dict) -> float | None:
+        v = p.get("win")
+        if v is None:
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        # odds_format=percent returns values like 8.3 meaning 8.3%
+        return f / 100.0
+
+    # Tier 1a: in-play feed
+    if in_tournament:
+        players = await fetch_in_play(tour="pga")
+        if players:
+            for p in players:
+                full = _name(p)
+                if not full:
+                    continue
+                if name_match(player_name, full):
+                    pw = _win_prob(p)
+                    if pw is not None:
+                        log.info(
+                            "datagolf.matched",
+                            source="in_play",
+                            player=player_name,
+                            matched=full,
+                            p_yes=round(pw, 4),
+                        )
+                        return pw, "datagolf:in_play", full
+
+    # Tier 1b: pre-tournament feed
+    players = await fetch_pre_tournament(tour="pga")
+    if players:
+        for p in players:
+            full = _name(p)
+            if not full:
+                continue
+            if name_match(player_name, full):
+                pw = _win_prob(p)
+                if pw is not None:
+                    log.info(
+                        "datagolf.matched",
+                        source="pre_tourney",
+                        player=player_name,
+                        matched=full,
+                        p_yes=round(pw, 4),
+                    )
+                    return pw, "datagolf:pre_tourney", full
+
+    return None

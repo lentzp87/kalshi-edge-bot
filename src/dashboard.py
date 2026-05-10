@@ -21,6 +21,8 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 from .config import env_config, file_config
+from . import cross_exchange_state
+from .exit_simulator import aggregate_exit_policies, edge_bucket
 from .journal import Journal
 
 app = FastAPI(title="Kalshi Edge Bot")
@@ -215,6 +217,16 @@ def edge() -> dict:
     return _journal.realized_edge_summary()
 
 
+@app.get("/cross_exchange")
+def cross_exchange() -> dict:
+    """Latest Kalshi-vs-Polymarket spread snapshot.
+
+    Populated by `cross_exchange_loop` in main.py every ~5 min. Cold
+    start returns ts=None and an empty spreads list.
+    """
+    return cross_exchange_state.latest()
+
+
 @app.get("/stats")
 def stats() -> dict:
     raw = _journal.recent_trades(limit=10000)
@@ -256,6 +268,7 @@ def stats() -> dict:
             "by_fav_dog": [], "by_entry_bucket": [], "by_tip_bucket": [],
             "by_exit_reason": [], "by_series": [], "by_hold": [],
             "by_confidence": [],
+            "by_exit_policy": [], "by_edge_bucket": [],
             "n_clv": 0, "avg_clv_bp": 0.0, "pct_positive_clv": 0.0,
             "by_sport_clv": [],
             "settlement": {
@@ -344,6 +357,15 @@ def stats() -> dict:
         "by_confidence": _bucket_aggregate(
             chronological,
             lambda r: r.get("_confidence_bucket")
+        ),
+        # A/B exit-policy cohort sim: per-policy P&L if every trade had
+        # used a different exit rule (TP-only, SL-only, time-only, etc.).
+        "by_exit_policy": aggregate_exit_policies(chronological),
+        # Edge-magnitude buckets: does bigger predicted edge actually
+        # produce bigger realized P&L?
+        "by_edge_bucket": _bucket_aggregate(
+            chronological,
+            lambda r: edge_bucket(r.get("_gross_edge"))
         ),
         # ---- CLV summary -----------------------------------------------
         # CLV per trade: clv_price - fill_price (>0 if line moved our way).
@@ -660,6 +682,45 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
     </div>
   </div>
 
+  <div class="grid cols-2" style="margin-top:16px">
+    <div class="panel">
+      <div class="title">A/B Exit Cohorts <span class="meta">what if every trade had used a different exit?</span></div>
+      <table>
+        <thead><tr><th>Policy</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="tbody-exit-policy"><tr><td colspan="4" class="empty">no data yet</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <div class="title">By Edge Bucket <span class="meta">does bigger predicted edge correlate with bigger realized P&amp;L?</span></div>
+      <table>
+        <thead><tr><th>Edge</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="tbody-edge-bucket"><tr><td colspan="4" class="empty">no data yet</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:16px">
+    <div class="title">Kalshi vs Polymarket Spreads
+      <span class="meta" id="cx-meta">awaiting first snapshot</span>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr>
+          <th>Kalshi market</th>
+          <th>Polymarket question</th>
+          <th class="num">Kalshi YES</th>
+          <th class="num">Poly YES</th>
+          <th class="num">Spread</th>
+          <th class="num">Match</th>
+          <th>Direction</th>
+        </tr></thead>
+        <tbody id="tbody-cross-exchange">
+          <tr><td colspan="7" class="empty">awaiting first snapshot</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
   <div class="panel" style="margin-top:16px">
     <div class="title">CLV by Sport <span class="meta">did the line move our way after we entered?</span></div>
     <table>
@@ -853,6 +914,40 @@ function renderBucketTable(tbodyId, rows) {{
       <td class="num">${{(r.win_rate*100).toFixed(0)}}%</td>
       <td class="num ${{cls(r.pnl)}}">${{fmt$(r.pnl)}}</td>
     </tr>`).join('');
+}}
+
+function renderCrossExchange(snap) {{
+  const tb = document.getElementById('tbody-cross-exchange');
+  const meta = document.getElementById('cx-meta');
+  if (!snap || !snap.spreads || !snap.spreads.length) {{
+    tb.innerHTML = '<tr><td colspan="7" class="empty">no spreads found</td></tr>';
+    if (snap && snap.ts) {{
+      meta.textContent = `last snapshot ${{fmtTime(snap.ts)}} — ` +
+        `Kalshi ${{snap.n_kalshi}} / Polymarket ${{snap.n_polymarket}}`;
+    }} else {{
+      meta.textContent = 'awaiting first snapshot';
+    }}
+    return;
+  }}
+  meta.textContent = `last snapshot ${{fmtTime(snap.ts)}} — ` +
+    `Kalshi ${{snap.n_kalshi}} / Polymarket ${{snap.n_polymarket}} — ` +
+    `${{snap.spreads.length}} spreads`;
+  tb.innerHTML = snap.spreads.map(s => {{
+    const sp = s.spread_pp;
+    const pp = (sp >= 0 ? '+' : '') + (sp * 100).toFixed(1) + 'pp';
+    const dirShort = (s.arb_direction || '')
+      .replace(/_/g, ' ')
+      .replace('buy ', '');
+    return `<tr>
+      <td class="ticker" title="${{s.kalshi_ticker}}">${{s.kalshi_title || s.kalshi_ticker}}</td>
+      <td title="${{s.polymarket_slug}}">${{s.polymarket_question}}</td>
+      <td class="num">${{(s.kalshi_yes_price * 100).toFixed(0)}}¢</td>
+      <td class="num">${{(s.polymarket_yes_price * 100).toFixed(0)}}¢</td>
+      <td class="num ${{cls(sp)}}">${{pp}}</td>
+      <td class="num">${{(s.match_score * 100).toFixed(0)}}%</td>
+      <td class="muted">${{dirShort}}</td>
+    </tr>`;
+  }}).join('');
 }}
 
 function renderClvTable(tbodyId, rows) {{
@@ -1081,11 +1176,12 @@ function renderKpis(s) {{
 
 async function refresh() {{
   try {{
-    const [stats, openPos, tradesRows, daily] = await Promise.all([
+    const [stats, openPos, tradesRows, daily, crossEx] = await Promise.all([
       fetch('/stats').then(r => r.json()),
       fetch('/positions').then(r => r.json()),
       fetch('/trades?limit=200').then(r => r.json()),
       fetch('/pnl').then(r => r.json()),
+      fetch('/cross_exchange').then(r => r.json()),
     ]);
     renderKpis(stats);
     buildCurveChart(stats.pnl_curve);
@@ -1100,7 +1196,10 @@ async function refresh() {{
     renderBucketTable('tbody-series',     stats.by_series);
     renderBucketTable('tbody-hold',       stats.by_hold);
     renderBucketTable('tbody-confidence', stats.by_confidence);
+    renderBucketTable('tbody-exit-policy', stats.by_exit_policy);
+    renderBucketTable('tbody-edge-bucket', stats.by_edge_bucket);
     renderClvTable('tbody-clv-sport',     stats.by_sport_clv);
+    renderCrossExchange(crossEx);
     renderOpen(openPos);
     renderTrades(tradesRows);
     renderDaily(daily);

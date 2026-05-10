@@ -33,6 +33,10 @@ class DecisionConfig(BaseModel):
     # if the edge looks positive, the variance/fee math is unfriendly.
     # Setting 0.0 disables this filter (back-compat default).
     min_p_yes: float = 0.0
+    # Safety margin (in probability points) added to the per-market
+    # required edge after entry+exit fees + half-spread + slippage.
+    # Don't fire on knife-edge gross edges that barely cover costs.
+    required_edge_safety_pp: float = 0.005
 
 
 class RiskConfig(BaseModel):

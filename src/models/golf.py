@@ -34,7 +34,10 @@ import structlog
 from ..config import file_config
 from ..kalshi_client import Market
 from ..market_fields import event_start_utc, yes_side_name
-from ..odds_provider import fair_probability_for_golf
+from ..odds_provider import (
+    fair_probability_for_golf,
+    fair_probability_for_golf_datagolf,
+)
 from .base import ProbabilityEstimate
 
 log = structlog.get_logger(__name__)
@@ -77,13 +80,22 @@ class GolfModel:
         tip_utc = event_start_utc(market.raw)
         date_utc_str = tip_utc.strftime("%Y-%m-%d") if tip_utc else None
 
-        fair = await fair_probability_for_golf(
-            player_name=our_name, date_utc=date_utc_str,
+        # Tier 1: DataGolf (datagolf.com) — sharpest public golf model.
+        # Tier 2: The Odds API (multi-book median devig).
+        fair_dg = await fair_probability_for_golf_datagolf(
+            player_name=our_name, in_tournament=True,
         )
-        if not fair:
-            log.info("golf.skip.no_book_match", ticker=ticker, player=our_name)
-            return None
-        p_yes, provider, matched_full = fair
+        if fair_dg is not None:
+            p_yes, provider, matched_full = fair_dg
+        else:
+            # Fall back to existing Odds API path
+            fair_oa = await fair_probability_for_golf(
+                player_name=our_name, date_utc=date_utc_str,
+            )
+            if not fair_oa:
+                log.info("golf.skip.no_book_match", ticker=ticker, player=our_name)
+                return None
+            p_yes, provider, matched_full = fair_oa
 
         # Clamp — players can have 1-2% fair prob; clamp to 0.005 floor
         # so the decision layer's min_entry_price still does its job.

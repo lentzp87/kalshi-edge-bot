@@ -46,15 +46,14 @@ log = structlog.get_logger(__name__)
 
 
 # Trading window in minutes-to-tipoff:
-#   too late  (<120 min)   -> dashboard data shows 1-2h window has
-#                              25% win rate and -$355 P&L on 28 trades.
-#                              Late-pregame news (lineup scratches,
-#                              weather, sharp volume) moves the book
-#                              faster than our cached probabilities.
-#   too early (>1440 min)  -> book lines may shift before close.
-# 2-24h is the empirically-best window: 81% wr / +$96 in 2-4h, 100% in 4h+.
-PREGAME_MAX_MIN = 24 * 60  # 24 hours
-PREGAME_MIN_MIN = 120      # 2 hours (was 5)
+#   too late  (<120 min)   -> 1-2h bucket showed 25% wr, -$355 (data).
+#   too early (>480 min)   -> 4h+ bucket only had 14 trades, +$2 P&L.
+#                              Lines move closer to close, so trading
+#                              earlier just eats more spread/fee drag.
+# 2-8h is the empirically-best window — concentrates on 2-4h sweet spot
+# (was 81% wr / +$96) without the 24h tail that produced no signal.
+PREGAME_MAX_MIN = 8 * 60   # 8 hours (was 24h)
+PREGAME_MIN_MIN = 120      # 2 hours
 
 
 SERIES_REGISTRY: dict[str, str] = {
@@ -175,9 +174,13 @@ class SportsModel:
                 return None
 
         # ----- Fair probability from book consensus -----
+        # ESPN pickcenter is intentionally NOT passed for pregame.
+        # Data showed ESPN-pregame trades returned -$239 over 79 trades
+        # — it's a soft single book that retail uses, so any "edge" is
+        # already priced in. ESPN winprob stays in InGameSportsModel.
         fair = await fair_probability_for_game(
             sport=sport,
-            espn_event_id=espn_event_id,
+            espn_event_id=None,   # ← was espn_event_id; intentionally killed
             away_name=away_name,
             home_name=home_name,
             date_utc=date_utc_str,

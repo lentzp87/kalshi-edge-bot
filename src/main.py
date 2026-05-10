@@ -16,11 +16,15 @@ import structlog
 import uvicorn
 
 from .config import env_config, file_config
+from .cross_exchange import find_spreads
+from . import cross_exchange_state
 from .decision import evaluate
 from .execution import Executor
 from .journal import Journal
 from .kalshi_client import KalshiClient
+from .kalshi_ws import KalshiWebSocket
 from .models import model_for_category
+from .polymarket_client import list_active_markets as poly_list_active_markets
 from .risk import RiskEngine
 from .scanner import Scanner
 from .orphan_recovery import recover_orphans
@@ -87,6 +91,55 @@ async def trading_loop(
         await asyncio.sleep(cfg.scanner.loop_interval_seconds)
 
 
+async def cross_exchange_loop(
+    client: KalshiClient, *, interval_seconds: int = 300,
+    max_pages: int = 5,
+) -> None:
+    """Periodic Kalshi-vs-Polymarket spread snapshot.
+
+    Read-only and out-of-band: doesn't touch the trading loop. Stores its
+    output in `cross_exchange_state` for the dashboard to surface.
+
+    `max_pages` caps the number of Kalshi paginated requests per cycle so
+    we don't hammer the API; with limit=200 that's ~1000 markets, which is
+    more than enough for the cross-exchange comparison since most Kalshi
+    markets won't have a Polymarket twin anyway.
+    """
+    while True:
+        try:
+            # Fetch Kalshi: paginate "open" markets up to max_pages.
+            kalshi_markets = []
+            cursor: str | None = None
+            for _ in range(max_pages):
+                batch, cursor = await client.list_markets(
+                    status="open", limit=200, cursor=cursor,
+                )
+                kalshi_markets.extend(batch)
+                if not cursor:
+                    break
+
+            poly_markets = await poly_list_active_markets()
+
+            spreads = find_spreads(
+                kalshi_markets=kalshi_markets,
+                polymarket_markets=poly_markets,
+            )
+            cross_exchange_state.update(
+                n_kalshi=len(kalshi_markets),
+                n_polymarket=len(poly_markets),
+                spreads=spreads,
+            )
+            log.info(
+                "cross_exchange.snapshot",
+                n_kalshi=len(kalshi_markets),
+                n_polymarket=len(poly_markets),
+                spreads=len(spreads),
+            )
+        except Exception:
+            log.exception("cross_exchange.error")
+        await asyncio.sleep(interval_seconds)
+
+
 async def dashboard_server() -> None:
     """Embed uvicorn so dashboard runs in the same process as the trading loop.
 
@@ -129,6 +182,22 @@ async def amain() -> None:
     else:
         log.warning("bot.odds_api_key", source="baked",
                     note="ODDS_API_KEY env var not set — using baked-in key (likely dead)")
+
+    # DataGolf is the Tier-1 truth source for the golf model. Log presence at
+    # startup so deploy logs show whether we're running with the sharper
+    # provider or falling back to The Odds API outright odds.
+    dg_key_env = _os.environ.get("DATAGOLF_API_KEY")
+    if dg_key_env:
+        dg_masked = (
+            dg_key_env[:4] + "..." + dg_key_env[-4:]
+            if len(dg_key_env) >= 8 else "***"
+        )
+        log.info("bot.datagolf_key", source="env", masked=dg_masked)
+    else:
+        log.info(
+            "bot.datagolf_key", source="missing",
+            note="DATAGOLF_API_KEY not set; golf falls back to Odds API outrights",
+        )
 
     client = KalshiClient()
     # Pull Kalshi's full series catalog ONCE at startup so every market
@@ -174,6 +243,12 @@ async def amain() -> None:
     except Exception:
         log.exception("orphan_recovery.error")
 
+    # Kalshi WebSocket — read-only ticker subscriber. No-ops gracefully if
+    # the `websockets` library isn't installed (REST polling continues
+    # regardless). Currently just logs ticks; integration with the in-game
+    # model is a follow-up.
+    ws = KalshiWebSocket(client)
+
     try:
         await asyncio.gather(
             trading_loop(scanner, executor, journal, whale_tracker),
@@ -183,6 +258,10 @@ async def amain() -> None:
             # settlement" P&L. Surfaces whether our exits are leaving
             # money on the table.
             settlement_loop(client, journal, interval_seconds=600),
+            # WebSocket: read-only smoke test of the Kalshi WS pipe.
+            ws.run(),
+            # Polymarket cross-exchange spread snapshot every 5 min.
+            cross_exchange_loop(client, interval_seconds=300),
         )
     finally:
         await client.aclose()

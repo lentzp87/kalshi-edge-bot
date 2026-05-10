@@ -104,19 +104,52 @@ def evaluate(market: Market, est: ProbabilityEstimate) -> TradeSignal | None:
                  min=cfg.decision.min_p_yes)
         return None
 
-    # Subtract fees + slippage. Estimate contract count at our max position
-    # size to compute the right fee buffer (fees are per-contract).
+    # ----- Per-market fee-adjusted edge gate -----
+    # ChatGPT pushback: a global min_edge ignores that the fee curve
+    # varies by price (peaks near 0.50). Compute a per-market required
+    # edge that includes both legs of fees, half the spread we have to
+    # cross, slippage cushion, and a safety margin. Then check raw
+    # gross_edge against THIS bar, not against a flat threshold.
     contracts_est = max(1, int(cfg.risk.max_position_size_usd / max(target_price, 0.01)))
-    fee_buf = fee_buffer_pp(target_price, contracts_est)
-    net_edge = gross_edge - fee_buf - _SLIPPAGE_BUFFER
-
+    entry_fee_pp = fee_buffer_pp(target_price, contracts_est)
+    # Estimate exit at the same price (worst case). Real exit may be
+    # cheaper/dearer depending on direction, but this is conservative.
+    exit_fee_pp = entry_fee_pp
+    # Half-spread we have to cross to enter. Already captured in
+    # executable price vs mid, but explicit factor keeps the math honest
+    # if the executable_price calculation ever changes.
+    spread = market.effective_yes_ask - market.effective_yes_bid
+    half_spread_pp = (spread / 2) / max(target_price, 0.01)
+    # Configurable safety margin so we don't fire on knife-edge edges.
+    safety_pp = cfg.decision.required_edge_safety_pp
+    required_edge = (
+        entry_fee_pp + exit_fee_pp + half_spread_pp
+        + _SLIPPAGE_BUFFER + safety_pp
+    )
+    net_edge = gross_edge - entry_fee_pp - exit_fee_pp - _SLIPPAGE_BUFFER
+    # Two-tier gate:
+    #   1. Raw gross_edge must exceed required_edge — covers all costs.
+    #   2. Net edge must clear cfg.decision.min_edge — paper-mode floor.
+    if gross_edge < required_edge:
+        log.info("decision.skip.edge_below_required",
+                 ticker=market.ticker, side=side,
+                 gross=round(gross_edge, 4),
+                 required=round(required_edge, 4),
+                 entry_fee=round(entry_fee_pp, 4),
+                 exit_fee=round(exit_fee_pp, 4),
+                 half_spread=round(half_spread_pp, 4),
+                 safety=round(safety_pp, 4),
+                 p_yes=round(p_yes, 3), price=round(target_price, 3))
+        return None
     if net_edge < cfg.decision.min_edge:
         log.info("decision.skip.edge_too_small",
                  ticker=market.ticker, side=side,
-                 gross=round(gross_edge, 4), fee_buf=round(fee_buf, 4),
+                 gross=round(gross_edge, 4), fee_buf=round(entry_fee_pp, 4),
                  net=round(net_edge, 4), min=cfg.decision.min_edge,
                  p_yes=round(p_yes, 3), price=round(target_price, 3))
         return None
+    # Keep original variable name for fee_buf in the rest of the file
+    fee_buf = entry_fee_pp
 
     # Kelly sizing on net edge, scaled by model confidence
     size_usd = _kelly_size(cfg.bankroll_usd, net_edge * est.confidence, target_price)

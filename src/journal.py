@@ -79,6 +79,11 @@ _MIGRATIONS = [
     # having to make Kalshi API calls itself.
     "ALTER TABLE trades ADD COLUMN current_mid REAL",
     "ALTER TABLE trades ADD COLUMN current_mid_ts TEXT",
+    # Per-position mid range during the entire hold. Lets the dashboard
+    # compute retrospective "would TP only have fired" / "would SL only
+    # have fired" without needing a full price-history table.
+    "ALTER TABLE trades ADD COLUMN max_mid_during_hold REAL",
+    "ALTER TABLE trades ADD COLUMN min_mid_during_hold REAL",
 ]
 
 
@@ -211,11 +216,17 @@ class Journal:
 
     def update_current_mid(self, *, ticker: str, opened_ts: str, mid: float) -> None:
         """Record the latest mark-to-market mid for an open position.
-        Called every 15s by the executor's watcher loop."""
+        Also rolls max_mid_during_hold and min_mid_during_hold so the
+        dashboard can answer 'would TP-only have fired?' / 'would
+        SL-only have fired?' without a separate snapshots table.
+        """
         self.conn.execute(
-            "UPDATE trades SET current_mid=?, current_mid_ts=? "
+            "UPDATE trades SET "
+            "  current_mid=?, current_mid_ts=?, "
+            "  max_mid_during_hold = MAX(COALESCE(max_mid_during_hold, ?), ?), "
+            "  min_mid_during_hold = MIN(COALESCE(min_mid_during_hold, ?), ?) "
             "WHERE ticker=? AND opened_ts=? AND closed_ts IS NULL",
-            (mid, self._now(), ticker, opened_ts),
+            (mid, self._now(), mid, mid, mid, mid, ticker, opened_ts),
         )
         self.conn.commit()
 
