@@ -213,17 +213,20 @@ async def amain() -> None:
         from .models.ufc import UFC_SERIES
         from .models.soccer import SOCCER_SERIES
         from .models.golf import GOLF_SERIES
+        from .models.cricket import CRICKET_SERIES
         sports = list(SPORTS_SERIES.keys())
         tennis = sorted(TENNIS_SERIES)
         ufc = sorted(UFC_SERIES)
         soccer = sorted(SOCCER_SERIES)
         golf = sorted(GOLF_SERIES)
+        cricket = sorted(CRICKET_SERIES)
         log.info("scanner.dynamic_series.sports", count=len(sports), series=sports)
         log.info("scanner.dynamic_series.tennis", count=len(tennis), series=tennis)
         log.info("scanner.dynamic_series.ufc",    count=len(ufc),    series=ufc)
         log.info("scanner.dynamic_series.soccer", count=len(soccer), series=soccer)
         log.info("scanner.dynamic_series.golf",   count=len(golf),   series=golf)
-        discovered += sports + tennis + ufc + soccer + golf
+        log.info("scanner.dynamic_series.cricket", count=len(cricket), series=cricket)
+        discovered += sports + tennis + ufc + soccer + golf + cricket
 
     if discovered:
         cfg.scanner.series_tickers = discovered

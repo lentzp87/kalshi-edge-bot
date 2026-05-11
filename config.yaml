@@ -95,13 +95,22 @@ risk:
   whale_max_position_size_usd: 200
 
 execution:
-  # Settlement backtest revealed: stops SAVED $153 over 29 SL exits, but
-  # take_profits COST $195 over 45 TP exits. TP at 0.30 was capping
-  # winners — held-to-settlement winners average +$10.91 vs +$6.56
-  # actual. Widen TP so only big moves trigger; let time_exit handle
-  # the rest. Stops stay tight (working as designed).
+  # 2026-05-11 SL DISABLED. Settlement backtest panel after the v4 DB
+  # rotation showed:
+  #   "Of 9 stop_loss exits: actual -$115.27, if held to settlement
+  #    +$6.72 — stops cost +$121.99"
+  # And the A/B Exit Cohorts panel showed all four alternative policies
+  # (tp_only_20, sl_only_12, time_only, tp_and_sl_20_12) returned
+  # +$67.82 on the same 11-trade window vs actual -$32.50.
+  # The model's calls were correct (65-70% confidence bucket would have
+  # been 4W-0L on settlement, was 0W-4L on actual). The SL was firing
+  # on bid-ask whipsaw at fill (one trade SL'd at hold=0m). Set to 1.0
+  # so the (mid - fill) / fill <= -1.0 branch in execution.py can never
+  # trigger. Let TP at +50% and time_exit at tipoff handle everything.
+  # If we re-introduce SL, do it as a >=10min grace period + use
+  # effective_yes_bid (not mid) for the trigger to remove fill-spread.
   take_profit_pct: 0.50
-  stop_loss_pct: 0.12
+  stop_loss_pct: 1.00
   # Long hold for pregame CLV: line drifts toward truth as tipoff nears.
   time_exit_minutes: 240
   order_type: limit

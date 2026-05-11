@@ -87,10 +87,12 @@ class SportsModel:
         from .ufc import UFCModel
         from .soccer import SoccerModel
         from .golf import GolfModel
+        from .cricket import CricketModel
         self._tennis = TennisModel(enabled=self.enabled)
         self._ufc = UFCModel(enabled=self.enabled)
         self._soccer = SoccerModel(enabled=self.enabled)
         self._golf = GolfModel(enabled=self.enabled)
+        self._cricket = CricketModel(enabled=self.enabled)
         # In-game targets ESPN winprob lag for team sports.
         self._in_game = InGameSportsModel(enabled=self.enabled)
 
@@ -106,6 +108,7 @@ class SportsModel:
         from .ufc import UFC_SERIES
         from .soccer import SOCCER_SERIES
         from .golf import GOLF_SERIES
+        from .cricket import CRICKET_SERIES
         if series in TENNIS_SERIES:
             return await self._tennis.estimate(market)
         if series in UFC_SERIES:
@@ -114,6 +117,8 @@ class SportsModel:
             return await self._soccer.estimate(market)
         if series in GOLF_SERIES:
             return await self._golf.estimate(market)
+        if series in CRICKET_SERIES:
+            return await self._cricket.estimate(market)
 
         # Team sports (NBA/NFL/MLB/NHL/WNBA/NCAA): try in-game first
         # (ESPN winprob lag during late-game phase), then fall through

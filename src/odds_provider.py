@@ -242,8 +242,162 @@ PINNACLE_LEAGUE_IDS: dict[str, int] = {
     # we fall through to Odds API which has solid NCAA coverage).
 }
 
+# Pinnacle "sport" ids for sports where the league granularity is
+# per-tournament-round (tennis) or rotates frequently (cricket). For these
+# we don't hardcode league IDs — we enumerate /sports/{id}/leagues with
+# matchupCount>0 dynamically and search across all active leagues.
+PINNACLE_SPORT_IDS: dict[str, int] = {
+    "tennis":  33,   # ATP / WTA / ITF / Challenger — split per round
+    "cricket":  8,   # IPL=720, Test=8896, World Cup L2, etc.
+}
+
+# Cache of (active_league_ids) per sport_id, refreshed every 10 min.
+# Keeping it longer than _PINNACLE_TTL_SEC because leagues come/go
+# slower than odds do, and an inactive league_id is harmless (just
+# returns empty matchups).
+_PINNACLE_LEAGUES_TTL_SEC = 600
+_pinnacle_active_leagues: dict[int, tuple[float, list[int]]] = {}
+_pinnacle_active_leagues_lock = asyncio.Lock()
+
 _pinnacle_cache: dict[str, tuple[float, dict]] = {}
 _pinnacle_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _fetch_pinnacle_active_leagues(sport_id: int) -> list[int]:
+    """Hit /sports/{sport_id}/leagues, return league IDs with matchupCount>0.
+
+    Cached 10 min globally per sport. Returns [] on failure (caller falls
+    through to other tiers).
+    """
+    cached = _pinnacle_active_leagues.get(sport_id)
+    now = time.time()
+    if cached and (now - cached[0]) < _PINNACLE_LEAGUES_TTL_SEC:
+        return cached[1]
+
+    async with _pinnacle_active_leagues_lock:
+        cached = _pinnacle_active_leagues.get(sport_id)
+        if cached and (time.time() - cached[0]) < _PINNACLE_LEAGUES_TTL_SEC:
+            return cached[1]
+        url = f"{_PINNACLE_BASE}/sports/{sport_id}/leagues"
+        headers = {
+            "X-API-Key": _PINNACLE_GUEST_KEY,
+            "Accept": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                payload = r.json() or []
+        except Exception as e:
+            log.warning("pinnacle.leagues_failed",
+                        sport_id=sport_id, err=str(e)[:200])
+            return []
+        ids: list[int] = []
+        if isinstance(payload, list):
+            for lg in payload:
+                if not isinstance(lg, dict):
+                    continue
+                if (lg.get("matchupCount") or 0) <= 0:
+                    continue
+                lid = lg.get("id")
+                if isinstance(lid, int):
+                    ids.append(lid)
+        log.info("pinnacle.leagues_loaded", sport_id=sport_id, active=len(ids))
+        _pinnacle_active_leagues[sport_id] = (time.time(), ids)
+        return ids
+
+
+async def _pinnacle_search_two_way(
+    *, sport_id: int, name_a: str, name_b: str,
+) -> tuple[float, float, str, str, str] | None:
+    """Generic 2-participant Pinnacle search across all active leagues
+    for `sport_id`. Returns (fair_a, fair_b, provider, a_full, b_full)
+    on first match, or None.
+
+    `name_a` / `name_b` are the two side names from Kalshi (player
+    names for tennis, team names for cricket). Order doesn't matter —
+    we normalize to whichever Pinnacle slot matches.
+    """
+    league_ids = await _fetch_pinnacle_active_leagues(sport_id)
+    if not league_ids:
+        return None
+
+    for lid in league_ids:
+        data = await _fetch_pinnacle_league(lid)
+        if not data:
+            continue
+        matchups = data.get("matchups") or []
+        markets = data.get("markets") or []
+        if not matchups:
+            continue
+
+        # Build matchupId -> (away, home) lookup
+        mu_by_id: dict[int, tuple[str, str]] = {}
+        for mu in matchups:
+            mid = mu.get("id")
+            if not mid:
+                continue
+            teams = _pinnacle_participants(mu)
+            if teams:
+                mu_by_id[int(mid)] = teams
+
+        # Find a matchup whose two participants match (a, b) in either order
+        target_mu_id = None
+        pin_away = pin_home = None
+        a_is_home = False
+        for mid, (a_pin, h_pin) in mu_by_id.items():
+            # forward: name_a matches Pinnacle "away", name_b matches "home"
+            if name_match(name_a, a_pin) and name_match(name_b, h_pin):
+                target_mu_id = mid
+                pin_away, pin_home = a_pin, h_pin
+                a_is_home = False
+                break
+            # reverse: name_a matches Pinnacle "home"
+            if name_match(name_a, h_pin) and name_match(name_b, a_pin):
+                target_mu_id = mid
+                pin_away, pin_home = a_pin, h_pin
+                a_is_home = True
+                break
+        if target_mu_id is None:
+            continue
+
+        # Find the moneyline market for that matchup
+        home_odds = away_odds = None
+        for mk in markets:
+            if mk.get("matchupId") != target_mu_id:
+                continue
+            if (mk.get("type") or "").lower() != "moneyline":
+                continue
+            for price in mk.get("prices") or []:
+                d = price.get("designation") or ""
+                label = price.get("label") or ""
+                if d == "home" or label == pin_home:
+                    home_odds = price.get("price")
+                elif d == "away" or label == pin_away:
+                    away_odds = price.get("price")
+            if home_odds is not None and away_odds is not None:
+                break
+
+        if home_odds is None or away_odds is None:
+            continue
+        pair = devig_two_way(home_odds, away_odds)
+        if not pair:
+            continue
+        # pair = (home_prob, away_prob)
+        if a_is_home:
+            fair_a, fair_b = pair[0], pair[1]
+            a_full, b_full = pin_home, pin_away
+        else:
+            fair_a, fair_b = pair[1], pair[0]
+            a_full, b_full = pin_away, pin_home
+        log.info(
+            "pinnacle.matched",
+            sport_id=sport_id, league_id=lid,
+            a=name_a, matched_a=a_full, fair_a=round(fair_a, 4),
+        )
+        return fair_a, fair_b, "pinnacle", a_full, b_full
+
+    return None
 
 
 async def _fetch_pinnacle_league(league_id: int) -> dict | None:
@@ -698,11 +852,24 @@ async def fair_probability_for_tennis(
     home_team / away_team fields. Player A's probability is fair_a
     regardless of which slot it falls into in the book's response.
     """
-    sport_keys = await _fetch_active_tennis_sport_keys()
-    if not sport_keys:
+    if not player_a_name or not player_b_name:
         return None
 
-    if not player_a_name or not player_b_name:
+    # Tier 1: Pinnacle. Tennis on Pinnacle is one league per
+    # tournament-round (e.g. "ATP Rome - R16"), so we enumerate active
+    # leagues for sport_id=33 dynamically and search across them all.
+    pin = await _pinnacle_search_two_way(
+        sport_id=PINNACLE_SPORT_IDS["tennis"],
+        name_a=player_a_name, name_b=player_b_name,
+    )
+    if pin:
+        fair_a, fair_b, _provider, a_full, b_full = pin
+        return fair_a, fair_b, "pinnacle:tennis", a_full, b_full
+
+    # Tier 2: The Odds API (multi-book median). Often blocked by
+    # subscription tier — we cache 401s for 24h to avoid hammering.
+    sport_keys = await _fetch_active_tennis_sport_keys()
+    if not sport_keys:
         return None
 
     date_window = None
@@ -779,6 +946,37 @@ async def fair_probability_for_tennis(
             provider = f"odds_api:{sport_key} ({n} books)"
             return fair_a, fair_b, provider, a_full, b_full
 
+    return None
+
+
+# ============================================================================
+# Cricket — 2-way (team A vs team B); Pinnacle only (sport=8)
+# ============================================================================
+
+async def fair_probability_for_cricket(
+    *, team_a_name: str, team_b_name: str,
+    date_utc: str | None = None,
+) -> tuple[float, float, str, str, str] | None:
+    """Pinnacle-only cricket fair probabilities.
+
+    Returns (fair_a, fair_b, provider, a_full, b_full). Pinnacle has
+    IPL (league_id=720), Test Matches (8896), and World Cup leagues
+    on the guest API. We enumerate active leagues for sport_id=8 and
+    search across them — same pattern as tennis.
+
+    The Odds API has cricket but most subscription tiers block it, so
+    we don't bother with Tier 2 fallback yet. Add it later if Pinnacle
+    starts missing matches.
+    """
+    if not team_a_name or not team_b_name:
+        return None
+    pin = await _pinnacle_search_two_way(
+        sport_id=PINNACLE_SPORT_IDS["cricket"],
+        name_a=team_a_name, name_b=team_b_name,
+    )
+    if pin:
+        fair_a, fair_b, _provider, a_full, b_full = pin
+        return fair_a, fair_b, "pinnacle:cricket", a_full, b_full
     return None
 
 
