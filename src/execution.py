@@ -66,14 +66,36 @@ class Executor:
         # every loop after each take_profit / stop_loss.
         self.cooldown_until: dict[str, datetime] = {}
 
-    _COOLDOWN_MINUTES = 60
+    _COOLDOWN_MINUTES = 90  # was 60 — Khachanov/Prizmic re-entered at 59m
 
     @staticmethod
     def _event_ticker(market: Market) -> str:
-        """Kalshi events group mirror tickers (TEAM-A-yes ≡ TEAM-B-no).
-        Falls back to the market ticker if event_ticker isn't present.
+        """Return the canonical event key shared by every side of a Kalshi
+        market.
+
+        We DERIVE this from the ticker string rather than trust
+        market.raw.event_ticker because Kalshi tennis markets ship a
+        DIFFERENT event_ticker for each player side — which broke our
+        dedup on 2026-05-12 (Khachanov-YES TP'd at 05:52, Prizmic-NO
+        re-entered at 06:51 = same Khachanov-to-win bet at a worse
+        price, lost $33).
+
+        Convention: Kalshi sports tickers look like
+        `SERIES-MATCHID-SIDE`, e.g. `KXATPMATCH-26MAY11KHAPRI-KHA` and
+        `KXATPMATCH-26MAY11KHAPRI-PRI`. Stripping the final `-SIDE`
+        chunk gives `KXATPMATCH-26MAY11KHAPRI`, identical for every
+        side of the same event (works for 2-way moneylines AND 3-way
+        soccer where there's an extra `-TIE` ticker).
+
+        Falls back to raw.event_ticker / ticker if the split fails.
         """
-        return (market.raw.get("event_ticker") or market.ticker or "").strip()
+        t = (market.ticker or "").strip()
+        if t and t.count("-") >= 2:
+            return t.rsplit("-", 1)[0]
+        # Defensive fallback: trust Kalshi's field if our split heuristic
+        # can't find at least two hyphens (shouldn't happen on real
+        # sports markets but might on non-sport ones).
+        return (market.raw.get("event_ticker") or t).strip()
 
     async def submit(self, signal: TradeSignal, market: Market) -> None:
         # 1) One position per ticker (existing dedup)

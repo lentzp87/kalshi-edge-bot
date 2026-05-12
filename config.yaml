@@ -12,7 +12,12 @@ scanner:
   # Same-day focus: only markets that resolve within the next 24 hours.
   # Resolution time = `expected_expiration_time` (game time / day-end), NOT
   # `close_time` (when trading stops, which can be weeks later for playoffs).
-  max_minutes_to_expiry: 1440   # 24 hours
+  # 2026-05-12: widened from 24h → 36h. First Bangladesh-vs-Pakistan
+  # cricket trade in bot history hit at Tip=24.0h — right at the prior
+  # boundary. Cricket Test matches span 5 days and most of our model
+  # MAX windows (tennis 36h, soccer 36h, cricket 36h) are 36h, so this
+  # aligns the scanner with the models.
+  max_minutes_to_expiry: 2160   # 36 hours
   min_minutes_to_expiry: 5      # skip markets resolving in <5 min (no time to react)
   # Only scan markets in these Kalshi categories; everything else gets dropped
   # at the scanner. Empty list = scan every category.
@@ -62,20 +67,22 @@ decision:
   #     games at $0.37-0.49 where the model still has a clear opinion.
   #     Fee math is uglier at $0.40 so the per-market `required_edge` gate
   #     in src/decision.py picks up the slack.
-  #   min_p_yes 0.55         — was 0.60; was rejecting MLB favorites the
-  #     model put at 52-55%. We're paper-trading: cast a wider net, then
-  #     read the by_confidence dashboard panel to see what win rate we
-  #     actually realize per bucket.
+  #   min_p_yes 0.52         — was 0.55, was 0.60. Tennis fills are
+  #     often inside the 50-55% band (e.g. Musetti at fill 0.41 won
+  #     anyway because the line drifted to 0.50). Want this data.
   # BEFORE LIVE: raise min_edge to >=0.03, restore min_p_yes to 0.60, and
   # tune from CLV / by_confidence calibration data.
   min_edge: -0.05
   kelly_fraction: 0.25
   min_entry_price: 0.40
-  min_p_yes: 0.55
+  min_p_yes: 0.52
   # Per-market gate: gross_edge must exceed
   #   entry_fee + exit_fee + half_spread + slippage + safety_pp
-  # safety_pp is the cushion above measured costs. 0.005 = 0.5pp.
-  required_edge_safety_pp: 0.005
+  # safety_pp is the cushion above measured costs. 2026-05-12: dropped
+  # from 0.005 → 0 in paper mode. Want to fire on knife-edge trades and
+  # bucket them in `by_edge_bucket` to see what threshold actually
+  # produces realized P&L. Restore to 0.005 before live.
+  required_edge_safety_pp: 0.0
 
 risk:
   # Lowered from $40 to $20 per ChatGPT recommendation: validate edge
