@@ -78,11 +78,14 @@ decision:
   min_p_yes: 0.52
   # Per-market gate: gross_edge must exceed
   #   entry_fee + exit_fee + half_spread + slippage + safety_pp
-  # safety_pp is the cushion above measured costs. 2026-05-12: dropped
-  # from 0.005 → 0 in paper mode. Want to fire on knife-edge trades and
-  # bucket them in `by_edge_bucket` to see what threshold actually
-  # produces realized P&L. Restore to 0.005 before live.
-  required_edge_safety_pp: 0.0
+  # safety_pp is the cushion above measured costs.
+  # 2026-05-12: dropped 0.005 → 0 to gather knife-edge data.
+  # 2026-05-13: restored 0 → 0.005. By Edge Bucket panel shows
+  # 28 of 29 trades clustered in the 5pp+ bucket but realized
+  # -$179.49; the 3-5pp single trade was -$21.83. Edge magnitude
+  # alone isn't predicting wins, so the cost-floor cushion is real
+  # protection — don't fire on cost-recovery-only trades.
+  required_edge_safety_pp: 0.005
 
 risk:
   # Lowered from $40 to $20 per ChatGPT recommendation: validate edge
@@ -99,7 +102,11 @@ risk:
   # cap. Capped at 5x the original Kelly inside execution.py to limit
   # damage if the whale is wrong / spoofed. Set equal to
   # max_position_size_usd to disable the boost.
-  whale_max_position_size_usd: 200
+  # 2026-05-13: was 200, dropped to 100. St. Louis MLB NO @ 0.44 → 0.01
+  # whale-boosted to $100, full stake loss = -$100 single trade, which
+  # is the entire max_daily_loss_usd budget on ONE position. Whale
+  # signal quality not yet proven; cap downside until we have data.
+  whale_max_position_size_usd: 100
 
 execution:
   # 2026-05-11 SL DISABLED. Settlement backtest panel after the v4 DB
