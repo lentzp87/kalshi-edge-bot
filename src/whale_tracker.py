@@ -65,6 +65,13 @@ class _Snapshot:
     volume_24h: float
     yes_bid_size: float
     yes_ask_size: float
+    # NO-side book sizes. Kalshi exposes these separately from the
+    # yes_* sizes. A large NO bid = whale BUYING NO directly (bearish
+    # on YES), a large NO ask = whale SELLING NO (bullish on YES via
+    # the arb relationship NO_ask = 1 - YES_bid). We were missing
+    # both before because we only watched the yes_* half.
+    no_bid_size: float = 0.0
+    no_ask_size: float = 0.0
 
 
 @dataclass
@@ -115,20 +122,23 @@ class WhaleTracker:
         baseline, not the immediately-previous call.
         """
         now = time.time()
-        try:
-            yes_bid_size = float(market.raw.get("yes_bid_size_fp") or 0)
-        except (TypeError, ValueError):
-            yes_bid_size = 0.0
-        try:
-            yes_ask_size = float(market.raw.get("yes_ask_size_fp") or 0)
-        except (TypeError, ValueError):
-            yes_ask_size = 0.0
+        def _size(key: str) -> float:
+            try:
+                return float(market.raw.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        yes_bid_size = _size("yes_bid_size_fp")
+        yes_ask_size = _size("yes_ask_size_fp")
+        no_bid_size  = _size("no_bid_size_fp")
+        no_ask_size  = _size("no_ask_size_fp")
         new = _Snapshot(
             ts=now,
             last_price=float(market.last_price or 0),
             volume_24h=float(market.volume or 0),
             yes_bid_size=yes_bid_size,
             yes_ask_size=yes_ask_size,
+            no_bid_size=no_bid_size,
+            no_ask_size=no_ask_size,
         )
         history = self._history.setdefault(market.ticker, [])
         history.append(new)
@@ -166,7 +176,13 @@ class WhaleTracker:
                 reason=f"volume_burst_{int(vol_delta)}",
             )
 
-        # 3. Resting whale — weakest, only if nothing stronger
+        # 3. Resting whale — weakest. Watch BOTH halves of the book:
+        #   large_yes_bid / large_no_ask  → bullish on YES
+        #   large_yes_ask / large_no_bid  → bullish on NO
+        # No-side detection added 2026-05-13. Previously we only saw
+        # YES-book resting orders; the NO-book half was invisible to us
+        # (a whale parking a $5k NO bid would only show up in our data
+        # after the YES book re-priced via arb, ~30s late).
         elif (yes_bid_size >= RESTING_SIZE_THRESHOLD
               and (old.yes_bid_size or 0) < RESTING_SIZE_THRESHOLD):
             signal = WhaleSignal(
@@ -174,12 +190,28 @@ class WhaleTracker:
                 direction="yes", confidence=0.4,
                 reason=f"large_yes_bid_{int(yes_bid_size)}c",
             )
+        elif (no_ask_size >= RESTING_SIZE_THRESHOLD
+              and (old.no_ask_size or 0) < RESTING_SIZE_THRESHOLD):
+            # whale selling NO = covering / closing NO = bullish on YES
+            signal = WhaleSignal(
+                ticker=market.ticker, detected_at=now,
+                direction="yes", confidence=0.4,
+                reason=f"large_no_ask_{int(no_ask_size)}c",
+            )
         elif (yes_ask_size >= RESTING_SIZE_THRESHOLD
               and (old.yes_ask_size or 0) < RESTING_SIZE_THRESHOLD):
             signal = WhaleSignal(
                 ticker=market.ticker, detected_at=now,
                 direction="no", confidence=0.4,
                 reason=f"large_yes_ask_{int(yes_ask_size)}c",
+            )
+        elif (no_bid_size >= RESTING_SIZE_THRESHOLD
+              and (old.no_bid_size or 0) < RESTING_SIZE_THRESHOLD):
+            # whale BUYING NO directly = bearish on YES
+            signal = WhaleSignal(
+                ticker=market.ticker, detected_at=now,
+                direction="no", confidence=0.4,
+                reason=f"large_no_bid_{int(no_bid_size)}c",
             )
 
         if signal:

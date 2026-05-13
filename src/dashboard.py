@@ -362,7 +362,7 @@ def stats() -> dict:
             "by_exit_reason": [], "by_series": [], "by_hold": [],
             "by_confidence": [],
             "by_exit_policy": [], "by_edge_bucket": [],
-            "by_whale_class": [], "by_whale_magnitude": [],
+            "by_whale_class": [], "by_whale_magnitude": [], "by_whale_side": [],
             "windowed_pnl": [], "open_mtm": _open_unrealized_snapshot(_journal.open_positions()),
             "n_clv": 0, "avg_clv_bp": 0.0, "pct_positive_clv": 0.0,
             "by_sport_clv": [],
@@ -475,6 +475,18 @@ def stats() -> dict:
         ),
         "by_whale_magnitude": _bucket_aggregate(
             chronological, lambda r: r.get("_whale_magnitude")
+        ),
+        # Whale-boosted trades only, bucketed by the side WE bet.
+        # Tests the hypothesis: are NO-side boosts more predictive than
+        # YES-side boosts? In a symmetric two-way market they should be
+        # equivalent, but Kalshi retail skews YES-heavy on favorites so
+        # NO-side whales may be smarter money fading retail. Empirical
+        # answer comes from this panel once we have N>20 boosted trades.
+        "by_whale_side": _bucket_aggregate(
+            chronological,
+            lambda r: (
+                f"whale→{r.get('side')}" if r.get("_whale_class") else None
+            )
         ),
         # Windowed P&L: realized within each window from chronological
         # (already enriched/cleaned). Unrealized is a separate snapshot
@@ -848,6 +860,16 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
         <tbody id="tbody-whale-magnitude"><tr><td colspan="4" class="empty">no whale-boosted trades yet</td></tr></tbody>
       </table>
     </div>
+  </div>
+
+  <div class="panel" style="margin-top:16px">
+    <div class="title">By Whale Side
+      <span class="meta">whale-boosted trades only · are NO-side whales smarter money fading retail?</span>
+    </div>
+    <table>
+      <thead><tr><th>Side we bet</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-whale-side"><tr><td colspan="4" class="empty">no whale-boosted trades yet</td></tr></tbody>
+    </table>
   </div>
 
   <div class="panel" style="margin-top:16px">
@@ -1405,6 +1427,7 @@ async function refresh() {{
     renderBucketTable('tbody-edge-bucket', stats.by_edge_bucket);
     renderBucketTable('tbody-whale-class', stats.by_whale_class);
     renderBucketTable('tbody-whale-magnitude', stats.by_whale_magnitude);
+    renderBucketTable('tbody-whale-side', stats.by_whale_side);
     renderWindowedPnl(stats.windowed_pnl, stats.open_mtm);
     renderClvTable('tbody-clv-sport',     stats.by_sport_clv);
     renderCrossExchange(crossEx);
