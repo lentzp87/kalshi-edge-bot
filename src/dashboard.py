@@ -61,6 +61,11 @@ _RE_TIP_MIN = re.compile(r"tip in ([\d.]+)min")
 _RE_NET_EDGE = re.compile(r"net_edge=([+-]?[\d.]+)")
 _RE_GROSS = re.compile(r"gross ([+-]?[\d.]+)")
 _RE_P_YES = re.compile(r"p_yes=([\d.]+)")
+# Whale-boost fields appended by execution.py when the whale tracker
+# aligned with our side. `class=aggressive|burst|resting|other` and
+# `magnitude=<bucket>` (e.g. "price_7-10c", "burst_25-50k").
+_RE_WHALE_CLASS = re.compile(r"WHALE_ALIGNED class=(\w+)")
+_RE_WHALE_MAGNITUDE = re.compile(r"magnitude=(\S+)")
 
 
 def _parse_reason(reason: str | None) -> dict:
@@ -101,6 +106,10 @@ def _parse_reason(reason: str | None) -> dict:
             out["p_yes"] = float(m.group(1))
         except ValueError:
             pass
+    if m := _RE_WHALE_CLASS.search(reason):
+        out["whale_class"] = m.group(1)
+    if m := _RE_WHALE_MAGNITUDE.search(reason):
+        out["whale_magnitude"] = m.group(1)
     return out
 
 
@@ -254,6 +263,9 @@ def stats() -> dict:
             "_fav_dog": (
                 "favorite" if (t.get("fill_price") or 0) >= 0.5 else "underdog"
             ),
+            # None for non-whale-boosted trades — _bucket_aggregate drops Nones.
+            "_whale_class": meta.get("whale_class"),
+            "_whale_magnitude": meta.get("whale_magnitude"),
         })
 
     if not enriched:
@@ -269,6 +281,7 @@ def stats() -> dict:
             "by_exit_reason": [], "by_series": [], "by_hold": [],
             "by_confidence": [],
             "by_exit_policy": [], "by_edge_bucket": [],
+            "by_whale_class": [], "by_whale_magnitude": [],
             "n_clv": 0, "avg_clv_bp": 0.0, "pct_positive_clv": 0.0,
             "by_sport_clv": [],
             "settlement": {
@@ -366,6 +379,20 @@ def stats() -> dict:
         "by_edge_bucket": _bucket_aggregate(
             chronological,
             lambda r: edge_bucket(r.get("_gross_edge"))
+        ),
+        # Whale-aligned boosts only: separates the bot's whale-trusted
+        # bets from its plain-Kelly bets. Both panels drop rows with
+        # `_whale_class is None` (i.e. non-whale-boosted trades), so N
+        # in these panels = "number of whale-boosted trades".
+        # by_whale_class: aggressive / burst / resting / other.
+        # by_whale_magnitude: continuous bucket inside the class
+        # (e.g. price_7-10c, burst_25-50k) — tells us whether boost
+        # SIZE inside a class predicts realized P&L.
+        "by_whale_class": _bucket_aggregate(
+            chronological, lambda r: r.get("_whale_class")
+        ),
+        "by_whale_magnitude": _bucket_aggregate(
+            chronological, lambda r: r.get("_whale_magnitude")
         ),
         # ---- CLV summary -----------------------------------------------
         # CLV per trade: clv_price - fill_price (>0 if line moved our way).
@@ -695,6 +722,23 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
       <table>
         <thead><tr><th>Edge</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
         <tbody id="tbody-edge-bucket"><tr><td colspan="4" class="empty">no data yet</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid cols-2" style="margin-top:16px">
+    <div class="panel">
+      <div class="title">By Whale Class <span class="meta">aggressive (price_jump) vs burst (volume) vs resting (book size)</span></div>
+      <table>
+        <thead><tr><th>Class</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="tbody-whale-class"><tr><td colspan="4" class="empty">no whale-boosted trades yet</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <div class="title">By Whale Magnitude <span class="meta">does bigger whale signal predict bigger P&amp;L within a class?</span></div>
+      <table>
+        <thead><tr><th>Bucket</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody id="tbody-whale-magnitude"><tr><td colspan="4" class="empty">no whale-boosted trades yet</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1206,6 +1250,8 @@ async function refresh() {{
     renderBucketTable('tbody-confidence', stats.by_confidence);
     renderBucketTable('tbody-exit-policy', stats.by_exit_policy);
     renderBucketTable('tbody-edge-bucket', stats.by_edge_bucket);
+    renderBucketTable('tbody-whale-class', stats.by_whale_class);
+    renderBucketTable('tbody-whale-magnitude', stats.by_whale_magnitude);
     renderClvTable('tbody-clv-sport',     stats.by_sport_clv);
     renderCrossExchange(crossEx);
     renderOpen(openPos);

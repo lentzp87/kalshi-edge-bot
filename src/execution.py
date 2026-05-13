@@ -33,6 +33,81 @@ from .risk import RiskEngine
 log = structlog.get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Whale boost math
+# ---------------------------------------------------------------------------
+# Continuous magnitude-based multiplier. Same per-class ceilings as the prior
+# binary tiers so worst-case sizing doesn't grow:
+#   price_jump    1.5x (5¢)   -> 5.0x (10¢+)
+#   volume_burst  1.2x (5k)   -> 2.5x (50k+)
+#   resting       1.1x (2k)   -> 1.5x (20k+)
+# The reason string contains the raw magnitude (e.g. "price_jump_+7c",
+# "volume_burst_12345", "large_yes_bid_3500c"). We extract the number,
+# normalize to a 0..1 ratio against the class's saturation point, and
+# interpolate between the class min and max multipliers.
+#
+# Returns (multiplier, class_label, magnitude_str) where magnitude_str is the
+# canonical bucket the dashboard's `By Whale Magnitude` panel groups by.
+
+import re as _re
+
+_WHALE_PRICE_RE = _re.compile(r"price_jump_([+\-]?\d+)c")
+_WHALE_VOL_RE   = _re.compile(r"volume_burst_(\d+)")
+_WHALE_REST_RE  = _re.compile(r"large_(?:yes|no)_(?:bid|ask)_(\d+)")
+
+
+def _lerp(t: float, lo: float, hi: float) -> float:
+    t = max(0.0, min(1.0, t))
+    return lo + (hi - lo) * t
+
+
+def _whale_multiplier(wreason: str) -> tuple[float, str, str]:
+    """Map a whale reason string to (multiplier, class_label, magnitude_str).
+    Falls back to (2.0x, "other", "unknown") for anything we don't parse.
+    """
+    if wreason.startswith("price_jump"):
+        m = _WHALE_PRICE_RE.search(wreason)
+        cents = abs(int(m.group(1))) if m else 5
+        # 5c floor → 1.5x, 10c saturation → 5.0x
+        t = (cents - 5) / 5.0
+        mult = _lerp(t, 1.5, 5.0)
+        # Bucket label for dashboard analysis
+        if cents < 7:        bucket = "price_5-7c"
+        elif cents < 10:     bucket = "price_7-10c"
+        else:                bucket = "price_10c+"
+        return mult, "aggressive", bucket
+    if wreason.startswith("volume_burst"):
+        m = _WHALE_VOL_RE.search(wreason)
+        contracts = int(m.group(1)) if m else 5000
+        # 5k floor → 1.2x, 50k saturation → 2.5x. Use log-ish scaling
+        # because 5k vs 50k is a 10x range.
+        import math as _math
+        # Map log(5k)..log(50k) to 0..1
+        lo, hi = _math.log(5000), _math.log(50000)
+        x = max(lo, min(hi, _math.log(max(contracts, 5000))))
+        t = (x - lo) / (hi - lo)
+        mult = _lerp(t, 1.2, 2.5)
+        if contracts < 10_000:    bucket = "burst_5-10k"
+        elif contracts < 25_000:  bucket = "burst_10-25k"
+        elif contracts < 50_000:  bucket = "burst_25-50k"
+        else:                     bucket = "burst_50k+"
+        return mult, "burst", bucket
+    if wreason.startswith("large_"):
+        m = _WHALE_REST_RE.search(wreason)
+        contracts = int(m.group(1)) if m else 2000
+        # 2k floor → 1.1x, 20k saturation → 1.5x
+        import math as _math
+        lo, hi = _math.log(2000), _math.log(20000)
+        x = max(lo, min(hi, _math.log(max(contracts, 2000))))
+        t = (x - lo) / (hi - lo)
+        mult = _lerp(t, 1.1, 1.5)
+        if contracts < 5_000:     bucket = "rest_2-5k"
+        elif contracts < 10_000:  bucket = "rest_5-10k"
+        else:                     bucket = "rest_10k+"
+        return mult, "resting", bucket
+    return 2.0, "other", "unknown"
+
+
 @dataclass
 class OpenPosition:
     signal: TradeSignal
@@ -122,12 +197,13 @@ class Executor:
         if not self.risk.approve(signal):
             return
 
-        # Whale boost — classified by signal type, not blanket.
-        # ChatGPT pushback: blind whale-following gets you exit-liquidity
-        # cosplay. Different whale shapes deserve different actions:
-        #   price_jump_*  -> aggressive whale through book; full boost
-        #   volume_burst_* -> ambient sharp activity; medium boost
-        #   large_yes_*   -> resting order; could be spoofed; small/no boost
+        # Whale boost — magnitude-scaled within each class.
+        # 2026-05-13: replaced binary tier (5x / 2.5x / 1.5x) with a
+        # continuous multiplier driven by the raw whale magnitude. Same
+        # per-class ceilings as before so worst case doesn't grow, but
+        # smaller whales get smaller boosts. The reason string now
+        # captures the raw magnitude (cents / contracts) so dashboard
+        # bucketing can read calibration per magnitude band.
         risk_cfg = file_config().risk
         whale_signal = None
         if self.whale_tracker is not None:
@@ -135,39 +211,26 @@ class Executor:
                 signal.ticker, signal.side
             )
         if whale_signal and risk_cfg.whale_max_position_size_usd > signal.size_usd:
-            # Classify by reason prefix
             wreason = whale_signal.reason
-            if wreason.startswith("price_jump"):
-                # Aggressive whale ate through the book. Strongest signal.
-                # Full boost: up to 5x or whale_max, whichever is smaller.
-                multiplier = 5.0
-                whale_class = "aggressive"
-            elif wreason.startswith("volume_burst"):
-                # Real $ moved but direction is ambiguous. Medium boost.
-                multiplier = 2.5
-                whale_class = "burst"
-            elif wreason.startswith("large_"):
-                # Resting order. Spoof-prone. Tiny boost only.
-                multiplier = 1.5
-                whale_class = "resting"
-            else:
-                multiplier = 2.0
-                whale_class = "other"
+            multiplier, whale_class, magnitude = _whale_multiplier(wreason)
 
             old_size = signal.size_usd
             signal.size_usd = min(
                 risk_cfg.whale_max_position_size_usd,
                 signal.size_usd * multiplier,
             )
+            # magnitude= field is what `By Whale Magnitude` panel reads.
             signal.reason = (
                 f"{signal.reason} | WHALE_ALIGNED class={whale_class} "
+                f"magnitude={magnitude} "
                 f"dir={whale_signal.direction} conf={whale_signal.confidence:.2f} "
                 f"({whale_signal.reason}) size_boost "
-                f"${old_size:.0f}->${signal.size_usd:.0f} ({multiplier:.1f}x)"
+                f"${old_size:.0f}->${signal.size_usd:.0f} ({multiplier:.2f}x)"
             )
             log.info("exec.whale_boost",
                      ticker=signal.ticker, side=signal.side,
-                     whale_class=whale_class, multiplier=multiplier,
+                     whale_class=whale_class, multiplier=round(multiplier, 2),
+                     magnitude=magnitude,
                      old_size=round(old_size, 2),
                      new_size=round(signal.size_usd, 2),
                      whale=whale_signal.reason)
