@@ -983,8 +983,8 @@ function renderOpen(positions) {{
     let betLabel = meta.ourSide || p.ticker.split('-').pop() || '?';
     if (meta.ourLoc) betLabel += ` <span class="muted">(${{meta.ourLoc}})</span>`;
     if (meta.matchup) betLabel += `<br><span class="muted" style="font-size:11px">${{meta.matchup}}</span>`;
-    // "Tip" cell: minutes-to-tipoff if pregame, "live" if the InGameSportsModel
-    // fired (reason starts with "{SPORT} late-game ..."), "—" otherwise.
+    // "Tip" cell: minutes-to-tipoff if pregame, "live" if the
+    // InGameSportsModel fired (reason contains "late-game"), "—" otherwise.
     const tipCell = (meta.minsToTip != null)
       ? (meta.minsToTip < 60 ? meta.minsToTip + 'm' : (meta.minsToTip/60).toFixed(1)+'h')
       : ((p.reason || '').includes('late-game')
@@ -1066,8 +1066,8 @@ function renderTrades(rows) {{
       : '<span class="muted">—</span>';
     const dupBadge = (r._dup > 1) ? ` <span class="muted">×${{r._dup}}</span>` : '';
     const meta = parseReason(r.reason);
-    // "Tip" cell: minutes-to-tipoff if pregame, "live" if the InGameSportsModel
-    // fired (reason starts with "{SPORT} late-game ..."), "—" otherwise.
+    // "Tip" cell: minutes-to-tipoff if pregame, "live" if the
+    // InGameSportsModel fired (reason contains "late-game"), "—" otherwise.
     const tipCell = (meta.minsToTip != null)
       ? (meta.minsToTip < 60 ? meta.minsToTip + 'm' : (meta.minsToTip/60).toFixed(1)+'h')
       : ((p.reason || '').includes('late-game')
