@@ -1070,7 +1070,7 @@ function renderTrades(rows) {{
     // InGameSportsModel fired (reason contains "late-game"), "—" otherwise.
     const tipCell = (meta.minsToTip != null)
       ? (meta.minsToTip < 60 ? meta.minsToTip + 'm' : (meta.minsToTip/60).toFixed(1)+'h')
-      : ((p.reason || '').includes('late-game')
+      : ((r.reason || '').includes('late-game')
           ? '<span class="muted">live</span>'
           : '<span class="muted">—</span>');
     const provCell = meta.provider
