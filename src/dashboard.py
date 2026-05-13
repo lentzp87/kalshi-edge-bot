@@ -226,6 +226,21 @@ def edge() -> dict:
     return _journal.realized_edge_summary()
 
 
+@app.get("/pnl_digest")
+def pnl_digest(window_hours: int = 6, send: bool = False) -> dict:
+    """Return the same P&L digest the Slack loop sends.
+
+    ?send=true also fires the Slack ping (useful for testing the webhook
+    without waiting for the 6h timer). Pass window_hours=N to widen or
+    narrow the window for an ad-hoc check.
+    """
+    from .slack_notifier import build_pnl_digest, notify_pnl_digest
+    text = build_pnl_digest(_journal, window_hours=window_hours)
+    if send:
+        notify_pnl_digest(_journal, window_hours=window_hours)
+    return {"window_hours": window_hours, "text": text, "sent": bool(send)}
+
+
 @app.get("/cross_exchange")
 def cross_exchange() -> dict:
     """Latest Kalshi-vs-Polymarket spread snapshot.

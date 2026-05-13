@@ -182,3 +182,154 @@ def notify_startup(mode: str, bankroll: float) -> None:
     """One-shot startup ping so you know the bot redeployed."""
     text = f"🤖 Bot online · {mode} mode · bankroll ${bankroll:.0f}"
     _fire(_post(text))
+
+
+# --------------------------------------------------------- 6h P&L digest
+
+def _fmt_money(x: float) -> str:
+    return f"${x:+.2f}" if x else "$0.00"
+
+
+def _bet_label(reason: str, ticker: str) -> str:
+    """Short label for a row in the digest. Falls back to the ticker tail
+    if the reason doesn't carry our= info (e.g. early-version rows)."""
+    label = _our_label(reason)
+    if label:
+        return label
+    return (ticker or "").rsplit("-", 1)[-1] or "?"
+
+
+def _unrealized_pnl(pos: dict) -> float | None:
+    """Mark-to-market for an open position. Returns None if we don't have
+    a current_mid yet (watcher hasn't sampled this position).
+
+    Math matches Executor._exit but estimated, not realized:
+      pnl = (current_mid - fill_price) * contracts  -  estimated exit fee
+    Entry fee is sunk — we don't double-count it (the reported "open"
+    P&L already implicitly includes the entry-fee drag because fill_price
+    is what we paid).
+    """
+    mid = pos.get("current_mid")
+    fill = pos.get("fill_price")
+    contracts = pos.get("contracts")
+    if mid is None or fill is None or not contracts:
+        return None
+    try:
+        from .fee_model import fee_per_contract_dollars
+        exit_fee = fee_per_contract_dollars(float(mid)) * int(contracts)
+    except Exception:
+        exit_fee = 0.0
+    return (float(mid) - float(fill)) * int(contracts) - exit_fee
+
+
+def build_pnl_digest(journal, *, window_hours: int = 6) -> str:
+    """Construct the digest text. Pure — doesn't post."""
+    from datetime import datetime, timezone, timedelta
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    cutoff_iso = cutoff.isoformat()
+
+    # All recent rows; we'll filter to "closed in window" client-side
+    # because journal.recent_trades doesn't take a time filter.
+    rows = journal.recent_trades(limit=500)
+    closed_in_window = [
+        r for r in rows
+        if r.get("closed_ts") and r.get("closed_ts") >= cutoff_iso
+        and r.get("pnl_usd") is not None
+    ]
+
+    realized = sum(float(r.get("pnl_usd") or 0) for r in closed_in_window)
+    wins = sum(1 for r in closed_in_window if (r.get("pnl_usd") or 0) > 0)
+    losses = sum(1 for r in closed_in_window if (r.get("pnl_usd") or 0) < 0)
+    n_closed = len(closed_in_window)
+    win_rate = (wins / n_closed * 100) if n_closed else 0.0
+
+    # Top / bottom for closed
+    by_pnl = sorted(closed_in_window, key=lambda r: float(r.get("pnl_usd") or 0), reverse=True)
+    top = by_pnl[:2]
+    bottom = list(reversed(by_pnl[-2:])) if len(by_pnl) >= 2 else []
+
+    # Open positions: mark-to-market
+    open_positions = journal.open_positions()
+    open_with_mtm = []
+    for p in open_positions:
+        u = _unrealized_pnl(p)
+        if u is None:
+            continue
+        open_with_mtm.append((u, p))
+    open_with_mtm.sort(key=lambda x: x[0], reverse=True)
+    unrealized = sum(u for u, _ in open_with_mtm)
+    n_open = len(open_positions)
+    n_with_mtm = len(open_with_mtm)
+
+    net = realized + unrealized
+
+    # ---- Format ----
+    lines = [f"📊 *P&L snapshot · last {window_hours}h*", ""]
+
+    # Realized line
+    if n_closed:
+        lines.append(
+            f"*Realized:* {_fmt_money(realized)}  "
+            f"({n_closed} closed · {wins}W/{losses}L · {win_rate:.0f}% wr)"
+        )
+        if top:
+            tops = ", ".join(
+                f"{_bet_label(r.get('reason',''), r.get('ticker',''))} "
+                f"{_fmt_money(float(r.get('pnl_usd') or 0))}"
+                for r in top if (r.get('pnl_usd') or 0) > 0
+            )
+            if tops:
+                lines.append(f"  🏆 {tops}")
+        if bottom:
+            bots = ", ".join(
+                f"{_bet_label(r.get('reason',''), r.get('ticker',''))} "
+                f"{_fmt_money(float(r.get('pnl_usd') or 0))}"
+                for r in bottom if (r.get('pnl_usd') or 0) < 0
+            )
+            if bots:
+                lines.append(f"  💀 {bots}")
+    else:
+        lines.append(f"*Realized:* no trades closed in last {window_hours}h")
+
+    lines.append("")
+
+    # Open / unrealized line
+    if n_open == 0:
+        lines.append("*Open:* no positions")
+    elif n_with_mtm == 0:
+        lines.append(f"*Open:* {n_open} position(s) · awaiting first mid sample")
+    else:
+        lines.append(
+            f"*Open:* {_fmt_money(unrealized)} unrealized "
+            f"({n_with_mtm}/{n_open} marked)"
+        )
+        # Best / worst open
+        best_u, best_p = open_with_mtm[0]
+        worst_u, worst_p = open_with_mtm[-1]
+        if best_u > 0:
+            lines.append(
+                f"  ↗ {_bet_label(best_p.get('reason',''), best_p.get('ticker',''))} "
+                f"{_fmt_money(best_u)}"
+            )
+        if worst_u < 0 and worst_p is not best_p:
+            lines.append(
+                f"  ↘ {_bet_label(worst_p.get('reason',''), worst_p.get('ticker',''))} "
+                f"{_fmt_money(worst_u)}"
+            )
+
+    lines.append("")
+    arrow = "📈" if net > 0 else ("📉" if net < 0 else "➖")
+    lines.append(f"{arrow} *Net {window_hours}h:* {_fmt_money(net)}")
+
+    return "\n".join(lines)
+
+
+def notify_pnl_digest(journal, *, window_hours: int = 6) -> None:
+    """Fire the digest to Slack. Fail-silent."""
+    try:
+        text = build_pnl_digest(journal, window_hours=window_hours)
+    except Exception as e:  # noqa: BLE001
+        log.warning("slack.digest_build_failed", err=str(e)[:200])
+        return
+    _fire(_post(text))

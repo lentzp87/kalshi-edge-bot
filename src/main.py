@@ -91,6 +91,28 @@ async def trading_loop(
         await asyncio.sleep(cfg.scanner.loop_interval_seconds)
 
 
+async def slack_digest_loop(
+    journal: Journal, *, interval_hours: int = 6,
+) -> None:
+    """Periodic 6h P&L digest to Slack.
+
+    No-ops gracefully if Slack isn't configured (slack_notifier checks env
+    vars on each post and warns once). Interval is configurable via the
+    SLACK_DIGEST_INTERVAL_HOURS env var (default 6).
+    """
+    from .slack_notifier import notify_pnl_digest
+    interval_seconds = max(60, int(interval_hours * 3600))
+    # Initial delay: wait one full interval before the first ping so the
+    # bot doesn't fire an empty digest immediately on every deploy.
+    await asyncio.sleep(interval_seconds)
+    while True:
+        try:
+            notify_pnl_digest(journal, window_hours=interval_hours)
+        except Exception:
+            log.exception("slack_digest.error")
+        await asyncio.sleep(interval_seconds)
+
+
 async def cross_exchange_loop(
     client: KalshiClient, *, interval_seconds: int = 300,
     max_pages: int = 5,
@@ -279,6 +301,14 @@ async def amain() -> None:
             ws.run(),
             # Polymarket cross-exchange spread snapshot every 5 min.
             cross_exchange_loop(client, interval_seconds=300),
+            # 6h Slack P&L digest. Reads SLACK_DIGEST_INTERVAL_HOURS env
+            # var for the interval; defaults to 6.
+            slack_digest_loop(
+                journal,
+                interval_hours=int(
+                    _os.environ.get("SLACK_DIGEST_INTERVAL_HOURS", "6")
+                ),
+            ),
         )
     finally:
         await client.aclose()
