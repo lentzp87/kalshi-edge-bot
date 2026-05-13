@@ -173,6 +173,72 @@ def _hold_bucket(opened_ts: str | None, closed_ts: str | None) -> str | None:
     return "4h+"
 
 
+def _open_unrealized_snapshot(open_positions: list[dict]) -> dict:
+    """Mark-to-market across all open positions. Unrealized P&L doesn't
+    depend on a window — it's just a snapshot of where the book stands
+    right now. Positions without a `current_mid` are counted in `n_total`
+    but excluded from the sum (`n_marked` tracks how many were summable).
+    """
+    from .fee_model import fee_per_contract_dollars
+    total = 0.0
+    n_marked = 0
+    for p in open_positions:
+        mid = p.get("current_mid")
+        fill = p.get("fill_price")
+        contracts = p.get("contracts")
+        if mid is None or fill is None or not contracts:
+            continue
+        try:
+            mid_f = float(mid)
+            fill_f = float(fill)
+            c = int(contracts)
+        except (TypeError, ValueError):
+            continue
+        # Estimated exit fee at the current mid. Entry fee already sunk
+        # in the fill price, so don't double-count it.
+        exit_fee = fee_per_contract_dollars(mid_f) * c
+        total += (mid_f - fill_f) * c - exit_fee
+        n_marked += 1
+    return {
+        "unrealized_usd": round(total, 2),
+        "n_open_total": len(open_positions),
+        "n_open_marked": n_marked,
+    }
+
+
+def _windowed_pnl(closed_trades: list[dict], window_hours: int) -> dict:
+    """Realized P&L for trades closed within the last `window_hours`.
+
+    Expects `closed_trades` to be the enriched, cleaned, chronological
+    list already filtered to clean (non-corrupted) trades. The unrealized
+    half is computed separately by _open_unrealized_snapshot since it's
+    window-independent.
+    """
+    from datetime import datetime, timezone, timedelta
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+    rows = [
+        t for t in closed_trades
+        if t.get("closed_ts") and t["closed_ts"] >= cutoff_iso
+    ]
+    if not rows:
+        return {
+            "window_hours": window_hours, "n": 0, "wins": 0, "losses": 0,
+            "realized_usd": 0.0, "win_rate": 0.0,
+        }
+    realized = sum(float(t.get("pnl_usd") or 0) for t in rows)
+    wins = sum(1 for t in rows if (t.get("pnl_usd") or 0) > 0)
+    losses = sum(1 for t in rows if (t.get("pnl_usd") or 0) < 0)
+    n = len(rows)
+    return {
+        "window_hours": window_hours,
+        "n": n,
+        "wins": wins,
+        "losses": losses,
+        "realized_usd": round(realized, 2),
+        "win_rate": round(wins / n, 3) if n else 0.0,
+    }
+
+
 def _bucket_aggregate(rows: list[dict], key_fn) -> list[dict]:
     """Group rows by key_fn(row) and return [{key, n, wins, pnl, avg_pnl, win_rate}]."""
     bucket: dict = defaultdict(lambda: {"n": 0, "wins": 0, "pnl": 0.0})
@@ -297,6 +363,7 @@ def stats() -> dict:
             "by_confidence": [],
             "by_exit_policy": [], "by_edge_bucket": [],
             "by_whale_class": [], "by_whale_magnitude": [],
+            "windowed_pnl": [], "open_mtm": _open_unrealized_snapshot(_journal.open_positions()),
             "n_clv": 0, "avg_clv_bp": 0.0, "pct_positive_clv": 0.0,
             "by_sport_clv": [],
             "settlement": {
@@ -409,6 +476,13 @@ def stats() -> dict:
         "by_whale_magnitude": _bucket_aggregate(
             chronological, lambda r: r.get("_whale_magnitude")
         ),
+        # Windowed P&L: realized within each window from chronological
+        # (already enriched/cleaned). Unrealized is a separate snapshot
+        # because it's window-independent (open positions are open NOW).
+        "windowed_pnl": [
+            _windowed_pnl(chronological, h) for h in (3, 6, 12, 24)
+        ],
+        "open_mtm": _open_unrealized_snapshot(_journal.open_positions()),
         # ---- CLV summary -----------------------------------------------
         # CLV per trade: clv_price - fill_price (>0 if line moved our way).
         # Aggregated across trades with a non-null clv_price.
@@ -598,6 +672,24 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
   </div>
 
   <div class="panel">
+    <div class="title">P&amp;L by Window
+      <span class="meta" id="window-pnl-meta">realized in window + current unrealized mark-to-market</span>
+    </div>
+    <table id="window-pnl-table" style="margin-top:4px">
+      <thead><tr>
+        <th></th>
+        <th class="num">3h</th>
+        <th class="num">6h</th>
+        <th class="num">12h</th>
+        <th class="num">24h</th>
+      </tr></thead>
+      <tbody id="tbody-window-pnl">
+        <tr><td colspan="5" class="empty">loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel" style="margin-top:16px">
     <div class="title">Cumulative P&amp;L <span class="meta" id="curve-meta"></span></div>
     <div class="chart-wrap tall"><canvas id="chart-curve"></canvas></div>
   </div>
@@ -961,6 +1053,52 @@ function buildCalibChart(buckets) {{
   }});
 }}
 
+function renderWindowedPnl(windows, openMtm) {{
+  const tb = document.getElementById('tbody-window-pnl');
+  const meta = document.getElementById('window-pnl-meta');
+  if (!windows || !windows.length) {{
+    tb.innerHTML = '<tr><td colspan="5" class="empty">no closed trades yet</td></tr>';
+    if (openMtm && openMtm.n_open_total > 0) {{
+      meta.textContent = `${{openMtm.n_open_marked}}/${{openMtm.n_open_total}} open positions marked · `
+        + `${{(openMtm.unrealized_usd >= 0 ? '+' : '')}}$${{openMtm.unrealized_usd.toFixed(2)}} unrealized`;
+    }}
+    return;
+  }}
+  const unrealized = openMtm ? openMtm.unrealized_usd : 0;
+  const nMarked = openMtm ? openMtm.n_open_marked : 0;
+  const nTotal  = openMtm ? openMtm.n_open_total : 0;
+  // The unrealized cell is the SAME for every window (it's a current snapshot).
+  // We still render it in each column so the Net row math is obvious.
+  const unrealCell = `<span class="${{cls(unrealized)}}">${{fmt$(unrealized)}}</span>`;
+  meta.textContent = nTotal
+    ? `${{nMarked}}/${{nTotal}} open positions marked-to-market`
+    : 'no open positions';
+  const cell = (w, key, signed) => {{
+    const v = w[key];
+    if (v === 0 || v == null) return '<span class="muted">—</span>';
+    return signed
+      ? `<span class="${{cls(v)}}">${{fmt$(v)}}</span>`
+      : v.toString();
+  }};
+  const rows = [
+    {{ label: 'Closed N',   fn: w => w.n.toString() }},
+    {{ label: 'Realized',   fn: w => cell(w, 'realized_usd', true) }},
+    {{ label: 'Unrealized', fn: _w => unrealCell }},
+    {{ label: 'Net',        fn: w => {{
+      const net = (w.realized_usd || 0) + unrealized;
+      return `<span class="${{cls(net)}}">${{fmt$(net)}}</span>`;
+    }} }},
+  ];
+  tb.innerHTML = rows.map(r => `
+    <tr>
+      <td class="muted">${{r.label}}</td>
+      <td class="num">${{r.fn(windows[0])}}</td>
+      <td class="num">${{r.fn(windows[1])}}</td>
+      <td class="num">${{r.fn(windows[2])}}</td>
+      <td class="num">${{r.fn(windows[3])}}</td>
+    </tr>`).join('');
+}}
+
 function renderBucketTable(tbodyId, rows) {{
   const tb = document.getElementById(tbodyId);
   if (!rows || !rows.length) {{
@@ -1267,6 +1405,7 @@ async function refresh() {{
     renderBucketTable('tbody-edge-bucket', stats.by_edge_bucket);
     renderBucketTable('tbody-whale-class', stats.by_whale_class);
     renderBucketTable('tbody-whale-magnitude', stats.by_whale_magnitude);
+    renderWindowedPnl(stats.windowed_pnl, stats.open_mtm);
     renderClvTable('tbody-clv-sport',     stats.by_sport_clv);
     renderCrossExchange(crossEx);
     renderOpen(openPos);

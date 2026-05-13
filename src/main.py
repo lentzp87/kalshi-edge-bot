@@ -15,13 +15,16 @@ import os
 import structlog
 import uvicorn
 
+from dataclasses import replace as _dc_replace
+
 from .config import env_config, file_config
 from .cross_exchange import find_spreads
 from . import cross_exchange_state
 from .decision import evaluate
 from .execution import Executor
+from . import fast_path
 from .journal import Journal
-from .kalshi_client import KalshiClient
+from .kalshi_client import KalshiClient, Market
 from .kalshi_ws import KalshiWebSocket
 from .models import model_for_category
 from .polymarket_client import list_active_markets as poly_list_active_markets
@@ -34,18 +37,111 @@ from .whale_tracker import WhaleTracker
 log = structlog.get_logger(__name__)
 
 
+# --------------------------------------------------------------------- WS cache
+# Most-recent Market dataclass per ticker, populated by the scanner loop.
+# The WS tick callback consults this cache to reconstruct a fresh Market
+# (with updated bid/ask/last_price/volume) without needing to re-fetch
+# metadata (title, category, raw fields) over REST. Ticks for tickers we
+# haven't scanned yet are no-ops.
+_last_seen_markets: dict[str, Market] = {}
+
+
+def _market_from_tick(cached: Market, ws_msg: dict) -> Market:
+    """Reconstruct a Market with fresh prices from a WS ticker_v2 frame.
+    Preserves metadata (title, category, raw event_ticker, etc.) from the
+    cached scanner snapshot.
+
+    Kalshi ticker_v2 payload shape varies a bit between deployments; we
+    try the obvious field names with safe fallbacks.
+    """
+    body = ws_msg.get("msg") or ws_msg
+    def _f(k: str, default: float) -> float:
+        v = body.get(k)
+        try:
+            return float(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+    new_yes_bid = _f("yes_bid", cached.yes_bid)
+    new_yes_ask = _f("yes_ask", cached.yes_ask)
+    new_last    = _f("price", _f("last_price", cached.last_price))
+    new_volume  = int(_f("volume", cached.volume))
+    # Update the raw dict's bid/ask sizes if the tick carries them — the
+    # whale tracker reads yes_bid_size_fp / yes_ask_size_fp from raw.
+    new_raw = dict(cached.raw)
+    for k in ("yes_bid_size_fp", "yes_ask_size_fp",
+              "no_bid_dollars", "no_ask_dollars"):
+        if k in body:
+            new_raw[k] = body[k]
+    return _dc_replace(
+        cached,
+        yes_bid=new_yes_bid,
+        yes_ask=new_yes_ask,
+        last_price=new_last,
+        volume=new_volume,
+        raw=new_raw,
+    )
+
+
+def _make_ws_tick_handler(
+    whale_tracker: WhaleTracker,
+    executor: Executor,
+    journal: Journal,
+) -> "callable":
+    """Build the on_tick callback that the WS subscriber will fire on
+    every ticker_v2 frame. Closes over the long-lived objects.
+
+    The handler does two things:
+      1. Update whale_tracker with the fresh tick. The tracker's sliding
+         baseline picks up real moves even at WS tick rate.
+      2. If whale_tracker returned a signal AND we have a cached Market
+         for this ticker, schedule a fast-path evaluation as a task. The
+         scheduler isolates the trade flow from the WS read loop.
+    """
+    def _handler(ticker: str, mid: float, ws_msg: dict) -> None:
+        cached = _last_seen_markets.get(ticker)
+        if cached is None:
+            return  # not tradeable yet — scanner hasn't touched it
+        try:
+            fresh = _market_from_tick(cached, ws_msg)
+        except Exception:
+            log.exception("ws.tick_market_build_failed", ticker=ticker)
+            return
+        # Update cache so subsequent ticks compound on the fresh prices
+        _last_seen_markets[ticker] = fresh
+        signal = whale_tracker.update(fresh)
+        if signal is None:
+            return
+        # Whale detected — fast-path eval out-of-band from the WS read loop.
+        try:
+            asyncio.get_event_loop().create_task(
+                fast_path.evaluate_and_submit(
+                    fresh, executor=executor, journal=journal,
+                    trigger=signal.reason,
+                )
+            )
+        except RuntimeError:
+            log.warning("ws.fast_path_no_loop", ticker=ticker)
+    return _handler
+
+
 async def loop_once(
     scanner: Scanner, executor: Executor, journal: Journal,
     whale_tracker: WhaleTracker,
+    ws: KalshiWebSocket | None = None,
 ) -> None:
     scanned = 0
     by_category: dict[str, int] = {}
     opinions = 0
     signals = 0
+    seen_tickers: list[str] = []
 
     async for market in scanner.stream_tradeable_markets():
         scanned += 1
         by_category[market.category] = by_category.get(market.category, 0) + 1
+
+        # Cache full Market for the WS tick path to reconstruct from later.
+        _last_seen_markets[market.ticker] = market
+        seen_tickers.append(market.ticker)
 
         # Feed every market through the whale tracker — it logs whale-
         # shaped deltas itself, and the executor consults it when sizing.
@@ -68,12 +164,25 @@ async def loop_once(
             signals += 1
             await executor.submit(signal, market)
 
+    # Refresh WS subscriptions to cover every tradeable ticker we just
+    # saw. subscribe() is idempotent (skips already-subscribed tickers),
+    # so we can call it every scan without thrashing. We deliberately
+    # don't unsubscribe stale tickers here — tickers that aged out of the
+    # tradeable set will just stop producing useful ticks; the dedup +
+    # category filters in fast_path drop those evaluations cheaply.
+    if ws is not None and seen_tickers:
+        try:
+            await ws.subscribe(seen_tickers)
+        except Exception:
+            log.exception("ws.subscribe_failed", count=len(seen_tickers))
+
     log.info(
         "loop.summary",
         scanned=scanned,
         by_category=by_category,
         opinions=opinions,
         signals=signals,
+        ws_subs=len(seen_tickers),
         rejections=scanner.rejection_counts,
     )
 
@@ -81,11 +190,12 @@ async def loop_once(
 async def trading_loop(
     scanner: Scanner, executor: Executor, journal: Journal,
     whale_tracker: WhaleTracker,
+    ws: KalshiWebSocket | None = None,
 ) -> None:
     cfg = file_config()
     while True:
         try:
-            await loop_once(scanner, executor, journal, whale_tracker)
+            await loop_once(scanner, executor, journal, whale_tracker, ws=ws)
         except Exception:
             log.exception("loop.error")
         await asyncio.sleep(cfg.scanner.loop_interval_seconds)
@@ -282,15 +392,18 @@ async def amain() -> None:
     except Exception:
         log.exception("orphan_recovery.error")
 
-    # Kalshi WebSocket — read-only ticker subscriber. No-ops gracefully if
-    # the `websockets` library isn't installed (REST polling continues
-    # regardless). Currently just logs ticks; integration with the in-game
-    # model is a follow-up.
+    # Kalshi WebSocket — now wired to the fast-path executor. On every
+    # ticker_v2 frame we reconstruct a fresh Market from the scanner's
+    # most-recent cached snapshot, feed it into whale_tracker (which uses
+    # a ~10s sliding baseline so tick-rate updates produce real deltas),
+    # and if a whale signal fires we schedule a fast-path eval out-of-band.
+    # Existing executor dedup / cooldown / risk all still gate the trade.
     ws = KalshiWebSocket(client)
+    ws.on_tick(_make_ws_tick_handler(whale_tracker, executor, journal))
 
     try:
         await asyncio.gather(
-            trading_loop(scanner, executor, journal, whale_tracker),
+            trading_loop(scanner, executor, journal, whale_tracker, ws=ws),
             dashboard_server(),
             # Periodic settlement backfill: for each closed trade, look up
             # the Kalshi market's resolution and compute "what if held to

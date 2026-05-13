@@ -49,6 +49,14 @@ VOLUME_BURST_THRESHOLD = 5000      # 5000 contracts ~ $2-3k notional
 RESTING_SIZE_THRESHOLD = 2000      # 2000 contracts at top of book
 SIGNAL_WINDOW_SECONDS = 15 * 60    # remember whale signals for 15 min
 
+# Baseline-comparison window. We diff the latest snapshot against the
+# snapshot closest to (now - BASELINE_WINDOW_SECONDS). This makes the
+# detector source-agnostic — slow 30s scanner polls and high-rate
+# WebSocket ticks both work because we always compare against a
+# ~10s-old reference, not just "the previous call to update()".
+BASELINE_WINDOW_SECONDS = 10
+HISTORY_RETENTION_SECONDS = 60     # drop snapshots older than this
+
 
 @dataclass
 class _Snapshot:
@@ -75,12 +83,36 @@ class WhaleTracker:
     """
 
     def __init__(self) -> None:
-        self._snapshots: dict[str, _Snapshot] = {}
+        # Per-ticker bounded history of snapshots, newest at the end. We
+        # diff "new" against the snapshot closest to (now - BASELINE_WINDOW).
+        # That makes WS ticks and scanner polls both produce correct deltas
+        # — the comparison reference is time-bounded, not call-bounded.
+        self._history: dict[str, list[_Snapshot]] = {}
         self._signals: dict[str, list[WhaleSignal]] = {}
+
+    @staticmethod
+    def _select_baseline(history: list[_Snapshot], now_ts: float) -> _Snapshot | None:
+        """Pick the snapshot closest to (now_ts - BASELINE_WINDOW_SECONDS).
+        Returns None if there's no snapshot at least 1s older than now_ts."""
+        target = now_ts - BASELINE_WINDOW_SECONDS
+        best = None
+        best_dist = float("inf")
+        for s in history:
+            if s.ts >= now_ts - 0.5:
+                continue  # skip the just-pushed snapshot
+            dist = abs(s.ts - target)
+            if dist < best_dist:
+                best_dist = dist
+                best = s
+        return best
 
     def update(self, market: Market) -> WhaleSignal | None:
         """Feed a fresh market snapshot. Returns a WhaleSignal if a
-        whale-shaped delta was detected since the previous poll, else None.
+        whale-shaped delta was detected vs the ~10s-old baseline.
+
+        Source-agnostic: scanner polls (30s gap) and WS ticks (many per
+        second) both work because we diff against the time-targeted
+        baseline, not the immediately-previous call.
         """
         now = time.time()
         try:
@@ -98,11 +130,17 @@ class WhaleTracker:
             yes_bid_size=yes_bid_size,
             yes_ask_size=yes_ask_size,
         )
-        old = self._snapshots.get(market.ticker)
-        self._snapshots[market.ticker] = new
+        history = self._history.setdefault(market.ticker, [])
+        history.append(new)
+        # Prune snapshots older than HISTORY_RETENTION_SECONDS so memory
+        # doesn't grow unbounded under WS firehose.
+        cutoff = now - HISTORY_RETENTION_SECONDS
+        if history[0].ts < cutoff:
+            history[:] = [s for s in history if s.ts >= cutoff]
+        old = self._select_baseline(history, now)
 
         if not old:
-            return None  # first poll for this ticker — nothing to compare
+            return None  # not enough history yet — nothing to compare
 
         signal: WhaleSignal | None = None
 
