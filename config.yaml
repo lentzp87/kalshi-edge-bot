@@ -74,7 +74,15 @@ decision:
   # tune from CLV / by_confidence calibration data.
   min_edge: -0.05
   kelly_fraction: 0.25
-  min_entry_price: 0.40
+  # Side-specific floors — start uniform at 0.35 today (down from 0.40).
+  # Slate analysis 2026-05-13 showed 176 decision.skip.low_price hits at
+  # 0.28-0.39 underdog entries; underdogs in the existing data have 54%
+  # wr vs 28% for favorites. Letting them through gives flow + tracks a
+  # better cohort. Will diverge YES vs NO once dashboard's by_side_x_entry
+  # panel shows clear evidence.
+  min_entry_price: 0.40         # legacy fallback (unused if both _yes/_no set)
+  min_entry_price_yes: 0.35
+  min_entry_price_no: 0.35
   min_p_yes: 0.52
   # Per-market gate: gross_edge must exceed
   #   entry_fee + exit_fee + half_spread + slippage + safety_pp

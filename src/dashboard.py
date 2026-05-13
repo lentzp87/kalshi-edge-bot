@@ -143,6 +143,25 @@ def _entry_price_bucket(fill_price: float | None) -> str:
     return "85+"
 
 
+def _side_entry_bucket(side: str | None, fill_price: float | None) -> str | None:
+    """Compose `side × entry-bucket` key for the asymmetric-floor analysis
+    panel. Returns e.g. 'yes <55', 'no 65-75'. None drops the row.
+
+    Smaller buckets than `_entry_price_bucket` to surface differences
+    in the cheap end where the new 0.35 floor matters most.
+    """
+    if side not in ("yes", "no") or fill_price is None:
+        return None
+    p = float(fill_price)
+    if p < 0.40:    bucket = "<40"
+    elif p < 0.50:  bucket = "40-50"
+    elif p < 0.60:  bucket = "50-60"
+    elif p < 0.70:  bucket = "60-70"
+    elif p < 0.80:  bucket = "70-80"
+    else:           bucket = "80+"
+    return f"{side} {bucket}"
+
+
 def _tip_bucket(mins: float | None) -> str:
     if mins is None:
         return "?"
@@ -385,6 +404,7 @@ def stats() -> dict:
             "by_confidence": [],
             "by_exit_policy": [], "by_edge_bucket": [],
             "by_whale_class": [], "by_whale_magnitude": [], "by_whale_side": [],
+            "by_side_x_entry": [],
             "windowed_pnl": [], "open_mtm": _open_unrealized_snapshot(_journal.open_positions()),
             "n_clv": 0, "avg_clv_bp": 0.0, "pct_positive_clv": 0.0,
             "by_sport_clv": [],
@@ -497,6 +517,15 @@ def stats() -> dict:
         ),
         "by_whale_magnitude": _bucket_aggregate(
             chronological, lambda r: r.get("_whale_magnitude")
+        ),
+        # Side × entry-price bucket — answers "do YES underdogs win more
+        # than NO underdogs at the same price?" Drives the eventual
+        # asymmetric tuning of min_entry_price_yes / min_entry_price_no.
+        # Currently both floors are 0.35 so this panel measures only;
+        # doesn't influence policy until we set asymmetric values.
+        "by_side_x_entry": _bucket_aggregate(
+            chronological,
+            lambda r: _side_entry_bucket(r.get("side"), r.get("fill_price"))
         ),
         # Whale-boosted trades only, bucketed by the side WE bet.
         # Tests the hypothesis: are NO-side boosts more predictive than
@@ -891,6 +920,16 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
     <table>
       <thead><tr><th>Side we bet</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
       <tbody id="tbody-whale-side"><tr><td colspan="4" class="empty">no whale-boosted trades yet</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="panel" style="margin-top:16px">
+    <div class="title">By Side × Entry Price
+      <span class="meta">do YES underdogs win more than NO underdogs at the same price? drives asymmetric min_entry_price tuning</span>
+    </div>
+    <table>
+      <thead><tr><th>Side × Price</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-side-x-entry"><tr><td colspan="4" class="empty">no data yet</td></tr></tbody>
     </table>
   </div>
 
@@ -1450,6 +1489,7 @@ async function refresh() {{
     renderBucketTable('tbody-whale-class', stats.by_whale_class);
     renderBucketTable('tbody-whale-magnitude', stats.by_whale_magnitude);
     renderBucketTable('tbody-whale-side', stats.by_whale_side);
+    renderBucketTable('tbody-side-x-entry', stats.by_side_x_entry);
     renderWindowedPnl(stats.windowed_pnl, stats.open_mtm);
     renderClvTable('tbody-clv-sport',     stats.by_sport_clv);
     renderCrossExchange(crossEx);

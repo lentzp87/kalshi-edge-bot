@@ -27,7 +27,16 @@ class ScannerConfig(BaseModel):
 class DecisionConfig(BaseModel):
     min_edge: float = 0.06
     kelly_fraction: float = 0.25
+    # Entry price floor. `min_entry_price` is the legacy single knob.
+    # `min_entry_price_yes` / `min_entry_price_no` allow side-specific
+    # floors — in a pure two-way market YES at $0.30 ≡ NO at $0.70,
+    # so symmetric thresholds are the right default. We keep the knobs
+    # separate to allow asymmetric tuning once we have N>=50 in the
+    # dashboard's by_side_x_entry panel. If either side-specific value
+    # is None, the legacy `min_entry_price` is used for that side.
     min_entry_price: float = 0.55
+    min_entry_price_yes: float | None = None
+    min_entry_price_no: float | None = None
     # Minimum model probability for OUR chosen side. If model thinks our
     # side wins 60%+, fire. If it's a coin flip or worse, skip — even
     # if the edge looks positive, the variance/fee math is unfriendly.

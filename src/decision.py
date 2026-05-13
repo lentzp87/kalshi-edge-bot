@@ -84,13 +84,21 @@ def evaluate(market: Market, est: ProbabilityEstimate) -> TradeSignal | None:
         target_price = no_ask
         gross_edge = gross_no
 
-    # Skip cheap entries — bad risk/reward and high fee drag
-    if target_price < cfg.decision.min_entry_price:
+    # Skip cheap entries — bad risk/reward and high fee drag.
+    # Side-specific floor: pick the YES or NO knob if set, else fall
+    # back to the legacy single `min_entry_price`. Keeps room for an
+    # evidence-based asymmetric policy once we have enough samples.
+    side_floor = (
+        cfg.decision.min_entry_price_yes if side == "yes"
+        else cfg.decision.min_entry_price_no
+    )
+    min_floor = side_floor if side_floor is not None else cfg.decision.min_entry_price
+    if target_price < min_floor:
         log.info("decision.skip.low_price",
                  ticker=market.ticker, side=side,
                  price=round(target_price, 3),
                  p_yes=round(p_yes, 3),
-                 min=cfg.decision.min_entry_price)
+                 min=min_floor)
         return None
 
     # Skip low-probability sides. p_yes is the model's prob that the
