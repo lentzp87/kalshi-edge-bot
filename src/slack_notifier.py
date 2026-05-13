@@ -222,79 +222,72 @@ def _unrealized_pnl(pos: dict) -> float | None:
     return (float(mid) - float(fill)) * int(contracts) - exit_fee
 
 
-def build_pnl_digest(journal, *, window_hours: int = 6) -> str:
-    """Construct the digest text. Pure — doesn't post."""
+def _window_stats(closed_rows: list[dict], cutoff_iso: str) -> dict:
+    """Realized stats for rows whose closed_ts >= cutoff_iso."""
+    in_win = [r for r in closed_rows if r.get("closed_ts", "") >= cutoff_iso]
+    n = len(in_win)
+    if n == 0:
+        return {"n": 0, "wins": 0, "losses": 0, "realized": 0.0}
+    realized = sum(float(r.get("pnl_usd") or 0) for r in in_win)
+    wins = sum(1 for r in in_win if (r.get("pnl_usd") or 0) > 0)
+    losses = sum(1 for r in in_win if (r.get("pnl_usd") or 0) < 0)
+    return {"n": n, "wins": wins, "losses": losses, "realized": realized}
+
+
+def build_pnl_digest(journal, *, windows: list[int] | None = None,
+                     window_hours: int | None = None) -> str:
+    """Multi-window P&L digest as a single Slack message.
+
+    Default windows = [3, 6, 12, 24]. The unrealized line and top/bottom
+    trades are drawn once from the widest window (so we don't repeat
+    them four times). The four windows share a monospace table.
+
+    Backwards-compat: `window_hours=N` is still accepted and produces a
+    single-window digest, matching the prior /pnl_digest behavior.
+    """
     from datetime import datetime, timezone, timedelta
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
-    cutoff_iso = cutoff.isoformat()
+    if windows is None and window_hours is None:
+        windows = [3, 6, 12, 24]
+    elif windows is None:
+        windows = [int(window_hours)]  # legacy single-window call
 
-    # All recent rows; we'll filter to "closed in window" client-side
-    # because journal.recent_trades doesn't take a time filter.
-    rows = journal.recent_trades(limit=500)
-    closed_in_window = [
+    windows = sorted(set(int(w) for w in windows))
+    max_win = max(windows)
+
+    now = datetime.now(timezone.utc)
+    cutoffs = {w: (now - timedelta(hours=w)).isoformat() for w in windows}
+    max_cutoff_iso = cutoffs[max_win]
+
+    # Pull a generous slice; we'll filter per-window below.
+    rows = journal.recent_trades(limit=1000)
+    relevant_closed = [
         r for r in rows
-        if r.get("closed_ts") and r.get("closed_ts") >= cutoff_iso
+        if r.get("closed_ts") and r["closed_ts"] >= max_cutoff_iso
         and r.get("pnl_usd") is not None
     ]
 
-    realized = sum(float(r.get("pnl_usd") or 0) for r in closed_in_window)
-    wins = sum(1 for r in closed_in_window if (r.get("pnl_usd") or 0) > 0)
-    losses = sum(1 for r in closed_in_window if (r.get("pnl_usd") or 0) < 0)
-    n_closed = len(closed_in_window)
-    win_rate = (wins / n_closed * 100) if n_closed else 0.0
+    # Per-window stats
+    per_window = [
+        (w, _window_stats(relevant_closed, cutoffs[w])) for w in windows
+    ]
 
-    # Top / bottom for closed
-    by_pnl = sorted(closed_in_window, key=lambda r: float(r.get("pnl_usd") or 0), reverse=True)
-    top = by_pnl[:2]
-    bottom = list(reversed(by_pnl[-2:])) if len(by_pnl) >= 2 else []
-
-    # Open positions: mark-to-market
+    # Open positions — single snapshot, window-independent.
     open_positions = journal.open_positions()
     open_with_mtm = []
     for p in open_positions:
         u = _unrealized_pnl(p)
-        if u is None:
-            continue
-        open_with_mtm.append((u, p))
+        if u is not None:
+            open_with_mtm.append((u, p))
     open_with_mtm.sort(key=lambda x: x[0], reverse=True)
     unrealized = sum(u for u, _ in open_with_mtm)
     n_open = len(open_positions)
     n_with_mtm = len(open_with_mtm)
 
-    net = realized + unrealized
+    # ---- Compose message ----
+    lines = ["📊 *P&L snapshot*", ""]
 
-    # ---- Format ----
-    lines = [f"📊 *P&L snapshot · last {window_hours}h*", ""]
-
-    # Realized line
-    if n_closed:
-        lines.append(
-            f"*Realized:* {_fmt_money(realized)}  "
-            f"({n_closed} closed · {wins}W/{losses}L · {win_rate:.0f}% wr)"
-        )
-        if top:
-            tops = ", ".join(
-                f"{_bet_label(r.get('reason',''), r.get('ticker',''))} "
-                f"{_fmt_money(float(r.get('pnl_usd') or 0))}"
-                for r in top if (r.get('pnl_usd') or 0) > 0
-            )
-            if tops:
-                lines.append(f"  🏆 {tops}")
-        if bottom:
-            bots = ", ".join(
-                f"{_bet_label(r.get('reason',''), r.get('ticker',''))} "
-                f"{_fmt_money(float(r.get('pnl_usd') or 0))}"
-                for r in bottom if (r.get('pnl_usd') or 0) < 0
-            )
-            if bots:
-                lines.append(f"  💀 {bots}")
-    else:
-        lines.append(f"*Realized:* no trades closed in last {window_hours}h")
-
-    lines.append("")
-
-    # Open / unrealized line
+    # Open / unrealized summary (single line)
     if n_open == 0:
         lines.append("*Open:* no positions")
     elif n_with_mtm == 0:
@@ -304,7 +297,6 @@ def build_pnl_digest(journal, *, window_hours: int = 6) -> str:
             f"*Open:* {_fmt_money(unrealized)} unrealized "
             f"({n_with_mtm}/{n_open} marked)"
         )
-        # Best / worst open
         best_u, best_p = open_with_mtm[0]
         worst_u, worst_p = open_with_mtm[-1]
         if best_u > 0:
@@ -319,16 +311,55 @@ def build_pnl_digest(journal, *, window_hours: int = 6) -> str:
             )
 
     lines.append("")
-    arrow = "📈" if net > 0 else ("📉" if net < 0 else "➖")
-    lines.append(f"{arrow} *Net {window_hours}h:* {_fmt_money(net)}")
+
+    # Monospace window table — Slack renders ``` blocks in fixed-width
+    # so columns align. Width budget: label 12, each window 11.
+    def _col(s: str, w: int = 11) -> str:
+        return s.rjust(w)
+
+    header = "Window      " + "".join(_col(f"{w}h") for w in windows)
+    n_row  = "Closed N    " + "".join(_col(str(s["n"])) for _w, s in per_window)
+    wl_row = "W / L       " + "".join(_col(f"{s['wins']}/{s['losses']}") for _w, s in per_window)
+    rp_row = "Realized    " + "".join(_col(_fmt_money(s["realized"])) for _w, s in per_window)
+    net_row = "Net         " + "".join(
+        _col(_fmt_money(s["realized"] + unrealized)) for _w, s in per_window
+    )
+
+    lines.append("```")
+    lines.append(header)
+    lines.append(n_row)
+    lines.append(wl_row)
+    lines.append(rp_row)
+    lines.append(net_row)
+    lines.append("```")
+
+    # Top / bottom over the widest window
+    by_pnl = sorted(relevant_closed, key=lambda r: float(r.get("pnl_usd") or 0), reverse=True)
+    top = by_pnl[:2]
+    bottom = list(reversed(by_pnl[-2:])) if len(by_pnl) >= 2 else []
+    tops_text = ", ".join(
+        f"{_bet_label(r.get('reason',''), r.get('ticker',''))} "
+        f"{_fmt_money(float(r.get('pnl_usd') or 0))}"
+        for r in top if (r.get('pnl_usd') or 0) > 0
+    )
+    bots_text = ", ".join(
+        f"{_bet_label(r.get('reason',''), r.get('ticker',''))} "
+        f"{_fmt_money(float(r.get('pnl_usd') or 0))}"
+        for r in bottom if (r.get('pnl_usd') or 0) < 0
+    )
+    if tops_text:
+        lines.append(f"🏆 *{max_win}h winners:* {tops_text}")
+    if bots_text:
+        lines.append(f"💀 *{max_win}h losers:* {bots_text}")
 
     return "\n".join(lines)
 
 
-def notify_pnl_digest(journal, *, window_hours: int = 6) -> None:
+def notify_pnl_digest(journal, *, windows: list[int] | None = None,
+                      window_hours: int | None = None) -> None:
     """Fire the digest to Slack. Fail-silent."""
     try:
-        text = build_pnl_digest(journal, window_hours=window_hours)
+        text = build_pnl_digest(journal, windows=windows, window_hours=window_hours)
     except Exception as e:  # noqa: BLE001
         log.warning("slack.digest_build_failed", err=str(e)[:200])
         return

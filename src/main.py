@@ -217,7 +217,10 @@ async def slack_digest_loop(
     await asyncio.sleep(interval_seconds)
     while True:
         try:
-            notify_pnl_digest(journal, window_hours=interval_hours)
+            # Show all four windows at once — periodic digest is more
+            # useful as a "state of the bot across timescales" snapshot
+            # than a single-window report.
+            notify_pnl_digest(journal, windows=[3, 6, 12, 24])
         except Exception:
             log.exception("slack_digest.error")
         await asyncio.sleep(interval_seconds)

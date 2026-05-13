@@ -293,18 +293,40 @@ def edge() -> dict:
 
 
 @app.get("/pnl_digest")
-def pnl_digest(window_hours: int = 6, send: bool = False) -> dict:
+def pnl_digest(
+    windows: str = "3,6,12,24",
+    window_hours: int | None = None,
+    send: bool = False,
+) -> dict:
     """Return the same P&L digest the Slack loop sends.
 
     ?send=true also fires the Slack ping (useful for testing the webhook
-    without waiting for the 6h timer). Pass window_hours=N to widen or
-    narrow the window for an ad-hoc check.
+    without waiting for the periodic timer).
+
+    ?windows=3,6,12,24 controls which windows show in the table
+    (comma-separated hours). Default is the same set the periodic loop
+    posts to Slack.
+
+    ?window_hours=N (legacy) forces a single-window digest.
     """
     from .slack_notifier import build_pnl_digest, notify_pnl_digest
-    text = build_pnl_digest(_journal, window_hours=window_hours)
-    if send:
-        notify_pnl_digest(_journal, window_hours=window_hours)
-    return {"window_hours": window_hours, "text": text, "sent": bool(send)}
+    if window_hours is not None:
+        text = build_pnl_digest(_journal, window_hours=int(window_hours))
+        meta = {"window_hours": int(window_hours)}
+        if send:
+            notify_pnl_digest(_journal, window_hours=int(window_hours))
+    else:
+        try:
+            win_list = [int(w.strip()) for w in windows.split(",") if w.strip()]
+        except ValueError:
+            win_list = [3, 6, 12, 24]
+        if not win_list:
+            win_list = [3, 6, 12, 24]
+        text = build_pnl_digest(_journal, windows=win_list)
+        meta = {"windows": win_list}
+        if send:
+            notify_pnl_digest(_journal, windows=win_list)
+    return {**meta, "text": text, "sent": bool(send)}
 
 
 @app.get("/cross_exchange")
