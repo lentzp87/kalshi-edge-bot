@@ -285,6 +285,16 @@ class Executor:
             pos.tip_utc = tip_utc  # type: ignore[attr-defined]
         self.risk.record_open(signal)
         self.journal.log_open(signal=signal, market=market, fill_price=fill_price, contracts=contracts)
+        # Slack ping. Fire-and-forget — failure never blocks the trade flow.
+        try:
+            from .slack_notifier import notify_open
+            notify_open(
+                ticker=signal.ticker, side=signal.side,
+                size_usd=signal.size_usd, fill_price=fill_price,
+                edge=signal.edge, reason=signal.reason,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("slack.notify_open_failed", err=str(e)[:200])
         pos.children.append(asyncio.create_task(self._watch(signal.ticker)))
         # Schedule a CLV sampler — captures Kalshi's mid price ~5 min
         # before tipoff so we can measure closing-line value even when
@@ -445,6 +455,18 @@ class Executor:
             fees_usd=fees_usd,
             reason=reason,
         )
+        # Slack ping on close. Includes hold duration via pos.opened_at.
+        try:
+            from .slack_notifier import notify_close
+            notify_close(
+                ticker=ticker, side=pos.signal.side,
+                fill_price=pos.fill_price, exit_price=exit_price,
+                pnl_usd=pnl_usd, fees_usd=fees_usd,
+                reason=pos.signal.reason, exit_reason=reason,
+                opened_at=pos.opened_at,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("slack.notify_close_failed", err=str(e)[:200])
         # Release event lock and start cooldown so we don't immediately
         # re-enter the same trade after a take_profit / stop_loss.
         ev = getattr(pos, "event_ticker", None)

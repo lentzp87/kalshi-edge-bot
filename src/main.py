@@ -183,6 +183,20 @@ async def amain() -> None:
         log.warning("bot.odds_api_key", source="baked",
                     note="ODDS_API_KEY env var not set — using baked-in key (likely dead)")
 
+    # Slack: presence check for trade-notification credentials. Fail-silent
+    # at send time; this just surfaces the config state in deploy logs.
+    slack_hook = _os.environ.get("SLACK_WEBHOOK_URL")
+    slack_token = _os.environ.get("SLACK_BOT_TOKEN")
+    slack_channel = _os.environ.get("SLACK_CHANNEL")
+    if slack_hook:
+        log.info("bot.slack", transport="webhook", configured=True)
+    elif slack_token and slack_channel:
+        log.info("bot.slack", transport="bot_token",
+                 channel=slack_channel, configured=True)
+    else:
+        log.info("bot.slack", configured=False,
+                 note="set SLACK_WEBHOOK_URL or SLACK_BOT_TOKEN+SLACK_CHANNEL")
+
     # DataGolf is the Tier-1 truth source for the golf model. Log presence at
     # startup so deploy logs show whether we're running with the sharper
     # provider or falling back to The Odds API outright odds.
