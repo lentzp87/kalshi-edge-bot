@@ -111,6 +111,16 @@ def evaluate(market: Market, est: ProbabilityEstimate) -> TradeSignal | None:
                  our_side_p=round(our_side_p, 3),
                  min=cfg.decision.min_p_yes)
         return None
+    # Skip overconfident model picks. 2026-05-19 data: 80%+ confidence
+    # bucket had 33% wr / -$285 over N=36 trades. Capping where the
+    # model has historically been most wrong.
+    max_p = cfg.decision.max_p_yes
+    if max_p is not None and our_side_p > max_p:
+        log.info("decision.skip.p_yes_too_high",
+                 ticker=market.ticker, side=side,
+                 our_side_p=round(our_side_p, 3),
+                 max=max_p)
+        return None
 
     # ----- Per-market fee-adjusted edge gate -----
     # ChatGPT pushback: a global min_edge ignores that the fee curve

@@ -84,6 +84,10 @@ decision:
   min_entry_price_yes: 0.35
   min_entry_price_no: 0.35
   min_p_yes: 0.52
+  # 2026-05-19: cap the top end. 80%+ confidence trades over N=36 ran
+  # 33% wr / -$285 — model is anti-predictive when most certain. Set
+  # to null to disable; restore to ~0.85 if calibration improves.
+  max_p_yes: 0.78
   # Per-market gate: gross_edge must exceed
   #   entry_fee + exit_fee + half_spread + slippage + safety_pp
   # safety_pp is the cushion above measured costs.
@@ -110,11 +114,14 @@ risk:
   # cap. Capped at 5x the original Kelly inside execution.py to limit
   # damage if the whale is wrong / spoofed. Set equal to
   # max_position_size_usd to disable the boost.
-  # 2026-05-13: was 200, dropped to 100. St. Louis MLB NO @ 0.44 → 0.01
-  # whale-boosted to $100, full stake loss = -$100 single trade, which
-  # is the entire max_daily_loss_usd budget on ONE position. Whale
-  # signal quality not yet proven; cap downside until we have data.
-  whale_max_position_size_usd: 100
+  # 2026-05-13: was 200, dropped to 100.
+  # 2026-05-19: dropped 100 -> 50. That one St. Louis blowout was 35%
+  # of our total P&L hit and made the entire aggressive-whale class
+  # look bad in retrospect (price_7-10c is actually 80% wr / +$99 over
+  # 5 trades; price_10c+ is just one -$100 outlier). Capping single-
+  # trade downside at $50 keeps whale boosting alive without letting
+  # a single mistake nuke a week.
+  whale_max_position_size_usd: 50
 
 execution:
   # 2026-05-11 SL DISABLED. Settlement backtest panel after the v4 DB

@@ -65,8 +65,13 @@ SERIES_REGISTRY: dict[str, str] = {
     "KXNFLGAME":    "nfl",
     "KXMLBGAME":    "mlb",
     "KXNHLGAME":    "nhl",
-    # WNBA — same template, different ESPN sport key
-    "KXWNBAGAME":   "wnba",
+    # 2026-05-19: KXWNBAGAME removed. 18 trades, 17% wr, -$131.53.
+    # The model is structurally wrong about WNBA — favorites lose to
+    # underdogs we don't take, and our chosen sides win 3 of 18 times.
+    # Pinnacle league_id 578 exists, data path works, but the edge isn't
+    # there. Reinstate after rebuilding the WNBA-specific model or
+    # finding a better book.
+    # "KXWNBAGAME":   "wnba",
     # NCAA basketball / football (verified series names may differ —
     # bot will log unknown series so we can confirm)
     "KXNCAABGAME":  "ncaab",

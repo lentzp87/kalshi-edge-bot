@@ -42,6 +42,12 @@ class DecisionConfig(BaseModel):
     # if the edge looks positive, the variance/fee math is unfriendly.
     # Setting 0.0 disables this filter (back-compat default).
     min_p_yes: float = 0.0
+    # Maximum model probability for OUR chosen side. None disables.
+    # Counterintuitive but real: in our data the 80%+ confidence bucket
+    # (N=36) had a 33% win rate and -$285 P&L. Model is anti-predictive
+    # when most certain — probably overestimating heavy favorites whose
+    # closing line drifts against us. Cap stops feeding the worst bucket.
+    max_p_yes: float | None = None
     # Safety margin (in probability points) added to the per-market
     # required edge after entry+exit fees + half-spread + slippage.
     # Don't fire on knife-edge gross edges that barely cover costs.
