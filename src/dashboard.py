@@ -348,6 +348,65 @@ def pnl_digest(
     return {**meta, "text": text, "sent": bool(send)}
 
 
+@app.get("/golf_3ball")
+async def golf_3ball(send: bool = False, min_edge_pp: float = 0.04) -> dict:
+    """Golf matchup edge advisor (beta). Read-only — surfaces +EV golf
+    3-ball / 2-ball legs from DataGolf vs DraftKings.
+
+    ?send=true also fires the Slack ping. ?min_edge_pp=N adjusts the
+    flag threshold (default 0.04 = 4 percentage points).
+    """
+    from .golf_3ball import find_edges, format_slack
+    edges = await find_edges(min_edge_pp=min_edge_pp)
+    text = format_slack(edges)
+    if send:
+        from .slack_notifier import send_text
+        send_text(text)
+    return {
+        "n_edges": len(edges),
+        "min_edge_pp": min_edge_pp,
+        "sent": bool(send),
+        "text": text,
+        "edges": [vars(e) for e in edges],
+    }
+
+
+@app.get("/golf_leader")
+async def golf_leader(send: bool = False, lead_gap: int = 1,
+                      min_thru: int = 9, min_edge_pp: float = 0.05) -> dict:
+    """Live golf round-leader alerter (beta). Read-only — surfaces
+    mid-tier golfers near the lead with holes to play whose DataGolf
+    in-play probability beats the DraftKings price.
+
+    ?send=true also fires the Slack ping. lead_gap / min_thru /
+    min_edge_pp tune the trigger.
+    """
+    from .golf_leader import find_leader_alerts, format_slack
+    alerts = await find_leader_alerts(
+        lead_gap=lead_gap, min_thru=min_thru, min_edge_pp=min_edge_pp,
+    )
+    text = format_slack(alerts)
+    if send:
+        from .slack_notifier import send_text
+        send_text(text)
+    return {
+        "n_alerts": len(alerts),
+        "sent": bool(send),
+        "text": text,
+        "alerts": [
+            {
+                "player": a.player_name, "pos": a.current_pos,
+                "score": a.current_score, "strokes_back": a.strokes_back,
+                "thru": a.thru, "round": a.round_num,
+                "best_market": a.best_market,
+                "best_edge_pp": round(a.best_edge_pp, 4),
+                "market_edges": a.market_edges,
+            }
+            for a in alerts
+        ],
+    }
+
+
 @app.get("/cross_exchange")
 def cross_exchange() -> dict:
     """Latest Kalshi-vs-Polymarket spread snapshot.
@@ -618,102 +677,175 @@ def _render_dashboard(*, mode: str, kalshi_env: str, bankroll: float,
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kalshi Edge Bot</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Edge Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
 :root {{
-  --bg: #0b0d10; --panel: #14171c; --panel-2: #1b2027;
-  --border: #232931; --text: #e8ecef; --text-dim: #8a93a0;
-  --accent: #4ade80; --danger: #f87171;
-  --warn: #fbbf24; --info: #60a5fa;
+  --bg: #0A0F14; --surface: #151A21; --surface-raised: #1E242D;
+  --surface-overlay: #252B35; --border: #2A313A;
+  --text: #FFFFFF; --text-secondary: #9CA3AF; --text-muted: #5E6470;
+  --primary: #3DA5F5; --primary-soft: rgba(61,165,245,0.18);
+  --accent: #7C9EFF;
+  --success: #3DD68C; --success-soft: rgba(61,214,140,0.15);
+  --danger: #FF4D4D; --danger-soft: rgba(255,77,77,0.15);
+  --warning: #FBB454; --warning-soft: rgba(251,180,84,0.15);
+  --info: #5BC0EB; --info-soft: rgba(91,192,235,0.12);
 }}
 * {{ box-sizing: border-box; }}
 html, body {{ margin: 0; padding: 0; background: var(--bg); color: var(--text);
-  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }}
-a {{ color: var(--info); text-decoration: none; }}
-a:hover {{ text-decoration: underline; }}
+  font-family: 'Inter', system-ui, -apple-system, sans-serif; font-size: 15px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased; font-variant-numeric: tabular-nums; }}
+a {{ color: var(--primary); text-decoration: none; transition: color 0.15s; }}
+a:hover {{ color: var(--accent); }}
 
-.shell {{ max-width: 1500px; margin: 0 auto; padding: 24px; }}
+.shell {{ max-width: 1240px; margin: 0 auto; padding: 32px 24px 80px; }}
 
-.header {{ display: flex; align-items: center; justify-content: space-between;
-  flex-wrap: wrap; gap: 12px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }}
-.header h1 {{ font-size: 20px; margin: 0; font-weight: 600; }}
-.subtitle {{ color: var(--text-dim); font-size: 13px; }}
-.badges {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-.badge {{ padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 500;
-  letter-spacing: 0.4px; text-transform: uppercase; background: var(--panel-2); border: 1px solid var(--border); }}
-.badge.paper {{ color: var(--info); border-color: rgba(96,165,250,0.3); }}
-.badge.live {{ color: var(--danger); border-color: rgba(248,113,113,0.3); }}
-.badge.prod {{ color: var(--warn); border-color: rgba(251,191,36,0.3); }}
-.badge.demo {{ color: var(--text-dim); }}
+.header {{ display: flex; align-items: flex-start; justify-content: space-between;
+  flex-wrap: wrap; gap: 16px; margin-bottom: 32px; }}
+.brand h1 {{ margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -0.02em; }}
+.brand .sub {{ color: var(--text-muted); font-size: 12px; margin-top: 6px;
+  display: flex; align-items: center; gap: 8px; }}
+.live-dot {{ width: 6px; height: 6px; border-radius: 50%; background: var(--success);
+  box-shadow: 0 0 8px var(--success); animation: pulse 2s ease-in-out infinite; }}
+@keyframes pulse {{ 0%,100%{{opacity:1}} 50%{{opacity:0.35}} }}
+.badges {{ display: flex; gap: 6px; flex-wrap: wrap; }}
+.badge {{ font-size: 10px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase;
+  padding: 6px 10px; border-radius: 6px; background: var(--surface); color: var(--text-secondary); }}
+.badge.live {{ color: var(--danger); background: var(--danger-soft); }}
+.badge.paper {{ color: var(--info); background: var(--info-soft); }}
+.badge.prod {{ color: var(--warning); background: var(--warning-soft); }}
+.badge.demo {{ color: var(--text-muted); }}
 
-.kpis {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-  gap: 12px; margin: 20px 0; }}
-.kpi {{ background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }}
-.kpi .label {{ color: var(--text-dim); font-size: 11px; text-transform: uppercase;
-  letter-spacing: 0.6px; margin-bottom: 6px; }}
-.kpi .value {{ font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }}
-.kpi .sub {{ font-size: 11px; color: var(--text-dim); margin-top: 4px; font-variant-numeric: tabular-nums; }}
-.kpi.pos .value {{ color: var(--accent); }}
-.kpi.neg .value {{ color: var(--danger); }}
+.hero {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 32px; }}
+.dial {{ background: var(--surface); border-radius: 16px; padding: 28px 24px;
+  display: flex; flex-direction: column; align-items: center; gap: 14px; }}
+.dial-svg {{ width: 200px; height: 200px; position: relative; }}
+.dial-svg svg {{ transform: rotate(-90deg); }}
+.dial-track {{ stroke: var(--surface-raised); fill: none; stroke-width: 10; }}
+.dial-arc {{ fill: none; stroke-width: 10; stroke-linecap: round;
+  transition: stroke-dashoffset 0.8s cubic-bezier(0.4,0,0.2,1), stroke 0.3s; }}
+.dial-center {{ position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; flex-direction: column; gap: 4px; }}
+.dial-value {{ font-size: 42px; font-weight: 800; letter-spacing: -0.03em; line-height: 1; }}
+.dial-value.pos {{ color: var(--success); }}
+.dial-value.neg {{ color: var(--danger); }}
+.dial-unit {{ font-size: 13px; font-weight: 500; color: var(--text-secondary); letter-spacing: 0.04em; }}
+.dial-label {{ font-size: 11px; font-weight: 600; letter-spacing: 0.16em;
+  text-transform: uppercase; color: var(--text-secondary); }}
+.dial-sub {{ font-size: 12px; color: var(--text-muted); margin-top: -4px; text-align: center; }}
 
-.grid {{ display: grid; gap: 16px; margin-bottom: 16px; }}
+.kpis {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px; margin-bottom: 24px; }}
+.kpi {{ background: var(--surface); border-radius: 16px; padding: 18px 20px; }}
+.kpi .label {{ font-size: 10px; font-weight: 600; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--text-secondary); margin-bottom: 10px; }}
+.kpi .value {{ font-size: 26px; font-weight: 700; letter-spacing: -0.02em; line-height: 1; }}
+.kpi .value.pos {{ color: var(--success); }} .kpi .value.neg {{ color: var(--danger); }}
+.kpi .sub {{ font-size: 12px; color: var(--text-muted); margin-top: 8px; }}
+
+.card {{ background: var(--surface); border-radius: 16px; padding: 20px 22px; }}
+.card-title {{ display: flex; align-items: baseline; justify-content: space-between;
+  margin-bottom: 16px; gap: 12px; flex-wrap: wrap; }}
+.card-title h3 {{ margin: 0; font-size: 11px; font-weight: 600; letter-spacing: 0.16em;
+  text-transform: uppercase; color: var(--text-secondary); }}
+.card-title .meta {{ font-size: 12px; color: var(--text-muted); font-weight: 400;
+  letter-spacing: 0; text-transform: none; }}
+
+.section {{ font-size: 11px; font-weight: 700; letter-spacing: 0.18em;
+  text-transform: uppercase; color: var(--text-secondary);
+  margin: 40px 0 16px; padding-top: 24px; border-top: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px; }}
+.section::after {{ content: ''; flex: 1; height: 1px; background: var(--border); margin-left: 8px; }}
+
+.grid {{ display: grid; gap: 16px; }}
 .grid.cols-2 {{ grid-template-columns: 1fr 1fr; }}
 .grid.cols-3 {{ grid-template-columns: 1fr 1fr 1fr; }}
-.grid.cols-4 {{ grid-template-columns: 1fr 1fr 1fr 1fr; }}
-@media (max-width: 1100px) {{ .grid.cols-3, .grid.cols-4 {{ grid-template-columns: 1fr 1fr; }} }}
-@media (max-width: 720px) {{ .grid.cols-2, .grid.cols-3, .grid.cols-4 {{ grid-template-columns: 1fr; }} }}
+.grid.cols-4 {{ grid-template-columns: repeat(4, 1fr); }}
+@media (max-width: 1024px) {{
+  .grid.cols-3, .grid.cols-4 {{ grid-template-columns: 1fr 1fr; }}
+  .hero {{ grid-template-columns: 1fr; max-width: 480px; margin: 0 auto 32px; }}
+}}
+@media (max-width: 600px) {{
+  .grid.cols-2, .grid.cols-3, .grid.cols-4 {{ grid-template-columns: 1fr; }}
+  .shell {{ padding: 20px 14px 60px; }} .dial-value {{ font-size: 36px; }}
+}}
 
-.panel {{ background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-  padding: 14px 16px; }}
-.panel .title {{ font-size: 12px; color: var(--text-dim); text-transform: uppercase;
-  letter-spacing: 0.6px; margin: 0 0 10px 0; display: flex; align-items: center;
-  justify-content: space-between; gap: 8px; }}
-.panel .title .meta {{ text-transform: none; letter-spacing: 0; color: var(--text-dim);
-  font-weight: 400; font-size: 11px; }}
-
-.section-header {{ font-size: 13px; color: var(--text); font-weight: 600;
-  text-transform: uppercase; letter-spacing: 0.6px; margin: 24px 0 8px 0;
-  display: flex; align-items: center; gap: 10px; }}
-.section-header::after {{ content: ''; flex: 1; height: 1px; background: var(--border); }}
-
-.chart-wrap {{ position: relative; height: 260px; }}
+.chart-wrap {{ height: 260px; position: relative; }}
 .chart-wrap.tall {{ height: 320px; }}
 
-table {{ width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }}
-th, td {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }}
-th {{ font-weight: 500; color: var(--text-dim); font-size: 11px;
-  text-transform: uppercase; letter-spacing: 0.4px; }}
+table {{ width: 100%; border-collapse: collapse; }}
+th {{ font-size: 10px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--text-muted); padding: 10px 12px; text-align: left;
+  border-bottom: 1px solid var(--border); }}
+th.num {{ text-align: right; }}
+td {{ padding: 12px; font-size: 13px;
+  border-bottom: 1px solid var(--surface-raised); white-space: nowrap; }}
+td.num {{ text-align: right; font-weight: 500; }}
+td.pos {{ color: var(--success); }} td.neg {{ color: var(--danger); }}
+td.muted {{ color: var(--text-muted); }}
+td.ticker {{ font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-muted); }}
 tr:last-child td {{ border-bottom: none; }}
-td.num {{ text-align: right; }}
-td.pos {{ color: var(--accent); }}
-td.neg {{ color: var(--danger); }}
-td.muted {{ color: var(--text-dim); }}
-td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }}
-.scroll {{ max-height: 380px; overflow-y: auto; }}
+.scroll {{ max-height: 420px; overflow-y: auto;
+  scrollbar-width: thin; scrollbar-color: var(--surface-raised) transparent; }}
+.scroll::-webkit-scrollbar {{ width: 6px; }}
+.scroll::-webkit-scrollbar-track {{ background: transparent; }}
+.scroll::-webkit-scrollbar-thumb {{ background: var(--surface-raised); border-radius: 3px; }}
 
-.empty {{ color: var(--text-dim); text-align: center; padding: 16px 0; font-style: italic; }}
+.pill {{ display: inline-flex; align-items: center; gap: 4px;
+  font-size: 10px; font-weight: 600; padding: 4px 8px; border-radius: 6px; letter-spacing: 0.04em; }}
+.pill.success {{ color: var(--success); background: var(--success-soft); }}
+.pill.danger {{ color: var(--danger); background: var(--danger-soft); }}
+.pill.warn {{ color: var(--warning); background: var(--warning-soft); }}
+.pill.info {{ color: var(--info); background: var(--info-soft); }}
 
-.refresh-pill {{ font-size: 11px; color: var(--text-dim); }}
-.dot {{ display: inline-block; width: 7px; height: 7px; border-radius: 50%;
-  background: var(--accent); margin-right: 6px; vertical-align: middle;
-  box-shadow: 0 0 6px var(--accent); animation: pulse 2s ease-in-out infinite; }}
-@keyframes pulse {{ 0%,100% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} }}
+.tag {{ display: inline-block; font-size: 9px; font-weight: 700; letter-spacing: 0.1em;
+  padding: 3px 7px; border-radius: 4px; background: var(--surface-raised);
+  color: var(--text-secondary); text-transform: uppercase; }}
+.tag.tennis {{ color: #B69CFA; background: rgba(157,124,247,0.15); }}
+.tag.cricket {{ color: #F5B470; background: rgba(245,158,61,0.15); }}
+.tag.mlb {{ color: #6FD0F5; background: rgba(91,192,235,0.15); }}
+.tag.hockey {{ color: #9DB5FF; background: rgba(124,158,255,0.15); }}
+.tag.nba, .tag.nfl {{ color: #FFA76E; background: rgba(255,138,61,0.15); }}
 
-.footer {{ color: var(--text-dim); font-size: 11px; padding: 18px 0;
-  text-align: center; border-top: 1px solid var(--border); margin-top: 16px; }}
+.empty {{ color: var(--text-muted); text-align: center; padding: 24px 0; font-style: italic; font-size: 13px; }}
+
+.settlement-grid {{ display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: 24px; padding: 8px 0 16px; }}
+.settlement-grid .item .lbl {{ font-size: 10px; font-weight: 600; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--text-muted); margin-bottom: 10px; }}
+.settlement-grid .item .val {{ font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }}
+.settlement-grid .item .val.pos {{ color: var(--success); }}
+.settlement-grid .item .val.neg {{ color: var(--danger); }}
+.settlement-grid .item .sub {{ font-size: 11px; color: var(--text-muted); margin-top: 6px; }}
+.stoploss-note {{ font-size: 12px; color: var(--text-secondary);
+  padding-top: 12px; border-top: 1px solid var(--surface-raised); }}
+
+.window-pnl-table td:first-child {{ color: var(--text-secondary);
+  font-size: 10px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; }}
+
+.footer {{ margin-top: 48px; padding-top: 24px; border-top: 1px solid var(--border);
+  font-size: 11px; color: var(--text-muted); text-align: center; }}
+.footer a {{ color: var(--text-secondary); margin: 0 8px; font-weight: 500; letter-spacing: 0.04em; }}
+
+.fab {{ position: fixed; bottom: 24px; right: 24px; width: 56px; height: 56px;
+  border-radius: 50%; background: var(--primary); color: var(--bg);
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 22px; box-shadow: 0 0 24px rgba(61,165,245,0.4);
+  cursor: pointer; transition: transform 0.2s, box-shadow 0.2s; text-decoration: none; }}
+.fab:hover {{ transform: translateY(-2px); box-shadow: 0 4px 32px rgba(61,165,245,0.5); color: var(--bg); }}
 </style>
 </head>
 <body>
 <div class="shell">
 
-  <div class="header">
-    <div>
-      <h1>Kalshi Edge Bot</h1>
-      <div class="subtitle">
-        <span class="dot"></span><span class="refresh-pill" id="refresh-status">connecting...</span>
-      </div>
+  <header class="header">
+    <div class="brand">
+      <h1>Edge Monitor</h1>
+      <div class="sub"><span class="live-dot"></span><span id="refresh-status">connecting…</span></div>
     </div>
     <div class="badges">
       <span class="badge {('paper' if mode == 'paper' else 'live')}">{mode}</span>
@@ -722,295 +854,285 @@ td.ticker {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px
       <span class="badge">min edge {min_edge_bp}bp</span>
       <span class="badge">min entry ${min_entry_price:.2f}</span>
     </div>
-  </div>
+  </header>
 
-  <div class="kpis" id="kpis">
-    <div class="kpi"><div class="label">Total P&amp;L</div><div class="value" id="kpi-pnl">—</div><div class="sub" id="kpi-pnl-sub"></div></div>
-    <div class="kpi"><div class="label">Trades</div><div class="value" id="kpi-trades">—</div><div class="sub" id="kpi-trades-sub"></div></div>
-    <div class="kpi"><div class="label">Win Rate</div><div class="value" id="kpi-winrate">—</div><div class="sub" id="kpi-winrate-sub"></div></div>
-    <div class="kpi"><div class="label">Avg Edge</div><div class="value" id="kpi-edge">—</div><div class="sub">predicted</div></div>
-    <div class="kpi"><div class="label">Open Positions</div><div class="value" id="kpi-open">—</div><div class="sub">capacity 15</div></div>
-    <div class="kpi"><div class="label">Best / Worst</div><div class="value" id="kpi-bestworst" style="font-size:14px">—</div><div class="sub">single-trade range</div></div>
-    <div class="kpi"><div class="label">Avg CLV</div><div class="value" id="kpi-clv">—</div><div class="sub" id="kpi-clv-sub">closing-line value</div></div>
-  </div>
-
-  <div class="panel">
-    <div class="title">P&amp;L by Window
-      <span class="meta" id="window-pnl-meta">realized in window + current unrealized mark-to-market</span>
+  <section class="hero">
+    <div class="dial">
+      <div class="dial-svg">
+        <svg viewBox="0 0 200 200" width="200" height="200">
+          <circle class="dial-track" cx="100" cy="100" r="84"/>
+          <circle id="arc-pnl" class="dial-arc" cx="100" cy="100" r="84"
+            stroke="var(--primary)" stroke-dasharray="528" stroke-dashoffset="528"/>
+        </svg>
+        <div class="dial-center">
+          <div class="dial-value" id="dial-pnl-value">—</div>
+          <div class="dial-unit" id="dial-pnl-unit"></div>
+        </div>
+      </div>
+      <div class="dial-label">Total P&amp;L</div>
+      <div class="dial-sub" id="dial-pnl-sub">awaiting first trade</div>
     </div>
-    <table id="window-pnl-table" style="margin-top:4px">
-      <thead><tr>
-        <th></th>
-        <th class="num">3h</th>
-        <th class="num">6h</th>
-        <th class="num">12h</th>
-        <th class="num">24h</th>
-      </tr></thead>
-      <tbody id="tbody-window-pnl">
-        <tr><td colspan="5" class="empty">loading...</td></tr>
-      </tbody>
-    </table>
+    <div class="dial">
+      <div class="dial-svg">
+        <svg viewBox="0 0 200 200" width="200" height="200">
+          <circle class="dial-track" cx="100" cy="100" r="84"/>
+          <circle id="arc-winrate" class="dial-arc" cx="100" cy="100" r="84"
+            stroke="var(--primary)" stroke-dasharray="528" stroke-dashoffset="528"/>
+        </svg>
+        <div class="dial-center"><div class="dial-value" id="dial-winrate-value">—</div>
+          <div class="dial-unit">%</div></div>
+      </div>
+      <div class="dial-label">Win Rate</div>
+      <div class="dial-sub" id="dial-winrate-sub">—</div>
+    </div>
+    <div class="dial">
+      <div class="dial-svg">
+        <svg viewBox="0 0 200 200" width="200" height="200">
+          <circle class="dial-track" cx="100" cy="100" r="84"/>
+          <circle id="arc-positions" class="dial-arc" cx="100" cy="100" r="84"
+            stroke="var(--primary)" stroke-dasharray="528" stroke-dashoffset="528"/>
+        </svg>
+        <div class="dial-center"><div class="dial-value" id="dial-positions-value">—</div>
+          <div class="dial-unit">/ 15</div></div>
+      </div>
+      <div class="dial-label">Open Positions</div>
+      <div class="dial-sub" id="dial-positions-sub">capacity 15</div>
+    </div>
+  </section>
+
+  <section class="kpis">
+    <div class="kpi"><div class="label">Best / Worst</div>
+      <div class="value" id="kpi-bestworst" style="font-size:18px">—</div>
+      <div class="sub">single-trade range</div></div>
+    <div class="kpi"><div class="label">Avg Edge</div>
+      <div class="value" id="kpi-edge">—</div><div class="sub">predicted bp</div></div>
+    <div class="kpi"><div class="label">Avg CLV</div>
+      <div class="value" id="kpi-clv">—</div>
+      <div class="sub" id="kpi-clv-sub">closing-line value</div></div>
+    <div class="kpi"><div class="label">Trades</div>
+      <div class="value" id="kpi-trades">—</div>
+      <div class="sub" id="kpi-trades-sub"></div></div>
+  </section>
+
+  <div class="card" style="margin-bottom: 16px">
+    <div class="card-title"><h3>P&amp;L by Window</h3>
+      <span class="meta" id="window-pnl-meta">realized + unrealized mtm</span></div>
+    <table class="window-pnl-table"><thead><tr>
+      <th></th><th class="num">3h</th><th class="num">6h</th><th class="num">12h</th><th class="num">24h</th>
+    </tr></thead>
+    <tbody id="tbody-window-pnl"><tr><td colspan="5" class="empty">loading…</td></tr></tbody></table>
   </div>
 
-  <div class="panel" style="margin-top:16px">
-    <div class="title">Cumulative P&amp;L <span class="meta" id="curve-meta"></span></div>
+  <div class="card" style="margin-bottom: 16px">
+    <div class="card-title"><h3>Cumulative P&amp;L</h3><span class="meta" id="curve-meta"></span></div>
     <div class="chart-wrap tall"><canvas id="chart-curve"></canvas></div>
   </div>
 
-  <div class="grid cols-2" style="margin-top:16px">
-    <div class="panel">
-      <div class="title">Edge Calibration <span class="meta">predicted vs realized $ per trade, by edge bucket</span></div>
+  <div class="grid cols-2">
+    <div class="card">
+      <div class="card-title"><h3>Edge Calibration</h3>
+        <span class="meta">predicted vs realized $ per trade</span></div>
       <div class="chart-wrap"><canvas id="chart-calibration"></canvas></div>
     </div>
-    <div class="panel">
-      <div class="title">Open Positions <span class="meta" id="open-count"></span></div>
-      <div class="scroll">
-        <table>
-          <thead><tr><th>Bet</th><th>Sport</th><th>Side</th><th class="num">Size</th><th class="num">Fill</th><th class="num">Now</th><th class="num">P&amp;L Now</th><th class="num">Max Win</th><th class="num">Edge</th><th>Tip</th><th>Provider</th><th>Opened</th><th class="num">Held</th></tr></thead>
-          <tbody id="tbody-open"><tr><td colspan="13" class="empty">loading...</td></tr></tbody>
-        </table>
-      </div>
+    <div class="card">
+      <div class="card-title"><h3>Open Positions</h3><span class="meta" id="open-count"></span></div>
+      <div class="scroll"><table><thead><tr>
+        <th>Bet</th><th>Sport</th><th>Side</th><th class="num">Size</th>
+        <th class="num">Fill</th><th class="num">Now</th><th class="num">P&amp;L</th>
+        <th class="num">Edge</th><th>Tip</th><th>Provider</th><th class="num">Held</th>
+      </tr></thead>
+      <tbody id="tbody-open"><tr><td colspan="11" class="empty">no positions</td></tr></tbody></table></div>
     </div>
   </div>
 
-  <div class="section-header">What works, what doesn't</div>
+  <h2 class="section">What works, what doesn't</h2>
 
   <div class="grid cols-3">
-    <div class="panel">
-      <div class="title">By Sport</div>
-      <table>
-        <thead><tr><th>Sport</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-        <tbody id="tbody-sport"><tr><td colspan="4" class="empty">none</td></tr></tbody>
-      </table>
-    </div>
-    <div class="panel">
-      <div class="title">Favorite vs Underdog <span class="meta">entry &gt;= 50¢ = favorite</span></div>
-      <table>
-        <thead><tr><th>Side</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-        <tbody id="tbody-favdog"><tr><td colspan="4" class="empty">none</td></tr></tbody>
-      </table>
-    </div>
-    <div class="panel">
-      <div class="title">Home vs Away</div>
-      <table>
-        <thead><tr><th>Side</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-        <tbody id="tbody-side"><tr><td colspan="4" class="empty">none</td></tr></tbody>
-      </table>
-    </div>
+    <div class="card"><div class="card-title"><h3>By Sport</h3></div>
+      <table><thead><tr><th>Sport</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-sport"><tr><td colspan="4" class="empty">no data</td></tr></tbody></table></div>
+    <div class="card"><div class="card-title"><h3>Favorite vs Underdog</h3><span class="meta">entry ≥ 50¢</span></div>
+      <table><thead><tr><th>Side</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-favdog"><tr><td colspan="4" class="empty">no data</td></tr></tbody></table></div>
+    <div class="card"><div class="card-title"><h3>Home vs Away</h3></div>
+      <table><thead><tr><th>Side</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-side"><tr><td colspan="4" class="empty">no data</td></tr></tbody></table></div>
   </div>
 
-  <div class="grid cols-3" style="margin-top:16px">
-    <div class="panel">
-      <div class="title">By Sportsbook Source <span class="meta">does multi-book help?</span></div>
-      <table>
-        <thead><tr><th>Provider</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-        <tbody id="tbody-provider"><tr><td colspan="4" class="empty">none</td></tr></tbody>
-      </table>
-    </div>
-    <div class="panel">
-      <div class="title">By Entry Price</div>
-      <table>
-        <thead><tr><th>Price</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-        <tbody id="tbody-entry"><tr><td colspan="4" class="empty">none</td></tr></tbody>
-      </table>
-    </div>
-    <div class="panel">
-      <div class="title">By Time-to-Tip <span class="meta">when in pregame did we enter</span></div>
-      <table>
-        <thead><tr><th>Window</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-        <tbody id="tbody-tip"><tr><td colspan="4" class="empty">none</td></tr></tbody>
-      </table>
-    </div>
+  <div class="grid cols-3" style="margin-top: 16px">
+    <div class="card"><div class="card-title"><h3>By Provider</h3><span class="meta">multi-book or single?</span></div>
+      <table><thead><tr><th>Provider</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-provider"><tr><td colspan="4" class="empty">no data</td></tr></tbody></table></div>
+    <div class="card"><div class="card-title"><h3>By Entry Price</h3></div>
+      <table><thead><tr><th>Price</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-entry"><tr><td colspan="4" class="empty">no data</td></tr></tbody></table></div>
+    <div class="card"><div class="card-title"><h3>By Time-to-Tip</h3></div>
+      <table><thead><tr><th>Window</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-tip"><tr><td colspan="4" class="empty">no data</td></tr></tbody></table></div>
   </div>
 
-  <div class="grid cols-2" style="margin-top:16px">
-    <div class="panel">
-      <div class="title">By Exit Reason</div>
-      <table>
-        <thead><tr><th>Reason</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-        <tbody id="tbody-exit"><tr><td colspan="4" class="empty">none</td></tr></tbody>
-      </table>
+  <div class="grid cols-2" style="margin-top: 16px">
+    <div class="card"><div class="card-title"><h3>By Exit Reason</h3></div>
+      <table><thead><tr><th>Reason</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-exit"><tr><td colspan="4" class="empty">no data</td></tr></tbody></table></div>
+    <div class="card"><div class="card-title"><h3>By Series</h3></div>
+      <div class="scroll"><table><thead><tr><th>Series</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-series"><tr><td colspan="4" class="empty">no data</td></tr></tbody></table></div></div>
+  </div>
+
+  <div class="card" style="margin-top: 16px">
+    <div class="card-title"><h3>Settlement Backtest</h3>
+      <span class="meta">would we have made more holding to game end?</span></div>
+    <div class="settlement-grid">
+      <div class="item"><div class="lbl">Actual P&amp;L</div>
+        <div class="val" id="bt-actual">—</div><div class="sub">with exits</div></div>
+      <div class="item"><div class="lbl">If Held to Settlement</div>
+        <div class="val" id="bt-settle">—</div><div class="sub">counterfactual</div></div>
+      <div class="item"><div class="lbl">Delta</div>
+        <div class="val" id="bt-delta">—</div><div class="sub" id="bt-delta-sub"></div></div>
     </div>
-    <div class="panel">
-      <div class="title">By Series <span class="meta">drill into specific Kalshi series</span></div>
+    <div class="stoploss-note" id="bt-stoploss"></div>
+  </div>
+
+  <div class="grid cols-2" style="margin-top: 16px">
+    <div class="card"><div class="card-title"><h3>By Hold Duration</h3>
+      <span class="meta">exiting too early on stop_loss noise?</span></div>
+      <table><thead><tr><th>Hold</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-hold"><tr><td colspan="4" class="empty">no data</td></tr></tbody></table></div>
+    <div class="card"><div class="card-title"><h3>By Model Confidence</h3>
+      <span class="meta">calibration check</span></div>
+      <table><thead><tr><th>p_yes</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-confidence"><tr><td colspan="4" class="empty">no data</td></tr></tbody></table></div>
+  </div>
+
+  <div class="grid cols-2" style="margin-top: 16px">
+    <div class="card"><div class="card-title"><h3>A/B Exit Cohorts</h3>
+      <span class="meta">what if every trade used a different exit?</span></div>
+      <table><thead><tr><th>Policy</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-exit-policy"><tr><td colspan="4" class="empty">no data</td></tr></tbody></table></div>
+    <div class="card"><div class="card-title"><h3>By Edge Bucket</h3>
+      <span class="meta">bigger edge → bigger P&amp;L?</span></div>
+      <table><thead><tr><th>Edge</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-edge-bucket"><tr><td colspan="4" class="empty">no data</td></tr></tbody></table></div>
+  </div>
+
+  <div class="grid cols-2" style="margin-top: 16px">
+    <div class="card"><div class="card-title"><h3>By Whale Class</h3>
+      <span class="meta">aggressive vs burst vs resting</span></div>
+      <table><thead><tr><th>Class</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-whale-class"><tr><td colspan="4" class="empty">no whale-boosted trades</td></tr></tbody></table></div>
+    <div class="card"><div class="card-title"><h3>By Whale Magnitude</h3>
+      <span class="meta">bigger signal → bigger P&amp;L?</span></div>
+      <table><thead><tr><th>Bucket</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+      <tbody id="tbody-whale-magnitude"><tr><td colspan="4" class="empty">no whale-boosted trades</td></tr></tbody></table></div>
+  </div>
+
+  <div class="card" style="margin-top: 16px">
+    <div class="card-title"><h3>By Whale Side</h3>
+      <span class="meta">are NO-side whales smarter money?</span></div>
+    <table><thead><tr><th>Side we bet</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+    <tbody id="tbody-whale-side"><tr><td colspan="4" class="empty">no whale-boosted trades</td></tr></tbody></table>
+  </div>
+
+  <div class="card" style="margin-top: 16px">
+    <div class="card-title"><h3>By Side × Entry Price</h3>
+      <span class="meta">YES underdogs vs NO underdogs at same price?</span></div>
+    <table><thead><tr><th>Side × Price</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
+    <tbody id="tbody-side-x-entry"><tr><td colspan="4" class="empty">no data</td></tr></tbody></table>
+  </div>
+
+  <div class="card" style="margin-top: 16px">
+    <div class="card-title"><h3>Kalshi vs Polymarket Spreads</h3>
+      <span class="meta" id="cx-meta">awaiting first snapshot</span></div>
+    <div class="scroll"><table><thead><tr>
+      <th>Kalshi market</th><th>Polymarket question</th>
+      <th class="num">Kalshi YES</th><th class="num">Poly YES</th>
+      <th class="num">Spread</th><th class="num">Match</th><th>Direction</th>
+    </tr></thead>
+    <tbody id="tbody-cross-exchange"><tr><td colspan="7" class="empty">awaiting first snapshot</td></tr></tbody></table></div>
+  </div>
+
+  <div class="card" style="margin-top: 16px">
+    <div class="card-title"><h3>CLV by Sport</h3>
+      <span class="meta">did the line move our way after we entered?</span></div>
+    <table><thead><tr><th>Sport</th><th class="num">N</th><th class="num">Avg CLV</th><th class="num">% Positive</th></tr></thead>
+    <tbody id="tbody-clv-sport"><tr><td colspan="4" class="empty">awaiting tipoff samples</td></tr></tbody></table>
+  </div>
+
+  <h2 class="section">Golf Advisor · beta</h2>
+
+  <div class="grid cols-2">
+    <div class="card">
+      <div class="card-title"><h3>Round-Leader Alerts</h3>
+        <span class="meta" id="golf-leader-meta">live in-play · DataGolf vs DraftKings</span></div>
       <div class="scroll">
-        <table>
-          <thead><tr><th>Series</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-          <tbody id="tbody-series"><tr><td colspan="4" class="empty">none</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <div class="panel" style="margin-top:16px; border-color:#334155;">
-    <div class="title">Settlement Backtest <span class="meta">would we have made more money holding to game end?</span></div>
-    <div class="grid cols-3" style="gap:24px;padding:12px 0">
-      <div>
-        <div class="muted" style="font-size:12px">Actual P&amp;L (with exits)</div>
-        <div id="bt-actual" style="font-size:24px;font-weight:600">—</div>
-      </div>
-      <div>
-        <div class="muted" style="font-size:12px">If Held to Settlement</div>
-        <div id="bt-settle" style="font-size:24px;font-weight:600">—</div>
-      </div>
-      <div>
-        <div class="muted" style="font-size:12px">Delta (held − actual)</div>
-        <div id="bt-delta" style="font-size:24px;font-weight:600">—</div>
-        <div id="bt-delta-sub" class="muted" style="font-size:11px"></div>
-      </div>
-    </div>
-    <div id="bt-stoploss" class="muted" style="font-size:12px;padding:0 0 8px 0"></div>
-  </div>
-
-  <div class="grid cols-2" style="margin-top:16px">
-    <div class="panel">
-      <div class="title">By Hold Duration <span class="meta">are we exiting too early on stop_loss noise?</span></div>
-      <table>
-        <thead><tr><th>Hold</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-        <tbody id="tbody-hold"><tr><td colspan="4" class="empty">no data yet</td></tr></tbody>
-      </table>
-    </div>
-    <div class="panel">
-      <div class="title">By Model Confidence <span class="meta">model p(our side wins) vs realized win rate — calibration</span></div>
-      <table>
-        <thead><tr><th>p_yes bucket</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-        <tbody id="tbody-confidence"><tr><td colspan="4" class="empty">no data yet</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="grid cols-2" style="margin-top:16px">
-    <div class="panel">
-      <div class="title">A/B Exit Cohorts <span class="meta">what if every trade had used a different exit?</span></div>
-      <table>
-        <thead><tr><th>Policy</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-        <tbody id="tbody-exit-policy"><tr><td colspan="4" class="empty">no data yet</td></tr></tbody>
-      </table>
-    </div>
-    <div class="panel">
-      <div class="title">By Edge Bucket <span class="meta">does bigger predicted edge correlate with bigger realized P&amp;L?</span></div>
-      <table>
-        <thead><tr><th>Edge</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-        <tbody id="tbody-edge-bucket"><tr><td colspan="4" class="empty">no data yet</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="grid cols-2" style="margin-top:16px">
-    <div class="panel">
-      <div class="title">By Whale Class <span class="meta">aggressive (price_jump) vs burst (volume) vs resting (book size)</span></div>
-      <table>
-        <thead><tr><th>Class</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-        <tbody id="tbody-whale-class"><tr><td colspan="4" class="empty">no whale-boosted trades yet</td></tr></tbody>
-      </table>
-    </div>
-    <div class="panel">
-      <div class="title">By Whale Magnitude <span class="meta">does bigger whale signal predict bigger P&amp;L within a class?</span></div>
-      <table>
-        <thead><tr><th>Bucket</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-        <tbody id="tbody-whale-magnitude"><tr><td colspan="4" class="empty">no whale-boosted trades yet</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="panel" style="margin-top:16px">
-    <div class="title">By Whale Side
-      <span class="meta">whale-boosted trades only · are NO-side whales smarter money fading retail?</span>
-    </div>
-    <table>
-      <thead><tr><th>Side we bet</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-      <tbody id="tbody-whale-side"><tr><td colspan="4" class="empty">no whale-boosted trades yet</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="panel" style="margin-top:16px">
-    <div class="title">By Side × Entry Price
-      <span class="meta">do YES underdogs win more than NO underdogs at the same price? drives asymmetric min_entry_price tuning</span>
-    </div>
-    <table>
-      <thead><tr><th>Side × Price</th><th class="num">N</th><th class="num">Win%</th><th class="num">P&amp;L</th></tr></thead>
-      <tbody id="tbody-side-x-entry"><tr><td colspan="4" class="empty">no data yet</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="panel" style="margin-top:16px">
-    <div class="title">Kalshi vs Polymarket Spreads
-      <span class="meta" id="cx-meta">awaiting first snapshot</span>
-    </div>
-    <div class="scroll">
-      <table>
-        <thead><tr>
-          <th>Kalshi market</th>
-          <th>Polymarket question</th>
-          <th class="num">Kalshi YES</th>
-          <th class="num">Poly YES</th>
-          <th class="num">Spread</th>
-          <th class="num">Match</th>
-          <th>Direction</th>
+        <table><thead><tr>
+          <th>Golfer</th><th>Pos</th><th class="num">Thru</th>
+          <th>Market</th><th class="num">DK</th><th class="num">DataGolf</th><th class="num">Edge</th>
         </tr></thead>
-        <tbody id="tbody-cross-exchange">
-          <tr><td colspan="7" class="empty">awaiting first snapshot</td></tr>
-        </tbody>
-      </table>
+        <tbody id="tbody-golf-leader"><tr><td colspan="7" class="empty">no qualifying golfers</td></tr></tbody></table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title"><h3>3-Ball / Matchup Edges</h3>
+        <span class="meta" id="golf-3ball-meta">DataGolf vs DraftKings matchup lines</span></div>
+      <div class="scroll">
+        <table><thead><tr>
+          <th>Pick</th><th>Event</th><th class="num">DK</th>
+          <th class="num">DataGolf</th><th class="num">Edge</th>
+        </tr></thead>
+        <tbody id="tbody-golf-3ball"><tr><td colspan="5" class="empty">no +EV legs</td></tr></tbody></table>
+      </div>
     </div>
   </div>
 
-  <div class="panel" style="margin-top:16px">
-    <div class="title">CLV by Sport <span class="meta">did the line move our way after we entered?</span></div>
-    <table>
-      <thead><tr><th>Sport</th><th class="num">N</th><th class="num">Avg CLV</th><th class="num">% Positive</th></tr></thead>
-      <tbody id="tbody-clv-sport"><tr><td colspan="4" class="empty">awaiting tipoff samples</td></tr></tbody>
-    </table>
+  <h2 class="section">Recent activity</h2>
+
+  <div class="card">
+    <div class="card-title"><h3>Recent Trades</h3><span class="meta" id="trades-count"></span></div>
+    <div class="scroll"><table><thead><tr>
+      <th>Bet</th><th>Sport</th><th>Side</th><th class="num">Size</th>
+      <th class="num">Edge</th><th class="num">Fill</th><th class="num">Exit</th>
+      <th class="num">CLV</th><th class="num">P&amp;L</th><th class="num">Fees</th>
+      <th>Opened</th><th class="num">Held</th><th>Tip</th><th>Provider</th><th>Why</th>
+    </tr></thead>
+    <tbody id="tbody-trades"><tr><td colspan="15" class="empty">loading…</td></tr></tbody></table></div>
   </div>
 
-  <div class="section-header">Recent activity</div>
-
-  <div class="panel">
-    <div class="title">Recent Trades <span class="meta" id="trades-count"></span></div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th>Bet</th><th>Sport</th><th>Side</th><th class="num">Size</th><th class="num">Edge</th><th class="num">Fill</th><th class="num">Exit</th><th class="num">CLV</th><th class="num">P&amp;L</th><th class="num">Fees</th><th>Opened</th><th class="num">Held</th><th class="num">Tip</th><th>Provider</th><th>Why</th></tr></thead>
-        <tbody id="tbody-trades"><tr><td colspan="15" class="empty">loading...</td></tr></tbody>
-      </table>
-    </div>
+  <div class="card" style="margin-top: 16px">
+    <div class="card-title"><h3>Daily P&amp;L</h3></div>
+    <table><thead><tr><th>Date</th><th class="num">Trades</th><th class="num">P&amp;L</th></tr></thead>
+    <tbody id="tbody-daily"><tr><td colspan="3" class="empty">loading…</td></tr></tbody></table>
   </div>
 
-  <div class="panel" style="margin-top:16px">
-    <div class="title">Daily P&amp;L</div>
-    <table>
-      <thead><tr><th>Date</th><th class="num">Trades</th><th class="num">P&amp;L</th></tr></thead>
-      <tbody id="tbody-daily"><tr><td colspan="3" class="empty">loading...</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="footer">
-    Auto-refreshes every 15s &middot;
-    <a href="/stats">/stats</a> &middot; <a href="/edge">/edge</a> &middot;
-    <a href="/trades">/trades</a> &middot; <a href="/positions">/positions</a> &middot; <a href="/pnl">/pnl</a>
-  </div>
-
+  <footer class="footer">
+    Auto-refreshes every 15s ·
+    <a href="/stats">/stats</a> · <a href="/trades">/trades</a> ·
+    <a href="/positions">/positions</a> · <a href="/pnl">/pnl</a> ·
+    <a href="/pnl_digest">/pnl_digest</a> · <a href="/cross_exchange">/cross_exchange</a>
+  </footer>
 </div>
+
+<a href="/pnl_digest?send=true" target="_blank" class="fab" title="Send P&L digest to Slack">⚡</a>
 
 <script>
 const fmt$ = n => (n >= 0 ? '+$' : '-$') + Math.abs(n).toFixed(2);
-const fmtTime = iso => {{
-  if (!iso) return '';
-  try {{ return new Date(iso).toLocaleString(undefined, {{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}}); }}
-  catch {{ return iso; }}
-}};
+const fmtTime = iso => {{ if (!iso) return ''; try {{ return new Date(iso).toLocaleString(undefined, {{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}}); }} catch {{ return iso; }} }};
+const fmtClock = iso => {{ if (!iso) return ''; try {{ return new Date(iso).toLocaleTimeString(undefined, {{hour:'2-digit',minute:'2-digit'}}); }} catch {{ return ''; }} }};
 const cls = n => n > 0 ? 'pos' : (n < 0 ? 'neg' : 'muted');
 const sportFromTicker = t => {{
   const s = (t || '').split('-')[0].toUpperCase();
-  return ({{KXNBAGAME:'NBA',KXNFLGAME:'NFL',KXMLBGAME:'MLB',KXNHLGAME:'NHL',KXATPMATCH:'ATP',KXWTAMATCH:'WTA'}})[s] || s;
+  return ({{KXNBAGAME:'NBA',KXNFLGAME:'NFL',KXMLBGAME:'MLB',KXNHLGAME:'NHL',KXATPMATCH:'ATP',KXWTAMATCH:'WTA',KXIPLGAME:'IPL',KXCRICKETTESTMATCH:'TEST',KXWNBAGAME:'WNBA',KXPGATOUR:'PGA'}})[s] || s;
 }};
-// HH:MM in user's local TZ (drops date so the column stays narrow)
-const fmtClock = iso => {{
-  if (!iso) return '';
-  try {{
-    return new Date(iso).toLocaleTimeString(undefined, {{hour:'2-digit',minute:'2-digit'}});
-  }} catch {{ return ''; }}
+const sportTagClass = code => {{
+  const c = (code || '').toLowerCase();
+  if (c === 'atp' || c === 'wta') return 'tag tennis';
+  if (c === 'ipl' || c === 'test') return 'tag cricket';
+  if (c === 'mlb') return 'tag mlb';
+  if (c === 'nhl') return 'tag hockey';
+  if (c === 'nba' || c === 'wnba' || c === 'nfl') return 'tag nba';
+  return 'tag';
 }};
-// Compact duration between two ISO timestamps: "47m", "1h 12m", "3h"
 const fmtHeld = (openIso, closeIso) => {{
   if (!openIso || !closeIso) return '';
   const ms = new Date(closeIso) - new Date(openIso);
@@ -1020,120 +1142,138 @@ const fmtHeld = (openIso, closeIso) => {{
   const h = Math.floor(mins / 60), m = mins % 60;
   return m === 0 ? `${{h}}h` : `${{h}}h ${{m}}m`;
 }};
-// Extract bits we care about from the reason string the model writes.
-// Format examples:
-//   "MLB pregame Pittsburgh@SF | book[odds_api (8 books)] ... |
-//    our=San Francisco(home) p_yes=0.532 | tip in 145min"
-//   "TENNIS pregame Taylor Townsend vs Sara Errani | book[pinnacle] ...
-//    our=Townsend p_yes=0.612 | start in 60min"
 const parseReason = reason => {{
   if (!reason) return {{}};
-  const out = {{}};
-  let m;
+  const out = {{}}; let m;
   if ((m = reason.match(/book\[([^\]]+)\]/))) {{
     const provider = m[1];
-    if (provider.startsWith('pinnacle')) out.provider = 'pinnacle';
-    else if (provider.startsWith('odds_api')) {{
-      out.provider = 'odds_api';
-      const bm = provider.match(/(\d+)\s+books/);
-      if (bm) out.books = bm[1];
-    }} else if (provider.startsWith('espn')) out.provider = 'espn';
+    if (provider.startsWith('pinnacle')) out.provider = provider.includes(':') ? provider : 'pinnacle';
+    else if (provider.startsWith('odds_api')) {{ out.provider = 'odds_api';
+      const bm = provider.match(/(\d+)\s+books/); if (bm) out.books = bm[1]; }}
+    else if (provider.startsWith('espn')) out.provider = 'espn';
+    else if (provider.startsWith('datagolf')) out.provider = 'datagolf';
     else out.provider = provider;
   }}
-  if ((m = reason.match(/tip in (-?\d+)min/)) || (m = reason.match(/start in (-?\d+)min/))) {{
-    out.minsToTip = parseInt(m[1]);
-  }}
-  // Matchup — take everything between "pregame" and the first " | "
-  if ((m = reason.match(/pregame\s+(.+?)\s+\|/))) {{
-    out.matchup = m[1].trim();
-  }}
-  // Our side (team or player name)
-  if ((m = reason.match(/our=([^()|]+?)(?:\(|\s+p_yes|\s*\|)/))) {{
-    out.ourSide = m[1].trim();
-  }}
-  // Home/away tag for team sports (in parens after our=)
-  if ((m = reason.match(/our=[^()|]+\((home|away)\)/))) {{
-    out.ourLoc = m[1];
-  }}
-  // Model probability we computed for our side
+  if ((m = reason.match(/tip in (-?\d+)min/)) || (m = reason.match(/start in (-?\d+)min/))) out.minsToTip = parseInt(m[1]);
+  if ((m = reason.match(/pregame\s+(.+?)\s+\|/))) out.matchup = m[1].trim();
+  if ((m = reason.match(/our=([^()|]+?)(?:\(|\s+p_yes|\s*\|)/))) out.ourSide = m[1].trim();
+  if ((m = reason.match(/our=[^()|]+\((home|away)\)/))) out.ourLoc = m[1];
   if ((m = reason.match(/p_yes=([\d.]+)/))) out.pYes = parseFloat(m[1]);
   return out;
 }};
-// Build a human-readable trade label like "PHI 76ers (home) vs NYK"
-const fmtMatchup = (r) => {{
-  const meta = parseReason(r.reason);
-  if (meta.matchup && meta.ourSide) {{
-    const loc = meta.ourLoc ? ` (${{meta.ourLoc}})` : '';
-    return `${{meta.ourSide}}${{loc}} — ${{meta.matchup}}`;
-  }}
-  return '';
-}};
+function feePerContract(price) {{ const p = Math.max(0.01, Math.min(0.99, price));
+  return Math.ceil(0.07 * p * (1 - p) * 100) / 100; }}
 
 let curveChart, calibChart;
-
 function buildCurveChart(curve) {{
   const ctx = document.getElementById('chart-curve');
   const labels = curve.map(p => fmtTime(p.ts));
   const values = curve.map(p => p.cum);
-  const tooltips = curve.map(p => p.ticker + ' ' + (p.pnl >= 0 ? '+' : '') + p.pnl.toFixed(2));
-  if (curveChart) {{
-    curveChart.data.labels = labels;
-    curveChart.data.datasets[0].data = values;
-    curveChart.data.datasets[0].tooltips = tooltips;
-    curveChart.update('none'); return;
-  }}
-  curveChart = new Chart(ctx, {{
-    type: 'line',
-    data: {{ labels, datasets: [{{
-      label: 'Cumulative P&L', data: values, tooltips,
-      borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.08)',
-      borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, tension: 0.18, fill: true,
-    }}] }},
-    options: {{
-      responsive: true, maintainAspectRatio: false, animation: false,
-      plugins: {{
-        legend: {{ display: false }},
-        tooltip: {{ callbacks: {{
-          label: ctx => {{
-            const tt = ctx.dataset.tooltips ? ctx.dataset.tooltips[ctx.dataIndex] : '';
-            return [`Cum: ${{fmt$(ctx.parsed.y)}}`, tt].filter(Boolean);
-          }}
-        }} }}
-      }},
-      scales: {{
-        x: {{ ticks: {{ color: '#8a93a0', maxRotation: 0, autoSkip: true, maxTicksLimit: 8 }}, grid: {{ color: 'rgba(255,255,255,0.04)' }} }},
-        y: {{ ticks: {{ color: '#8a93a0', callback: v => '$' + v.toFixed(0) }}, grid: {{ color: 'rgba(255,255,255,0.04)' }} }},
-      }}
-    }}
-  }});
+  if (curveChart) {{ curveChart.data.labels = labels; curveChart.data.datasets[0].data = values; curveChart.update('none'); return; }}
+  curveChart = new Chart(ctx, {{ type: 'line',
+    data: {{ labels, datasets: [{{ label: 'Cumulative P&L', data: values,
+      borderColor: '#3DA5F5', backgroundColor: 'rgba(61,165,245,0.08)',
+      borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, tension: 0.18, fill: true }}] }},
+    options: {{ responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: {{ legend: {{ display: false }},
+        tooltip: {{ backgroundColor: '#1E242D', borderColor: '#2A313A', borderWidth: 1,
+          titleColor: '#FFF', bodyColor: '#9CA3AF', padding: 10, cornerRadius: 8, displayColors: false,
+          callbacks: {{ title: i => i[0].label, label: i => '$' + i.parsed.y.toFixed(2) }} }} }},
+      scales: {{ x: {{ ticks: {{ color: '#5E6470', font: {{ size: 10 }} }}, grid: {{ color: 'transparent' }} }},
+        y: {{ ticks: {{ color: '#5E6470', font: {{ size: 10 }}, callback: v => '$' + v.toFixed(0) }},
+          grid: {{ color: 'rgba(42,49,58,0.5)', drawBorder: false }} }} }} }} }});
+}}
+function buildCalibChart(rows) {{
+  const ctx = document.getElementById('chart-calibration');
+  const labels = rows.map(r => r.bucket_pp + 'bp');
+  const predicted = rows.map(r => r.predicted);
+  const realized = rows.map(r => r.realized);
+  if (calibChart) {{ calibChart.data.labels = labels; calibChart.data.datasets[0].data = predicted; calibChart.data.datasets[1].data = realized; calibChart.update('none'); return; }}
+  calibChart = new Chart(ctx, {{ type: 'bar',
+    data: {{ labels, datasets: [
+      {{ label: 'Predicted', data: predicted, backgroundColor: 'rgba(61,165,245,0.6)', borderRadius: 4 }},
+      {{ label: 'Realized', data: realized, backgroundColor: 'rgba(61,214,140,0.6)', borderRadius: 4 }}, ] }},
+    options: {{ responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: {{ legend: {{ position: 'top', labels: {{ color: '#9CA3AF', font: {{ size: 11 }} }} }},
+        tooltip: {{ backgroundColor: '#1E242D', borderColor: '#2A313A', borderWidth: 1,
+          titleColor: '#FFF', bodyColor: '#9CA3AF', padding: 10, cornerRadius: 8 }} }},
+      scales: {{ x: {{ ticks: {{ color: '#5E6470', font: {{ size: 10 }} }}, grid: {{ color: 'transparent' }} }},
+        y: {{ ticks: {{ color: '#5E6470', font: {{ size: 10 }}, callback: v => '$' + v.toFixed(0) }},
+          grid: {{ color: 'rgba(42,49,58,0.5)', drawBorder: false }} }} }} }} }});
 }}
 
-function buildCalibChart(buckets) {{
-  const ctx = document.getElementById('chart-calibration');
-  const labels = buckets.map(b => b.bucket_pp + 'bp');
-  const predicted = buckets.map(b => b.predicted);
-  const realized = buckets.map(b => b.realized);
-  if (calibChart) {{
-    calibChart.data.labels = labels;
-    calibChart.data.datasets[0].data = predicted;
-    calibChart.data.datasets[1].data = realized;
-    calibChart.update('none'); return;
+function setDial(arcId, valueId, unitId, subId, value, opts) {{
+  const DASH = 528;
+  const arc = document.getElementById(arcId);
+  const val = document.getElementById(valueId);
+  const unit = unitId ? document.getElementById(unitId) : null;
+  const sub  = subId  ? document.getElementById(subId)  : null;
+  if (opts.format === 'money') {{
+    val.textContent = (value >= 0 ? '+$' : '-$') + Math.abs(value).toFixed(2);
+    val.className = 'dial-value ' + (value > 0 ? 'pos' : value < 0 ? 'neg' : '');
+    arc.setAttribute('stroke', value > 0 ? 'var(--success)' : value < 0 ? 'var(--danger)' : 'var(--primary)');
+  }} else if (opts.format === 'percent') {{
+    val.textContent = (value * 100).toFixed(0); val.className = 'dial-value';
+    arc.setAttribute('stroke', value >= 0.55 ? 'var(--success)' : value >= 0.45 ? 'var(--primary)' : 'var(--danger)');
+  }} else {{
+    val.textContent = value; val.className = 'dial-value';
+    arc.setAttribute('stroke', 'var(--primary)');
   }}
-  calibChart = new Chart(ctx, {{
-    type: 'bar',
-    data: {{ labels, datasets: [
-      {{ label: 'Predicted $', data: predicted, backgroundColor: 'rgba(96,165,250,0.55)', borderRadius: 4 }},
-      {{ label: 'Realized $',  data: realized,  backgroundColor: 'rgba(74,222,128,0.55)', borderRadius: 4 }},
-    ] }},
-    options: {{
-      responsive: true, maintainAspectRatio: false, animation: false,
-      plugins: {{ legend: {{ labels: {{ color: '#e8ecef', boxWidth: 12, font: {{ size: 11 }} }} }} }},
-      scales: {{
-        x: {{ ticks: {{ color: '#8a93a0' }}, grid: {{ color: 'rgba(255,255,255,0.04)' }} }},
-        y: {{ ticks: {{ color: '#8a93a0', callback: v => '$' + v.toFixed(0) }}, grid: {{ color: 'rgba(255,255,255,0.04)' }} }},
-      }}
-    }}
-  }});
+  if (unit && opts.unit !== undefined) unit.textContent = opts.unit;
+  if (sub && opts.sub !== undefined) sub.textContent = opts.sub;
+  const ratio = Math.max(0, Math.min(1, opts.fillRatio || 0));
+  arc.setAttribute('stroke-dashoffset', DASH * (1 - ratio));
+}}
+
+function updateDials(stats) {{
+  const n = stats.n_trades || 0;
+  const pnl = stats.total_pnl || 0;
+  const wr = stats.win_rate || 0;
+  const open = stats.open_positions || 0;
+  setDial('arc-pnl', 'dial-pnl-value', 'dial-pnl-unit', 'dial-pnl-sub', pnl, {{
+    format: 'money', unit: '', fillRatio: Math.min(Math.abs(pnl) / 200, 1),
+    sub: n > 0 ? `${{n}} trades · avg ${{fmt$(stats.avg_pnl||0)}}/trade` : 'awaiting first trade' }});
+  setDial('arc-winrate', 'dial-winrate-value', null, 'dial-winrate-sub', wr, {{
+    format: 'percent', fillRatio: wr,
+    sub: n > 0 ? `${{stats.n_wins||0}}W · ${{stats.n_losses||0}}L` : '—' }});
+  setDial('arc-positions', 'dial-positions-value', null, 'dial-positions-sub', open, {{
+    format: 'count', fillRatio: Math.min(open / 15, 1), sub: 'capacity 15' }});
+}}
+
+function renderKpis(stats) {{
+  document.getElementById('kpi-bestworst').innerHTML =
+    `<span class="pos">${{fmt$(stats.best_trade||0)}}</span> / <span class="neg">${{fmt$(stats.worst_trade||0)}}</span>`;
+  document.getElementById('kpi-edge').textContent = (stats.avg_edge_bp||0).toFixed(1) + 'bp';
+  const clv = stats.avg_clv_bp || 0;
+  const clvEl = document.getElementById('kpi-clv');
+  if (stats.n_clv > 0) {{
+    clvEl.className = 'value ' + cls(clv);
+    clvEl.textContent = (clv >= 0 ? '+' : '') + clv.toFixed(1) + 'bp';
+    document.getElementById('kpi-clv-sub').textContent = `${{stats.n_clv}} samples · ${{(stats.pct_positive_clv||0).toFixed(0)}}% positive`;
+  }} else {{
+    clvEl.textContent = '—';
+    document.getElementById('kpi-clv-sub').textContent = 'awaiting tipoff samples';
+  }}
+  document.getElementById('kpi-trades').textContent = stats.n_trades || 0;
+  document.getElementById('kpi-trades-sub').textContent =
+    `${{stats.n_wins||0}}W · ${{stats.n_losses||0}}L · ${{((stats.win_rate||0)*100).toFixed(0)}}% wr`;
+}}
+
+function renderBucketTable(tbodyId, rows) {{
+  const tb = document.getElementById(tbodyId);
+  if (!rows || !rows.length) {{ tb.innerHTML = '<tr><td colspan="4" class="empty">no data yet</td></tr>'; return; }}
+  tb.innerHTML = rows.map(r => `<tr>
+    <td>${{r.key}}</td><td class="num">${{r.n}}</td>
+    <td class="num">${{(r.win_rate*100).toFixed(0)}}%</td>
+    <td class="num ${{cls(r.pnl)}}">${{fmt$(r.pnl)}}</td></tr>`).join('');
+}}
+function renderClvTable(tbodyId, rows) {{
+  const tb = document.getElementById(tbodyId);
+  if (!rows || !rows.length) {{ tb.innerHTML = '<tr><td colspan="4" class="empty">awaiting tipoff samples</td></tr>'; return; }}
+  tb.innerHTML = rows.map(r => `<tr>
+    <td>${{r.key}}</td><td class="num">${{r.n}}</td>
+    <td class="num ${{cls(r.avg_clv_bp)}}">${{(r.avg_clv_bp>=0?'+':'')}}${{r.avg_clv_bp.toFixed(1)}}bp</td>
+    <td class="num">${{r.pct_positive.toFixed(0)}}%</td></tr>`).join('');
 }}
 
 function renderWindowedPnl(windows, openMtm) {{
@@ -1141,59 +1281,26 @@ function renderWindowedPnl(windows, openMtm) {{
   const meta = document.getElementById('window-pnl-meta');
   if (!windows || !windows.length) {{
     tb.innerHTML = '<tr><td colspan="5" class="empty">no closed trades yet</td></tr>';
-    if (openMtm && openMtm.n_open_total > 0) {{
-      meta.textContent = `${{openMtm.n_open_marked}}/${{openMtm.n_open_total}} open positions marked · `
-        + `${{(openMtm.unrealized_usd >= 0 ? '+' : '')}}$${{openMtm.unrealized_usd.toFixed(2)}} unrealized`;
-    }}
-    return;
+    meta.textContent = openMtm && openMtm.n_open_total > 0
+      ? `${{openMtm.n_open_marked}}/${{openMtm.n_open_total}} marked · ${{fmt$(openMtm.unrealized_usd||0)}} unrealized`
+      : 'awaiting trades'; return;
   }}
-  const unrealized = openMtm ? openMtm.unrealized_usd : 0;
+  const unr = openMtm ? openMtm.unrealized_usd : 0;
   const nMarked = openMtm ? openMtm.n_open_marked : 0;
-  const nTotal  = openMtm ? openMtm.n_open_total : 0;
-  // The unrealized cell is the SAME for every window (it's a current snapshot).
-  // We still render it in each column so the Net row math is obvious.
-  const unrealCell = `<span class="${{cls(unrealized)}}">${{fmt$(unrealized)}}</span>`;
-  meta.textContent = nTotal
-    ? `${{nMarked}}/${{nTotal}} open positions marked-to-market`
-    : 'no open positions';
-  const cell = (w, key, signed) => {{
-    const v = w[key];
-    if (v === 0 || v == null) return '<span class="muted">—</span>';
-    return signed
-      ? `<span class="${{cls(v)}}">${{fmt$(v)}}</span>`
-      : v.toString();
-  }};
+  const nTotal = openMtm ? openMtm.n_open_total : 0;
+  meta.textContent = nTotal ? `${{nMarked}}/${{nTotal}} open positions marked-to-market` : 'no open positions';
+  const unrealCell = `<span class="${{cls(unr)}}">${{fmt$(unr)}}</span>`;
   const rows = [
-    {{ label: 'Closed N',   fn: w => w.n.toString() }},
-    {{ label: 'Realized',   fn: w => cell(w, 'realized_usd', true) }},
+    {{ label: 'Closed N', fn: w => `<span>${{w.n}}</span>` }},
+    {{ label: 'W / L', fn: w => `<span class="muted">${{w.wins}}/${{w.losses}}</span>` }},
+    {{ label: 'Realized', fn: w => `<span class="${{cls(w.realized_usd)}}">${{fmt$(w.realized_usd)}}</span>` }},
     {{ label: 'Unrealized', fn: _w => unrealCell }},
-    {{ label: 'Net',        fn: w => {{
-      const net = (w.realized_usd || 0) + unrealized;
-      return `<span class="${{cls(net)}}">${{fmt$(net)}}</span>`;
-    }} }},
+    {{ label: 'Net', fn: w => {{ const net = (w.realized_usd || 0) + unr;
+      return `<span class="${{cls(net)}}">${{fmt$(net)}}</span>`; }} }},
   ];
-  tb.innerHTML = rows.map(r => `
-    <tr>
-      <td class="muted">${{r.label}}</td>
-      <td class="num">${{r.fn(windows[0])}}</td>
-      <td class="num">${{r.fn(windows[1])}}</td>
-      <td class="num">${{r.fn(windows[2])}}</td>
-      <td class="num">${{r.fn(windows[3])}}</td>
-    </tr>`).join('');
-}}
-
-function renderBucketTable(tbodyId, rows) {{
-  const tb = document.getElementById(tbodyId);
-  if (!rows || !rows.length) {{
-    tb.innerHTML = '<tr><td colspan="4" class="empty">no data yet</td></tr>'; return;
-  }}
-  tb.innerHTML = rows.map(r => `
-    <tr>
-      <td>${{r.key}}</td>
-      <td class="num">${{r.n}}</td>
-      <td class="num">${{(r.win_rate*100).toFixed(0)}}%</td>
-      <td class="num ${{cls(r.pnl)}}">${{fmt$(r.pnl)}}</td>
-    </tr>`).join('');
+  tb.innerHTML = rows.map(r => `<tr><td>${{r.label}}</td>
+    <td class="num">${{r.fn(windows[0])}}</td><td class="num">${{r.fn(windows[1])}}</td>
+    <td class="num">${{r.fn(windows[2])}}</td><td class="num">${{r.fn(windows[3])}}</td></tr>`).join('');
 }}
 
 function renderCrossExchange(snap) {{
@@ -1201,23 +1308,13 @@ function renderCrossExchange(snap) {{
   const meta = document.getElementById('cx-meta');
   if (!snap || !snap.spreads || !snap.spreads.length) {{
     tb.innerHTML = '<tr><td colspan="7" class="empty">no spreads found</td></tr>';
-    if (snap && snap.ts) {{
-      meta.textContent = `last snapshot ${{fmtTime(snap.ts)}} — ` +
-        `Kalshi ${{snap.n_kalshi}} / Polymarket ${{snap.n_polymarket}}`;
-    }} else {{
-      meta.textContent = 'awaiting first snapshot';
-    }}
-    return;
+    meta.textContent = snap && snap.ts
+      ? `last snapshot ${{fmtTime(snap.ts)}} — Kalshi ${{snap.n_kalshi}} / Polymarket ${{snap.n_polymarket}}`
+      : 'awaiting first snapshot'; return;
   }}
-  meta.textContent = `last snapshot ${{fmtTime(snap.ts)}} — ` +
-    `Kalshi ${{snap.n_kalshi}} / Polymarket ${{snap.n_polymarket}} — ` +
-    `${{snap.spreads.length}} spreads`;
+  meta.textContent = `last snapshot ${{fmtTime(snap.ts)}} — Kalshi ${{snap.n_kalshi}} / Polymarket ${{snap.n_polymarket}} — ${{snap.spreads.length}} spreads`;
   tb.innerHTML = snap.spreads.map(s => {{
-    const sp = s.spread_pp;
-    const pp = (sp >= 0 ? '+' : '') + (sp * 100).toFixed(1) + 'pp';
-    const dirShort = (s.arb_direction || '')
-      .replace(/_/g, ' ')
-      .replace('buy ', '');
+    const sp = s.spread_pp; const pp = (sp >= 0 ? '+' : '') + (sp * 100).toFixed(1) + 'pp';
     return `<tr>
       <td class="ticker" title="${{s.kalshi_ticker}}">${{s.kalshi_title || s.kalshi_ticker}}</td>
       <td title="${{s.polymarket_slug}}">${{s.polymarket_question}}</td>
@@ -1225,283 +1322,223 @@ function renderCrossExchange(snap) {{
       <td class="num">${{(s.polymarket_yes_price * 100).toFixed(0)}}¢</td>
       <td class="num ${{cls(sp)}}">${{pp}}</td>
       <td class="num">${{(s.match_score * 100).toFixed(0)}}%</td>
-      <td class="muted">${{dirShort}}</td>
+      <td class="muted">${{(s.arb_direction || '').replace(/_/g,' ').replace('buy ','')}}</td>
     </tr>`;
   }}).join('');
-}}
-
-function renderClvTable(tbodyId, rows) {{
-  const tb = document.getElementById(tbodyId);
-  if (!rows || !rows.length) {{
-    tb.innerHTML = '<tr><td colspan="4" class="empty">awaiting tipoff samples</td></tr>'; return;
-  }}
-  tb.innerHTML = rows.map(r => `
-    <tr>
-      <td>${{r.key}}</td>
-      <td class="num">${{r.n}}</td>
-      <td class="num ${{cls(r.avg_clv_bp)}}">${{(r.avg_clv_bp>=0?'+':'')}}${{r.avg_clv_bp.toFixed(1)}}bp</td>
-      <td class="num">${{r.pct_positive.toFixed(0)}}%</td>
-    </tr>`).join('');
-}}
-
-// Kalshi fee = ceil(0.07 * p * (1-p) * 100) / 100 per contract.
-// Used to estimate P&L net of fees for open positions.
-function feePerContract(price) {{
-  const p = Math.max(0.01, Math.min(0.99, price));
-  const raw = 0.07 * p * (1 - p);
-  return Math.ceil(raw * 100) / 100;
 }}
 
 function renderOpen(positions) {{
   document.getElementById('open-count').textContent = positions.length + ' open';
   const tb = document.getElementById('tbody-open');
-  if (!positions.length) {{ tb.innerHTML = '<tr><td colspan="13" class="empty">none</td></tr>'; return; }}
-  const nowIso = new Date().toISOString();
+  if (!positions.length) {{ tb.innerHTML = '<tr><td colspan="11" class="empty">no positions</td></tr>'; return; }}
   tb.innerHTML = positions.map(p => {{
     const meta = parseReason(p.reason);
-    // Bet label: "Phillies (home)" or "Townsend" — what we actually backed.
+    const sport = sportFromTicker(p.ticker);
+    const sportTag = `<span class="${{sportTagClass(sport)}}">${{sport}}</span>`;
+    const sideTag = p.side === 'yes' ? `<span class="pill info">YES</span>` : `<span class="pill warn">NO</span>`;
+    const fill = (p.fill_price || 0);
+    const mid = p.current_mid;
+    const nowCell = (mid != null) ? `<span class="${{cls(mid - fill)}}">${{(mid * 100).toFixed(0)}}¢</span>` : '<span class="muted">—</span>';
+    let pnlNow = '<span class="muted">—</span>';
+    if (mid != null) {{
+      const contracts = (p.size_usd || 0) / Math.max(fill, 0.01);
+      const grossPnl = (mid - fill) * contracts;
+      const fee = feePerContract(mid) * contracts;
+      const net = grossPnl - fee;
+      pnlNow = `<span class="${{cls(net)}}">${{fmt$(net)}}</span>`;
+    }}
+    const tip = (meta.minsToTip != null)
+      ? (meta.minsToTip < 60 ? meta.minsToTip + 'm' : (meta.minsToTip/60).toFixed(1)+'h')
+      : ((p.reason || '').includes('late-game') ? '<span class="muted">live</span>' : '<span class="muted">—</span>');
+    const provider = meta.provider || '—';
+    const held = fmtHeld(p.opened_ts, new Date().toISOString());
     let betLabel = meta.ourSide || p.ticker.split('-').pop() || '?';
     if (meta.ourLoc) betLabel += ` <span class="muted">(${{meta.ourLoc}})</span>`;
     if (meta.matchup) betLabel += `<br><span class="muted" style="font-size:11px">${{meta.matchup}}</span>`;
-    // "Tip" cell: minutes-to-tipoff if pregame, "live" if the
-    // InGameSportsModel fired (reason contains "late-game"), "—" otherwise.
-    const tipCell = (meta.minsToTip != null)
-      ? (meta.minsToTip < 60 ? meta.minsToTip + 'm' : (meta.minsToTip/60).toFixed(1)+'h')
-      : ((p.reason || '').includes('late-game')
-          ? '<span class="muted">live</span>'
-          : '<span class="muted">—</span>');
-    const provCell = meta.provider
-      ? (meta.books ? `${{meta.provider}} <span class="muted">(${{meta.books}})</span>` : meta.provider)
-      : '<span class="muted">—</span>';
-
-    // P&L math — both fill_price and current_mid are side-adjusted, so
-    // pnl = (mid - fill) * contracts regardless of yes/no. Fees are
-    // estimated for both entry and (would-be) exit.
-    const fill = p.fill_price || 0;
-    const ctr  = p.contracts || 0;
-    const entryFee = feePerContract(fill) * ctr;
-    let nowCell, pnlNowCell, maxCell;
-    if (p.current_mid != null && p.current_mid > 0 && p.current_mid < 1) {{
-      const mid = p.current_mid;
-      const exitFee = feePerContract(mid) * ctr;
-      const pnlNow = (mid - fill) * ctr - entryFee - exitFee;
-      nowCell = mid.toFixed(2);
-      pnlNowCell = `<span class="${{cls(pnlNow)}}">${{fmt$(pnlNow)}}</span>`;
-    }} else {{
-      nowCell = '<span class="muted">—</span>';
-      pnlNowCell = '<span class="muted">—</span>';
-    }}
-    // Max win = if our side resolves YES at $1, no exit fee.
-    const maxProfit = (1 - fill) * ctr - entryFee;
-    maxCell = `<span class="pos">${{fmt$(maxProfit)}}</span>`;
-
-    const reasonAttr = p.reason ? ` title="${{(p.reason||'').replace(/"/g,'&quot;')}}"` : '';
-    return `
-    <tr${{reasonAttr}}>
-      <td>${{betLabel}}</td>
-      <td>${{sportFromTicker(p.ticker)}}</td>
-      <td>${{p.side}}</td>
+    return `<tr><td>${{betLabel}}</td><td>${{sportTag}}</td><td>${{sideTag}}</td>
       <td class="num">$${{(p.size_usd||0).toFixed(0)}}</td>
-      <td class="num">${{fill.toFixed(2)}}</td>
-      <td class="num">${{nowCell}}</td>
-      <td class="num">${{pnlNowCell}}</td>
-      <td class="num">${{maxCell}}</td>
-      <td class="num">${{((p.edge||0)*100).toFixed(1)}}bp</td>
-      <td class="num">${{tipCell}}</td>
-      <td class="muted">${{provCell}}</td>
-      <td class="muted">${{fmtClock(p.opened_ts)}}</td>
-      <td class="num muted">${{fmtHeld(p.opened_ts, nowIso)}}</td>
-    </tr>`;
+      <td class="num">${{(fill*100).toFixed(0)}}¢</td>
+      <td class="num">${{nowCell}}</td><td class="num">${{pnlNow}}</td>
+      <td class="num muted">${{((p.edge||0)*100).toFixed(1)}}bp</td>
+      <td>${{tip}}</td><td class="muted">${{provider}}</td>
+      <td class="num muted">${{held}}</td></tr>`;
   }}).join('');
 }}
 
 function renderTrades(rows) {{
   const tb = document.getElementById('tbody-trades');
   const closed = rows.filter(r => r.closed_ts && r.pnl_usd != null);
-  if (!closed.length) {{
-    document.getElementById('trades-count').textContent = '0 shown';
-    tb.innerHTML = '<tr><td colspan="9" class="empty">no closed trades yet</td></tr>'; return;
-  }}
-  const safe = closed.filter(r => Math.abs(r.pnl_usd) <= Math.max(3 * (r.size_usd||0), 200));
-  // Dedup churn: collapse exact-duplicate rows (same ticker/side/fill/exit/pnl)
-  // into one row with a count. Pre-fix data had this happen ~13x per game.
-  const seen = new Map();
-  for (const r of safe) {{
-    const key = [r.ticker, r.side, r.fill_price, r.exit_price, r.pnl_usd, r.exit_reason].join('|');
-    const prev = seen.get(key);
-    if (prev) {{ prev._dup += 1; }}
-    else {{ seen.set(key, {{ ...r, _dup: 1 }}); }}
-  }}
-  const deduped = [...seen.values()];
-  document.getElementById('trades-count').textContent =
-    deduped.length + ' unique · ' + safe.length + ' total';
-  tb.innerHTML = deduped.slice(0, 50).map(r => {{
-    // CLV = (clv_price - fill_price). Positive when the line moved
-    // toward our fill (good — we got a better entry than close). null
-    // until the sampler runs ~5 min before tipoff.
-    const clvDelta = (r.clv_price != null && r.fill_price != null)
-      ? (r.clv_price - r.fill_price) : null;
-    const clvCell = (clvDelta != null)
+  document.getElementById('trades-count').textContent = `${{closed.length}} closed`;
+  if (!closed.length) {{ tb.innerHTML = '<tr><td colspan="15" class="empty">no closed trades</td></tr>'; return; }}
+  tb.innerHTML = closed.map(r => {{
+    const meta = parseReason(r.reason);
+    const sport = sportFromTicker(r.ticker);
+    const sportTag = `<span class="${{sportTagClass(sport)}}">${{sport}}</span>`;
+    const sideTag = r.side === 'yes' ? `<span class="pill info">YES</span>` : `<span class="pill warn">NO</span>`;
+    const clvDelta = (r.clv_price != null && r.fill_price != null) ? (r.clv_price - r.fill_price) : null;
+    const clvCell = clvDelta != null
       ? `<span class="${{cls(clvDelta)}}">${{(clvDelta*100>=0?'+':'')}}${{(clvDelta*100).toFixed(1)}}bp</span>`
       : '<span class="muted">—</span>';
-    const dupBadge = (r._dup > 1) ? ` <span class="muted">×${{r._dup}}</span>` : '';
-    const meta = parseReason(r.reason);
-    // "Tip" cell: minutes-to-tipoff if pregame, "live" if the
-    // InGameSportsModel fired (reason contains "late-game"), "—" otherwise.
     const tipCell = (meta.minsToTip != null)
       ? (meta.minsToTip < 60 ? meta.minsToTip + 'm' : (meta.minsToTip/60).toFixed(1)+'h')
-      : ((r.reason || '').includes('late-game')
-          ? '<span class="muted">live</span>'
-          : '<span class="muted">—</span>');
-    const provCell = meta.provider
-      ? (meta.books ? `${{meta.provider}} <span class="muted">(${{meta.books}})</span>` : meta.provider)
-      : '<span class="muted">—</span>';
-    // Full reason string available on row hover for deep-dive
-    const reasonAttr = r.reason ? ` title="${{(r.reason||'').replace(/"/g,'&quot;')}}"` : '';
-    // Bet label same as open positions: parsed team/player + matchup subtitle
+      : ((r.reason || '').includes('late-game') ? '<span class="muted">live</span>' : '<span class="muted">—</span>');
     let betLabel = meta.ourSide || r.ticker.split('-').pop() || '?';
     if (meta.ourLoc) betLabel += ` <span class="muted">(${{meta.ourLoc}})</span>`;
     if (meta.matchup) betLabel += `<br><span class="muted" style="font-size:11px">${{meta.matchup}}</span>`;
-    if (r._dup > 1) betLabel += ` <span class="muted">×${{r._dup}}</span>`;
-    return `
-    <tr${{reasonAttr}}>
-      <td>${{betLabel}}</td>
-      <td>${{sportFromTicker(r.ticker)}}</td>
-      <td>${{r.side}}</td>
+    return `<tr><td>${{betLabel}}</td><td>${{sportTag}}</td><td>${{sideTag}}</td>
       <td class="num">$${{(r.size_usd||0).toFixed(0)}}</td>
-      <td class="num">${{((r.edge||0)*100).toFixed(1)}}bp</td>
-      <td class="num">${{(r.fill_price||0).toFixed(2)}}</td>
-      <td class="num">${{(r.exit_price||0).toFixed(2)}}</td>
+      <td class="num muted">${{((r.edge||0)*100).toFixed(1)}}bp</td>
+      <td class="num">${{((r.fill_price||0)*100).toFixed(0)}}¢</td>
+      <td class="num">${{((r.exit_price||0)*100).toFixed(0)}}¢</td>
       <td class="num">${{clvCell}}</td>
       <td class="num ${{cls(r.pnl_usd)}}">${{fmt$(r.pnl_usd)}}</td>
       <td class="num muted">$${{(r.fees_usd||0).toFixed(2)}}</td>
       <td class="muted">${{fmtClock(r.opened_ts)}}</td>
       <td class="num muted">${{fmtHeld(r.opened_ts, r.closed_ts)}}</td>
-      <td class="num muted">${{tipCell}}</td>
-      <td class="muted">${{provCell}}</td>
-      <td class="muted">${{r.exit_reason||''}}</td>
-    </tr>`;
+      <td>${{tipCell}}</td><td class="muted">${{meta.provider || '—'}}</td>
+      <td class="muted">${{r.exit_reason || ''}}</td></tr>`;
   }}).join('');
 }}
 
-function renderDaily(dailyMap) {{
+function renderDaily(daily) {{
   const tb = document.getElementById('tbody-daily');
-  const entries = Object.entries(dailyMap || {{}})
-    .filter(([d, v]) => Math.abs(v.pnl||0) <= 1000)
-    .sort((a,b) => b[0].localeCompare(a[0]));
-  if (!entries.length) {{ tb.innerHTML = '<tr><td colspan="3" class="empty">no closed trades yet</td></tr>'; return; }}
-  tb.innerHTML = entries.map(([d, v]) => `
-    <tr><td>${{d}}</td><td class="num">${{v.n}}</td><td class="num ${{cls(v.pnl)}}">${{fmt$(v.pnl)}}</td></tr>
-  `).join('');
+  const dates = Object.keys(daily).sort().reverse();
+  if (!dates.length) {{ tb.innerHTML = '<tr><td colspan="3" class="empty">no daily data</td></tr>'; return; }}
+  tb.innerHTML = dates.map(d => {{ const row = daily[d];
+    return `<tr><td>${{d}}</td><td class="num">${{row.n}}</td><td class="num ${{cls(row.pnl)}}">${{fmt$(row.pnl)}}</td></tr>`;
+  }}).join('');
 }}
 
-function renderKpis(s) {{
-  const pnl = s.total_pnl || 0;
-  const e1 = document.getElementById('kpi-pnl');
-  e1.textContent = fmt$(pnl);
-  e1.parentElement.classList.toggle('pos', pnl > 0);
-  e1.parentElement.classList.toggle('neg', pnl < 0);
-  document.getElementById('kpi-pnl-sub').textContent = (s.filtered_out > 0)
-    ? `excluded ${{s.filtered_out}} corrupt trades` : 'clean trades only';
-  document.getElementById('kpi-trades').textContent = s.n_trades;
-  document.getElementById('kpi-trades-sub').textContent = `${{s.n_wins}}W / ${{s.n_losses}}L`;
-  document.getElementById('kpi-winrate').textContent = (s.win_rate*100).toFixed(0) + '%';
-  document.getElementById('kpi-winrate-sub').textContent = `avg ${{fmt$(s.avg_pnl)}} per trade`;
-  document.getElementById('kpi-edge').textContent = (s.avg_edge_bp||0).toFixed(0) + 'bp';
-  document.getElementById('kpi-open').textContent = s.open_positions;
-  document.getElementById('kpi-bestworst').textContent = `${{fmt$(s.best_trade)}} / ${{fmt$(s.worst_trade)}}`;
-  // CLV KPI: green if avg CLV > 0 (you got better entries than the close on average)
-  const clvBp = s.avg_clv_bp || 0;
-  const clvEl = document.getElementById('kpi-clv');
-  if (s.n_clv > 0) {{
-    clvEl.textContent = (clvBp >= 0 ? '+' : '') + clvBp.toFixed(1) + 'bp';
-    clvEl.parentElement.classList.toggle('pos', clvBp > 0);
-    clvEl.parentElement.classList.toggle('neg', clvBp < 0);
-    document.getElementById('kpi-clv-sub').textContent =
-      `${{s.n_clv}} samples · ${{(s.pct_positive_clv||0).toFixed(0)}}% positive`;
-  }} else {{
-    clvEl.textContent = '—';
-    document.getElementById('kpi-clv-sub').textContent = 'awaiting tipoff samples';
-  }}
-  document.getElementById('curve-meta').textContent = s.pnl_curve.length
-    ? `${{s.n_trades}} trades · range ${{fmt$(s.worst_trade)}} ... ${{fmt$(s.best_trade)}}`
-    : 'no closed trades yet';
-
-  // Settlement backtest panel
-  const bt = s.settlement || {{}};
-  if (bt.n_resolved > 0) {{
-    document.getElementById('bt-actual').textContent = fmt$(bt.actual_total);
-    document.getElementById('bt-actual').className = cls(bt.actual_total);
-    document.getElementById('bt-settle').textContent = fmt$(bt.settlement_total);
-    document.getElementById('bt-settle').className = cls(bt.settlement_total);
-    document.getElementById('bt-delta').textContent = fmt$(bt.delta);
-    document.getElementById('bt-delta').className = cls(bt.delta);
-    document.getElementById('bt-delta-sub').textContent =
-      `${{bt.n_resolved}} resolved · holding beat exit on ${{bt.better_held_pct}}%`;
-    if (bt.stop_loss_n > 0) {{
-      const slDelta = (bt.stop_loss_settlement || 0) - (bt.stop_loss_actual || 0);
-      // slDelta > 0: holding would have made MORE money → stops cost us
-      // slDelta < 0: holding would have lost MORE money → stops saved us
-      // The negation matches an intuitive "stop verdict" P&L: positive
-      // = stops were good, negative = stops cost us.
-      const stopVerdict = -slDelta;
-      const verdictWord = stopVerdict >= 0 ? 'saved' : 'cost';
-      document.getElementById('bt-stoploss').innerHTML =
-        `Of ${{bt.stop_loss_n}} stop_loss exits: actual ${{fmt$(bt.stop_loss_actual)}}, ` +
-        `if held to settlement ${{fmt$(bt.stop_loss_settlement)}} — ` +
-        `<span class="${{cls(stopVerdict)}}">stops ${{verdictWord}} ${{fmt$(Math.abs(stopVerdict))}}</span>`;
-    }} else {{
-      document.getElementById('bt-stoploss').textContent = '';
-    }}
-  }} else {{
+function renderBacktest(bt) {{
+  if (!bt || bt.n_resolved === 0) {{
     document.getElementById('bt-actual').textContent = '—';
     document.getElementById('bt-settle').textContent = '—';
     document.getElementById('bt-delta').textContent = '—';
     document.getElementById('bt-delta-sub').textContent = 'awaiting Kalshi resolutions';
-    document.getElementById('bt-stoploss').textContent = '';
+    document.getElementById('bt-stoploss').textContent = ''; return;
   }}
+  const a = document.getElementById('bt-actual');
+  a.textContent = fmt$(bt.actual_total); a.className = 'val ' + cls(bt.actual_total);
+  const s = document.getElementById('bt-settle');
+  s.textContent = fmt$(bt.settlement_total); s.className = 'val ' + cls(bt.settlement_total);
+  const d = document.getElementById('bt-delta');
+  d.textContent = fmt$(bt.delta); d.className = 'val ' + cls(bt.delta);
+  document.getElementById('bt-delta-sub').textContent =
+    `${{bt.n_resolved}} resolved · holding beat exit on ${{bt.better_held_pct}}%`;
+  if (bt.stop_loss_n > 0) {{
+    const slDelta = bt.stop_loss_settlement - bt.stop_loss_actual;
+    const stopVerdict = -slDelta;
+    const verdictWord = stopVerdict >= 0 ? 'saved' : 'cost';
+    document.getElementById('bt-stoploss').innerHTML =
+      `Of ${{bt.stop_loss_n}} stop_loss exits: actual ${{fmt$(bt.stop_loss_actual)}}, ` +
+      `if held to settlement ${{fmt$(bt.stop_loss_settlement)}} — ` +
+      `<span class="${{cls(stopVerdict)}}">stops ${{verdictWord}} ${{fmt$(Math.abs(stopVerdict))}}</span>`;
+  }} else {{ document.getElementById('bt-stoploss').textContent = ''; }}
+}}
+
+// Golf round-leader alerts
+function renderGolfLeader(data) {{
+  const tb = document.getElementById('tbody-golf-leader');
+  const meta = document.getElementById('golf-leader-meta');
+  const alerts = (data && data.alerts) || [];
+  if (!alerts.length) {{
+    tb.innerHTML = '<tr><td colspan="7" class="empty">no qualifying golfers right now</td></tr>';
+    meta.textContent = 'live in-play · no near-leader with soft DK odds';
+    return;
+  }}
+  meta.textContent = `${{alerts.length}} golfer(s) · DataGolf vs DraftKings`;
+  const rows = [];
+  alerts.forEach(a => {{
+    const pos = a.strokes_back === 0 ? 'LEADING' : a.strokes_back + ' back';
+    const me = a.market_edges || {{}};
+    const markets = Object.keys(me);
+    if (!markets.length) {{
+      rows.push(`<tr><td>${{a.player}}</td><td>${{a.pos}}</td>
+        <td class="num">${{a.thru}}</td><td colspan="4" class="muted">—</td></tr>`);
+      return;
+    }}
+    markets.forEach((mkt, i) => {{
+      const [model, dk, edge] = me[mkt];
+      const first = i === 0;
+      rows.push(`<tr>
+        <td>${{first ? '<b>'+a.player+'</b>' : ''}}</td>
+        <td class="muted">${{first ? pos+' ('+a.pos+')' : ''}}</td>
+        <td class="num">${{first ? 'R'+a.round+' · '+a.thru : ''}}</td>
+        <td>${{mkt}}</td>
+        <td class="num">${{(dk*100).toFixed(1)}}%</td>
+        <td class="num">${{(model*100).toFixed(1)}}%</td>
+        <td class="num ${{cls(edge)}}">${{(edge*100>=0?'+':'')}}${{(edge*100).toFixed(1)}}pp</td>
+      </tr>`);
+    }});
+  }});
+  tb.innerHTML = rows.join('');
+}}
+
+// Golf 3-ball / matchup edges
+function renderGolf3ball(data) {{
+  const tb = document.getElementById('tbody-golf-3ball');
+  const meta = document.getElementById('golf-3ball-meta');
+  const edges = (data && data.edges) || [];
+  if (!edges.length) {{
+    tb.innerHTML = '<tr><td colspan="5" class="empty">no +EV legs right now</td></tr>';
+    meta.textContent = 'DataGolf vs DraftKings · no matchup edges';
+    return;
+  }}
+  meta.textContent = `${{edges.length}} +EV leg(s) flagged`;
+  tb.innerHTML = edges.map(e => {{
+    const dog = e.is_underdog ? ' 🐕' : '';
+    return `<tr>
+      <td><b>${{e.pick}}</b>${{dog}}</td>
+      <td class="muted">${{e.event_name}} R${{e.round_num}}</td>
+      <td class="num">${{(e.dk_prob*100).toFixed(0)}}%</td>
+      <td class="num">${{(e.datagolf_prob*100).toFixed(0)}}%</td>
+      <td class="num pos">+${{(e.edge_pp*100).toFixed(1)}}pp</td>
+    </tr>`;
+  }}).join('');
 }}
 
 async function refresh() {{
   try {{
-    const [stats, openPos, tradesRows, daily, crossEx] = await Promise.all([
+    const [stats, openPos, tradesRows, daily, crossEx, golfLeader, golf3ball] = await Promise.all([
       fetch('/stats').then(r => r.json()),
       fetch('/positions').then(r => r.json()),
       fetch('/trades?limit=200').then(r => r.json()),
       fetch('/pnl').then(r => r.json()),
       fetch('/cross_exchange').then(r => r.json()),
+      fetch('/golf_leader').then(r => r.json()).catch(() => ({{alerts: []}})),
+      fetch('/golf_3ball').then(r => r.json()).catch(() => ({{edges: []}})),
     ]);
-    renderKpis(stats);
-    buildCurveChart(stats.pnl_curve);
-    buildCalibChart(stats.edge_calibration);
-    renderBucketTable('tbody-sport',    stats.by_sport);
-    renderBucketTable('tbody-favdog',   stats.by_fav_dog);
-    renderBucketTable('tbody-side',     stats.by_our_side);
-    renderBucketTable('tbody-provider', stats.by_provider);
-    renderBucketTable('tbody-entry',    stats.by_entry_bucket);
-    renderBucketTable('tbody-tip',      stats.by_tip_bucket);
-    renderBucketTable('tbody-exit',       stats.by_exit_reason);
-    renderBucketTable('tbody-series',     stats.by_series);
-    renderBucketTable('tbody-hold',       stats.by_hold);
-    renderBucketTable('tbody-confidence', stats.by_confidence);
-    renderBucketTable('tbody-exit-policy', stats.by_exit_policy);
-    renderBucketTable('tbody-edge-bucket', stats.by_edge_bucket);
-    renderBucketTable('tbody-whale-class', stats.by_whale_class);
+    updateDials(stats); renderKpis(stats);
+    buildCurveChart(stats.pnl_curve || []);
+    buildCalibChart(stats.edge_calibration || []);
+    renderBucketTable('tbody-sport',           stats.by_sport);
+    renderBucketTable('tbody-favdog',          stats.by_fav_dog);
+    renderBucketTable('tbody-side',            stats.by_our_side);
+    renderBucketTable('tbody-provider',        stats.by_provider);
+    renderBucketTable('tbody-entry',           stats.by_entry_bucket);
+    renderBucketTable('tbody-tip',             stats.by_tip_bucket);
+    renderBucketTable('tbody-exit',            stats.by_exit_reason);
+    renderBucketTable('tbody-series',          stats.by_series);
+    renderBucketTable('tbody-hold',            stats.by_hold);
+    renderBucketTable('tbody-confidence',      stats.by_confidence);
+    renderBucketTable('tbody-exit-policy',     stats.by_exit_policy);
+    renderBucketTable('tbody-edge-bucket',     stats.by_edge_bucket);
+    renderBucketTable('tbody-whale-class',     stats.by_whale_class);
     renderBucketTable('tbody-whale-magnitude', stats.by_whale_magnitude);
-    renderBucketTable('tbody-whale-side', stats.by_whale_side);
-    renderBucketTable('tbody-side-x-entry', stats.by_side_x_entry);
+    renderBucketTable('tbody-whale-side',      stats.by_whale_side);
+    renderBucketTable('tbody-side-x-entry',    stats.by_side_x_entry);
+    renderClvTable('tbody-clv-sport',          stats.by_sport_clv);
     renderWindowedPnl(stats.windowed_pnl, stats.open_mtm);
-    renderClvTable('tbody-clv-sport',     stats.by_sport_clv);
+    renderBacktest(stats.settlement);
     renderCrossExchange(crossEx);
-    renderOpen(openPos);
-    renderTrades(tradesRows);
-    renderDaily(daily);
+    renderGolfLeader(golfLeader);
+    renderGolf3ball(golf3ball);
+    renderOpen(openPos); renderTrades(tradesRows); renderDaily(daily);
     document.getElementById('refresh-status').textContent = 'updated ' + new Date().toLocaleTimeString();
   }} catch (e) {{
     document.getElementById('refresh-status').textContent = 'fetch error: ' + e.message;
   }}
 }}
-
 refresh();
 setInterval(refresh, 15000);
 </script>

@@ -184,6 +184,12 @@ def notify_startup(mode: str, bankroll: float) -> None:
     _fire(_post(text))
 
 
+def send_text(text: str) -> None:
+    """Public generic sender — fire-and-forget a raw Slack message.
+    Used by the golf 3-ball advisor and any other ad-hoc pings."""
+    _fire(_post(text))
+
+
 # --------------------------------------------------------- 6h P&L digest
 
 def _fmt_money(x: float) -> str:

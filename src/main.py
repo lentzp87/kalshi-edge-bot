@@ -226,6 +226,71 @@ async def slack_digest_loop(
         await asyncio.sleep(interval_seconds)
 
 
+async def golf_3ball_loop(*, interval_hours: int = 4) -> None:
+    """Periodic golf matchup edge advisor (beta).
+
+    Read-only — pings Slack with +EV golf 3-ball / 2-ball legs from
+    DataGolf vs DraftKings. Does NOT place trades. Only re-pings when the
+    edge set actually changes, so a quiet slate doesn't spam the channel.
+    """
+    from .golf_3ball import find_edges, format_slack
+    from .slack_notifier import send_text
+
+    last_signature: str | None = None
+    await asyncio.sleep(90)  # let the rest of startup settle
+    interval_seconds = max(600, int(interval_hours * 3600))
+    while True:
+        try:
+            edges = await find_edges()
+            # Signature = the set of (pick, round) pairs — re-ping only
+            # when the actual edges change, not every interval.
+            signature = "|".join(
+                sorted(f"{e.pick}:{e.round_num}:{e.market}" for e in edges)
+            )
+            if edges and signature != last_signature:
+                send_text(format_slack(edges))
+                last_signature = signature
+                log.info("golf_3ball.pinged", edges=len(edges))
+            else:
+                log.info("golf_3ball.scan", edges=len(edges),
+                         changed=(signature != last_signature))
+        except Exception:
+            log.exception("golf_3ball.error")
+        await asyncio.sleep(interval_seconds)
+
+
+async def golf_leader_loop(*, interval_minutes: int = 10) -> None:
+    """Live golf round-leader alerter (beta).
+
+    Polls every ~10 min during play. Pings Slack when a mid-tier golfer
+    is leading / within a stroke with holes to play AND DataGolf's
+    in-play probability beats the DraftKings price. Read-only.
+
+    Dedup: each (dg_id, round) is alerted at most once — one heads-up
+    per golfer per round, not a re-ping every 10 min.
+    """
+    from .golf_leader import find_leader_alerts, format_slack
+    from .slack_notifier import send_text
+
+    alerted: set[tuple[int, int]] = set()
+    await asyncio.sleep(120)  # let startup settle
+    interval_seconds = max(120, int(interval_minutes * 60))
+    while True:
+        try:
+            alerts = await find_leader_alerts()
+            fresh = [a for a in alerts if (a.dg_id, a.round_num) not in alerted]
+            if fresh:
+                send_text(format_slack(fresh))
+                for a in fresh:
+                    alerted.add((a.dg_id, a.round_num))
+                log.info("golf_leader.pinged", new=len(fresh), total=len(alerts))
+            else:
+                log.info("golf_leader.scan", qualifying=len(alerts), new=0)
+        except Exception:
+            log.exception("golf_leader.error")
+        await asyncio.sleep(interval_seconds)
+
+
 async def cross_exchange_loop(
     client: KalshiClient, *, interval_seconds: int = 300,
     max_pages: int = 5,
@@ -423,6 +488,21 @@ async def amain() -> None:
                 journal,
                 interval_hours=int(
                     _os.environ.get("SLACK_DIGEST_INTERVAL_HOURS", "6")
+                ),
+            ),
+            # Golf 3-ball / 2-ball edge advisor (beta). Read-only — pings
+            # Slack with +EV DataGolf-vs-DraftKings matchup legs.
+            golf_3ball_loop(
+                interval_hours=int(
+                    _os.environ.get("GOLF_3BALL_INTERVAL_HOURS", "4")
+                ),
+            ),
+            # Golf round-leader alerter (beta). Read-only — pings Slack
+            # when a mid-tier golfer leads/near-leads with holes to play
+            # and DataGolf's in-play prob beats the DraftKings price.
+            golf_leader_loop(
+                interval_minutes=int(
+                    _os.environ.get("GOLF_LEADER_INTERVAL_MINUTES", "10")
                 ),
             ),
         )

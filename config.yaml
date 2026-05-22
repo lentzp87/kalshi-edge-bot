@@ -85,9 +85,12 @@ decision:
   min_entry_price_no: 0.35
   min_p_yes: 0.52
   # 2026-05-19: cap the top end. 80%+ confidence trades over N=36 ran
-  # 33% wr / -$285 — model is anti-predictive when most certain. Set
-  # to null to disable; restore to ~0.85 if calibration improves.
-  max_p_yes: 0.78
+  # 33% wr / -$285 — model is anti-predictive when most certain.
+  # 2026-05-21: tightened 0.78 -> 0.70. With the 80%+ band frozen by
+  # the prior cap, the 70-80% bucket became the worst ACTIVE loser:
+  # 41 trades, 41% wr, -$154. Set to null to disable; restore upward
+  # only if by_confidence calibration improves.
+  max_p_yes: 0.70
   # Per-market gate: gross_edge must exceed
   #   entry_fee + exit_fee + half_spread + slippage + safety_pp
   # safety_pp is the cushion above measured costs.

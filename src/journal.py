@@ -125,7 +125,18 @@ class Journal:
         )
         self.conn.commit()
 
-    def log_open(self, *, signal: TradeSignal, market: Market, fill_price: float, contracts: int) -> None:
+    def log_open(self, *, signal: TradeSignal, market: Market, fill_price: float,
+                 contracts: int, opened_ts: str | None = None) -> None:
+        """Insert an opened-position row.
+
+        `opened_ts` MUST be the caller's `pos.opened_at.isoformat()`, not a
+        fresh timestamp. The CLV sampler and the mark-to-market watcher both
+        issue `UPDATE ... WHERE ticker=? AND opened_ts=?` using the in-memory
+        OpenPosition's `opened_at`. If log_open stamps its own `_now()` here,
+        that value never matches the watchers' value and every CLV / mid-range
+        UPDATE silently affects zero rows. (Root cause of n_clv=0 and the
+        degenerate A/B exit panel — fixed 2026-05-21.)
+        """
         self.conn.execute(
             "INSERT INTO trades (ticker, side, contracts, size_usd, fill_price, opened_ts, edge, reason) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -135,7 +146,7 @@ class Journal:
                 contracts,
                 signal.size_usd,
                 fill_price,
-                self._now(),
+                opened_ts or self._now(),
                 signal.edge,
                 signal.reason,
             ),

@@ -79,31 +79,32 @@ def _whale_multiplier(wreason: str) -> tuple[float, str, str]:
     if wreason.startswith("volume_burst"):
         m = _WHALE_VOL_RE.search(wreason)
         contracts = int(m.group(1)) if m else 5000
-        # 5k floor → 1.2x, 50k saturation → 2.5x. Use log-ish scaling
-        # because 5k vs 50k is a 10x range.
-        import math as _math
-        # Map log(5k)..log(50k) to 0..1
-        lo, hi = _math.log(5000), _math.log(50000)
-        x = max(lo, min(hi, _math.log(max(contracts, 5000))))
-        t = (x - lo) / (hi - lo)
-        mult = _lerp(t, 1.2, 2.5)
+        # 2026-05-20: burst class disabled. 18 trades, 44% wr, -$104.
+        # Direction-ambiguous volume bursts aren't predictive. We keep
+        # the class label + magnitude bucket for logging continuity so
+        # the dashboard's `By Whale Class` panel still tracks the
+        # cohort, but the size multiplier is 1.0 (no boost).
         if contracts < 10_000:    bucket = "burst_5-10k"
         elif contracts < 25_000:  bucket = "burst_10-25k"
         elif contracts < 50_000:  bucket = "burst_25-50k"
         else:                     bucket = "burst_50k+"
-        return mult, "burst", bucket
+        return 1.0, "burst", bucket
     if wreason.startswith("large_"):
         m = _WHALE_REST_RE.search(wreason)
         contracts = int(m.group(1)) if m else 2000
-        # 2k floor → 1.1x, 20k saturation → 1.5x
+        if contracts < 5_000:
+            # 2026-05-21: rest_2-5k disabled. 26 trades, 42% wr, -$49.
+            # Small resting orders are spoof-prone noise; only 5k+ pays
+            # (rest_5-10k 73% wr, rest_10k+ 65% wr). Label kept for the
+            # dashboard's By Whale Magnitude panel; multiplier is 1.0.
+            return 1.0, "resting", "rest_2-5k"
+        # 5k → ~1.2x, 20k saturation → 1.5x
         import math as _math
-        lo, hi = _math.log(2000), _math.log(20000)
-        x = max(lo, min(hi, _math.log(max(contracts, 2000))))
+        lo, hi = _math.log(5000), _math.log(20000)
+        x = max(lo, min(hi, _math.log(max(contracts, 5000))))
         t = (x - lo) / (hi - lo)
-        mult = _lerp(t, 1.1, 1.5)
-        if contracts < 5_000:     bucket = "rest_2-5k"
-        elif contracts < 10_000:  bucket = "rest_5-10k"
-        else:                     bucket = "rest_10k+"
+        mult = _lerp(t, 1.2, 1.5)
+        bucket = "rest_5-10k" if contracts < 10_000 else "rest_10k+"
         return mult, "resting", bucket
     return 2.0, "other", "unknown"
 
@@ -284,7 +285,14 @@ class Executor:
         if tip_utc:
             pos.tip_utc = tip_utc  # type: ignore[attr-defined]
         self.risk.record_open(signal)
-        self.journal.log_open(signal=signal, market=market, fill_price=fill_price, contracts=contracts)
+        # Pass pos.opened_at so the journal row's opened_ts matches what
+        # _sample_clv / _watch use in their UPDATE WHERE clauses. Without
+        # this they target a non-existent (ticker, opened_ts) pair and
+        # silently update zero rows.
+        self.journal.log_open(
+            signal=signal, market=market, fill_price=fill_price,
+            contracts=contracts, opened_ts=pos.opened_at.isoformat(),
+        )
         # Slack ping. Fire-and-forget — failure never blocks the trade flow.
         try:
             from .slack_notifier import notify_open
