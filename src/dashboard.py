@@ -838,6 +838,33 @@ a:hover {{ color: var(--accent); }}
   .shell {{ padding: 20px 14px 60px; }} .dial-value {{ font-size: 36px; }}
 }}
 
+/* Phone-preview mode — class-triggered so it works at any viewport.
+   Lets you eyeball the iPhone layout from a laptop. CSS media queries
+   key off VIEWPORT width, so a class is the only way to force the
+   mobile layout in a desktop browser. */
+.shell.phone-view {{
+  max-width: 414px;
+  border: 1px solid var(--border);
+  border-radius: 28px;
+  padding: 24px 16px 60px;
+  margin-top: 16px;
+}}
+.shell.phone-view .hero,
+.shell.phone-view .grid.cols-2,
+.shell.phone-view .grid.cols-3,
+.shell.phone-view .grid.cols-4 {{ grid-template-columns: 1fr; }}
+.shell.phone-view .kpis {{ grid-template-columns: 1fr 1fr; }}
+.shell.phone-view .dial-value {{ font-size: 36px; }}
+.shell.phone-view .settlement-grid {{ grid-template-columns: 1fr; }}
+.shell.phone-view .scroll {{ max-height: 320px; }}
+
+.view-toggle {{
+  font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
+  padding: 6px 12px; border-radius: 8px; cursor: pointer;
+  background: var(--surface-raised); color: var(--text-secondary);
+  border: 1px solid var(--border); }}
+.view-toggle:hover {{ color: var(--text); background: var(--surface-overlay); }}
+
 .chart-wrap {{ height: 260px; position: relative; }}
 .chart-wrap.tall {{ height: 320px; }}
 
@@ -917,6 +944,7 @@ tr:last-child td {{ border-bottom: none; }}
       <span class="badge">bankroll ${bankroll:.0f}</span>
       <span class="badge">min edge {min_edge_bp}bp</span>
       <span class="badge">min entry ${min_entry_price:.2f}</span>
+      <button class="view-toggle" id="view-toggle" onclick="toggleView()">💻 Laptop</button>
     </div>
   </header>
 
@@ -1631,6 +1659,28 @@ async function refresh() {{
     document.getElementById('refresh-status').textContent = 'fetch error: ' + e.message;
   }}
 }}
+// Phone / Laptop view toggle. Class-based so the mobile layout can be
+// previewed from a desktop browser; persisted in localStorage.
+const VIEW_KEY = 'edgemonitor_view';
+function applyView(mode) {{
+  const shell = document.querySelector('.shell');
+  const btn = document.getElementById('view-toggle');
+  if (mode === 'phone') {{
+    shell.classList.add('phone-view');
+    btn.textContent = '📱 Phone';
+  }} else {{
+    shell.classList.remove('phone-view');
+    btn.textContent = '💻 Laptop';
+  }}
+}}
+function toggleView() {{
+  const cur = (localStorage.getItem(VIEW_KEY) === 'phone') ? 'phone' : 'laptop';
+  const next = (cur === 'phone') ? 'laptop' : 'phone';
+  localStorage.setItem(VIEW_KEY, next);
+  applyView(next);
+}}
+applyView(localStorage.getItem(VIEW_KEY) === 'phone' ? 'phone' : 'laptop');
+
 refresh();
 setInterval(refresh, 15000);
 </script>
