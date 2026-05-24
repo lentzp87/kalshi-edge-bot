@@ -30,6 +30,7 @@ from .models import model_for_category
 from .polymarket_client import list_active_markets as poly_list_active_markets
 from .risk import RiskEngine
 from .scanner import Scanner
+from . import shadow_models
 from .orphan_recovery import recover_orphans
 from .settlement_backfill import backfill_loop as settlement_loop
 from .whale_tracker import WhaleTracker
@@ -146,6 +147,15 @@ async def loop_once(
         # Feed every market through the whale tracker — it logs whale-
         # shaped deltas itself, and the executor consults it when sizing.
         whale_tracker.update(market)
+
+        # Shadow models — observe-only alternative signal generators
+        # (baseline / steam / cross-exchange). They persist picks to the
+        # shadow_signals table for per-model backtesting; they do NOT
+        # place trades. Wrapped so a shadow failure can't break scanning.
+        try:
+            shadow_models.run_shadows(market, journal)
+        except Exception:
+            log.exception("shadow.run_error", ticker=market.ticker)
 
         model = model_for_category(market.category)
         if not model or not getattr(model, "enabled", True):

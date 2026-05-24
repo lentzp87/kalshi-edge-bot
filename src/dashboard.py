@@ -478,6 +478,30 @@ def cross_exchange() -> dict:
     return cross_exchange_state.latest()
 
 
+@app.get("/shadow")
+def shadow() -> dict:
+    """Per-model shadow-signal scoreboard.
+
+    Each observe-only model (baseline / steam / cross_exchange) logs
+    picks to `shadow_signals`; the settlement backfill stamps the
+    outcome. This returns counts + resolved win rate per model so the
+    dashboard can show which model — if any — beats the structural-bias
+    baseline. A model only earns promotion if it clears baseline here.
+    """
+    rows = _journal.shadow_summary()
+    baseline_wr = next(
+        (r["win_rate"] for r in rows if r["model"] == "baseline"), None
+    )
+    for r in rows:
+        r["beats_baseline"] = (
+            baseline_wr is not None
+            and r["model"] != "baseline"
+            and r["resolved"] > 0
+            and r["win_rate"] > baseline_wr
+        )
+    return {"models": rows, "baseline_win_rate": baseline_wr}
+
+
 @app.get("/stats")
 def stats() -> dict:
     raw = _journal.recent_trades(limit=10000)
@@ -1161,6 +1185,19 @@ tr:last-child td {{ border-bottom: none; }}
     <tbody id="tbody-clv-sport"><tr><td colspan="4" class="empty">awaiting tipoff samples</td></tr></tbody></table>
   </div>
 
+  <h2 class="section">Shadow Models · observe-only</h2>
+
+  <div class="card">
+    <div class="card-title"><h3>Shadow Model Scoreboard</h3>
+      <span class="meta" id="shadow-meta">picks logged but never traded · beat baseline to earn promotion</span></div>
+    <table><thead><tr>
+      <th>Model</th><th class="num">Picks</th><th class="num">Resolved</th>
+      <th class="num">Wins</th><th class="num">Win%</th><th class="num">Avg Edge</th>
+      <th>vs Baseline</th>
+    </tr></thead>
+    <tbody id="tbody-shadow"><tr><td colspan="7" class="empty">no shadow picks yet</td></tr></tbody></table>
+  </div>
+
   <h2 class="section">Golf Advisor · beta</h2>
 
   <div class="grid cols-2">
@@ -1616,9 +1653,46 @@ function renderGolf3ball(data) {{
   }}).join('');
 }}
 
+function renderShadow(data) {{
+  const tb = document.getElementById('tbody-shadow');
+  const meta = document.getElementById('shadow-meta');
+  const models = (data && data.models) || [];
+  if (!models.length) {{
+    tb.innerHTML = '<tr><td colspan="7" class="empty">no shadow picks yet</td></tr>';
+    return;
+  }}
+  const baseWr = data.baseline_win_rate;
+  meta.textContent = baseWr != null
+    ? `baseline win rate ${{(baseWr*100).toFixed(1)}}% — a model must beat this to earn promotion`
+    : 'picks logged but never traded · beat baseline to earn promotion';
+  tb.innerHTML = models.map(m => {{
+    let verdict = '<span class="muted">—</span>';
+    if (m.model === 'baseline') {{
+      verdict = '<span class="pill info">null hypothesis</span>';
+    }} else if (m.resolved > 0) {{
+      verdict = m.beats_baseline
+        ? '<span class="pill" style="background:#1f6f43;color:#d6f5e3">beats baseline</span>'
+        : '<span class="pill warn">below baseline</span>';
+    }} else {{
+      verdict = '<span class="muted">awaiting settlement</span>';
+    }}
+    const wr = m.resolved > 0 ? (m.win_rate*100).toFixed(1) + '%' : '—';
+    const ae = (m.avg_edge >= 0 ? '+' : '') + (m.avg_edge*100).toFixed(1) + 'pp';
+    return `<tr>
+      <td>${{m.model}}</td>
+      <td class="num">${{m.n}}</td>
+      <td class="num">${{m.resolved}}</td>
+      <td class="num">${{m.wins}}</td>
+      <td class="num">${{wr}}</td>
+      <td class="num">${{ae}}</td>
+      <td>${{verdict}}</td>
+    </tr>`;
+  }}).join('');
+}}
+
 async function refresh() {{
   try {{
-    const [stats, openPos, tradesRows, daily, crossEx, golfLeader, golf3ball] = await Promise.all([
+    const [stats, openPos, tradesRows, daily, crossEx, golfLeader, golf3ball, shadow] = await Promise.all([
       fetch('/stats').then(r => r.json()),
       fetch('/positions').then(r => r.json()),
       fetch('/trades?limit=200').then(r => r.json()),
@@ -1626,6 +1700,7 @@ async function refresh() {{
       fetch('/cross_exchange').then(r => r.json()),
       fetch('/golf_leader').then(r => r.json()).catch(() => ({{alerts: []}})),
       fetch('/golf_3ball').then(r => r.json()).catch(() => ({{edges: []}})),
+      fetch('/shadow').then(r => r.json()).catch(() => ({{models: []}})),
     ]);
     updateDials(stats); renderKpis(stats);
     buildCurveChart(stats.pnl_curve || []);
@@ -1653,6 +1728,7 @@ async function refresh() {{
     renderCrossExchange(crossEx);
     renderGolfLeader(golfLeader);
     renderGolf3ball(golf3ball);
+    renderShadow(shadow);
     renderOpen(openPos); renderTrades(tradesRows); renderDaily(daily);
     document.getElementById('refresh-status').textContent = 'updated ' + new Date().toLocaleTimeString();
   }} catch (e) {{

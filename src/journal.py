@@ -60,6 +60,25 @@ CREATE TABLE IF NOT EXISTS trades (
     -- are both stored in the side we bought).
     clv_price REAL
 );
+
+-- Observe-only picks from src/shadow_models.py. Every alternative
+-- model logs its pick here so each can be backtested in isolation
+-- against Kalshi resolutions. Nothing here is a real position.
+CREATE TABLE IF NOT EXISTS shadow_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    model TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    side TEXT NOT NULL,
+    prob REAL,
+    edge REAL,
+    kalshi_price REAL,
+    note TEXT,
+    -- filled later by the settlement backfill: 1 if the picked side
+    -- won, 0 if it lost, NULL until the Kalshi market resolves.
+    settled_outcome INTEGER,
+    settled_checked_ts TEXT
+);
 """
 
 
@@ -244,6 +263,62 @@ class Journal:
             "  min_mid_during_hold = MIN(COALESCE(min_mid_during_hold, ?), ?) "
             "WHERE ticker=? AND opened_ts=? AND closed_ts IS NULL",
             (mid, self._now(), mid, mid, mid, mid, ticker, opened_ts),
+        )
+        self.conn.commit()
+
+    def log_shadow_signal(self, *, model: str, ticker: str, side: str,
+                          prob: float, edge: float, kalshi_price: float,
+                          note: str) -> None:
+        """Record one observe-only shadow-model pick. Backtested later
+        by joining settled_outcome (filled by the settlement backfill)."""
+        self.conn.execute(
+            "INSERT INTO shadow_signals "
+            "(ts, model, ticker, side, prob, edge, kalshi_price, note) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (self._now(), model, ticker, side, prob, edge, kalshi_price, note),
+        )
+        self.conn.commit()
+
+    def shadow_summary(self) -> list[dict]:
+        """Per-model shadow-signal counts + resolved-pick win rate.
+        Used by the dashboard's shadow-models panel."""
+        cur = self.conn.execute(
+            "SELECT model, COUNT(*) AS n, "
+            "  SUM(CASE WHEN settled_outcome IS NOT NULL THEN 1 ELSE 0 END) AS resolved, "
+            "  SUM(CASE WHEN settled_outcome = 1 THEN 1 ELSE 0 END) AS wins, "
+            "  AVG(edge) AS avg_edge "
+            "FROM shadow_signals GROUP BY model ORDER BY n DESC"
+        )
+        out = []
+        for model, n, resolved, wins, avg_edge in cur.fetchall():
+            resolved = resolved or 0
+            wins = wins or 0
+            out.append({
+                "model": model,
+                "n": n,
+                "resolved": resolved,
+                "wins": wins,
+                "win_rate": round(wins / resolved, 3) if resolved else 0.0,
+                "avg_edge": round(avg_edge or 0.0, 4),
+            })
+        return out
+
+    def shadow_signals_pending_settlement(self, limit: int = 1000) -> list[dict]:
+        """Shadow picks not yet resolved against a Kalshi outcome."""
+        cur = self.conn.execute(
+            "SELECT * FROM shadow_signals WHERE settled_outcome IS NULL "
+            "ORDER BY ts DESC LIMIT ?", (limit,),
+        )
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def update_shadow_settlement(self, *, signal_id: int,
+                                 settled_outcome: int) -> None:
+        """Record whether a shadow pick's side won (1) or lost (0)."""
+        self.conn.execute(
+            "UPDATE shadow_signals SET settled_outcome=?, settled_checked_ts=? "
+            "WHERE id=?",
+            (settled_outcome, self._now(), signal_id),
         )
         self.conn.commit()
 

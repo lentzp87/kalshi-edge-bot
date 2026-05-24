@@ -86,13 +86,51 @@ async def _check_one(client: KalshiClient, journal: Journal, trade: dict) -> boo
     return True
 
 
+async def _settle_shadows(client: KalshiClient, journal: Journal) -> None:
+    """Resolve observe-only shadow-model picks against Kalshi outcomes.
+
+    Many shadow signals share a ticker, so we resolve each distinct
+    ticker once, then stamp every pending signal on it. settled_outcome
+    = 1 if the picked side won, else 0 — that's what shadow_summary()
+    turns into a per-model win rate.
+    """
+    pending = journal.shadow_signals_pending_settlement(limit=2000)
+    if not pending:
+        return
+    # ticker -> "yes" / "no" / None (None = not yet resolved)
+    resolved: dict[str, str | None] = {}
+    updated = 0
+    for sig in pending:
+        ticker = sig.get("ticker") or ""
+        if ticker not in resolved:
+            try:
+                market = await client.get_market_raw(ticker)
+                res = (market or {}).get("result", "") or ""
+                resolved[ticker] = res if res in ("yes", "no") else None
+            except Exception:
+                resolved[ticker] = None
+            await asyncio.sleep(0.05)
+        result = resolved[ticker]
+        if result is None:
+            continue
+        won = 1 if result == (sig.get("side") or "") else 0
+        try:
+            journal.update_shadow_settlement(
+                signal_id=int(sig["id"]), settled_outcome=won,
+            )
+            updated += 1
+        except Exception:
+            log.exception("settlement.shadow_update_error",
+                           signal_id=sig.get("id"))
+    log.info("settlement.shadows.done",
+             pending=len(pending), tickers=len(resolved), updated=updated)
+
+
 async def _run_one_batch(client: KalshiClient, journal: Journal, *, label: str) -> None:
     """One pass over pending trades. Always logs start + end so the bot
     is observably doing work even if there's nothing to update."""
     pending = journal.trades_pending_settlement(limit=500)
     log.info(f"settlement.{label}.start", pending=len(pending))
-    if not pending:
-        return
     updated = 0
     skipped_unresolved = 0
     for trade in pending:
@@ -109,6 +147,11 @@ async def _run_one_batch(client: KalshiClient, journal: Journal, *, label: str) 
     log.info(f"settlement.{label}.done",
              checked=len(pending), updated=updated,
              still_unresolved=skipped_unresolved)
+    # Resolve shadow-model picks in the same pass.
+    try:
+        await _settle_shadows(client, journal)
+    except Exception:
+        log.exception("settlement.shadows_error")
 
 
 async def backfill_loop(
