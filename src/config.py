@@ -79,6 +79,12 @@ class ExecutionConfig(BaseModel):
     take_profit_pct: float = 0.20
     stop_loss_pct: float = 0.12
     time_exit_minutes: int = 90
+    # Hard cap on hold duration (minutes). Whatever the tip-aligned or
+    # flat deadline works out to, a position is force-closed once it
+    # reaches this age. Promoted from the A/B exit simulator: the
+    # `exit_75min` policy backtested far ahead of the actual exits.
+    # Set very high (e.g. 100000) to effectively disable.
+    hard_exit_minutes: int = 75
     order_type: Literal["limit", "market"] = "limit"
     scale_in_chunks: int = 2
 

@@ -154,6 +154,18 @@ execution:
   stop_loss_pct: 1.00
   # Long hold for pregame CLV: line drifts toward truth as tipoff nears.
   time_exit_minutes: 240
+  # 2026-05-24: HARD 75-MIN EXIT PROMOTED FROM BACKTEST TO LIVE.
+  # The A/B exit simulator's `exit_75min` policy (keep take-profit, but
+  # force-close anything still open at 75 min) backtested to +$423.17
+  # over 113 instrumented trades / 63.7% wr vs the actual exits' -$110.60.
+  # Root cause in the data: trades that miss TP and ride to the long
+  # tip-aligned deadline bleed out — `time_exit` exits were -$1,097 over
+  # 125 trades while `take_profit` exits were +$1,190. Capping the hold
+  # at 75 min cuts the losers off near their inflection point.
+  # The watcher caps every position's deadline at opened + this value;
+  # such exits are journaled with reason `hard_exit_75m` so the
+  # dashboard tracks the new cohort separately from old `time_exit`s.
+  hard_exit_minutes: 75
   order_type: limit
   scale_in_chunks: 2
 

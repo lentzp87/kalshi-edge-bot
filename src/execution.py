@@ -365,6 +365,19 @@ class Executor:
             deadline = max(tip_deadline, pos.opened_at + timedelta(minutes=15))
         else:
             deadline = flat_deadline
+        # Hard 75-min exit cap (promoted from the A/B exit simulator,
+        # 2026-05-24). Whatever the tip/flat deadline above works out to,
+        # never hold a position past `hard_exit_minutes` — the backtest
+        # showed trades open this long have usually missed their
+        # inflection point and bleed into a losing time_exit. When this
+        # cap is the binding deadline we journal the exit under a distinct
+        # reason so the dashboard tracks the cohort separately.
+        hard_deadline = pos.opened_at + timedelta(
+            minutes=self.cfg.hard_exit_minutes
+        )
+        hard_capped = hard_deadline < deadline
+        if hard_capped:
+            deadline = hard_deadline
         opened_ts = pos.opened_at.isoformat()
         while ticker in self.open:
             await asyncio.sleep(15)
@@ -403,7 +416,11 @@ class Executor:
                     await self._exit(ticker, mid, reason="stop_loss")
                     return
                 if datetime.now(timezone.utc) >= deadline:
-                    await self._exit(ticker, mid, reason="time_exit")
+                    exit_reason = (
+                        f"hard_exit_{self.cfg.hard_exit_minutes}m"
+                        if hard_capped else "time_exit"
+                    )
+                    await self._exit(ticker, mid, reason=exit_reason)
                     return
             except Exception as e:
                 log.exception("exec.watch.error", ticker=ticker, err=str(e))
