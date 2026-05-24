@@ -101,6 +101,35 @@ def evaluate(market: Market, est: ProbabilityEstimate) -> TradeSignal | None:
                  min=min_floor)
         return None
 
+    # Skip expensive entries — heavy favorites are a fee trap. Kalshi's
+    # fee peaks near $0.50; a $0.70 favorite needs ~75% just to break
+    # even. Research + our own by_entry_bucket data: entries above ~60c
+    # are net -$300+. None disables the cap.
+    side_cap = (
+        cfg.decision.max_entry_price_yes if side == "yes"
+        else cfg.decision.max_entry_price_no
+    )
+    if side_cap is not None and target_price > side_cap:
+        log.info("decision.skip.high_price",
+                 ticker=market.ticker, side=side,
+                 price=round(target_price, 3),
+                 p_yes=round(p_yes, 3),
+                 max=side_cap)
+        return None
+
+    # Skip suspiciously large edges. A gross edge above ~15pp almost
+    # never means a huge opportunity — it means stale book data, late
+    # news Kalshi has priced but the book hasn't, or a market-matching
+    # error. Our edge_calibration data: the 20-25pp bucket ran 40% wr,
+    # negative P&L. Treat big edges as suspect, not bigger. None disables.
+    max_edge = cfg.decision.max_edge
+    if max_edge is not None and gross_edge > max_edge:
+        log.info("decision.skip.edge_too_large",
+                 ticker=market.ticker, side=side,
+                 gross=round(gross_edge, 4), max=max_edge,
+                 p_yes=round(p_yes, 3), price=round(target_price, 3))
+        return None
+
     # Skip low-probability sides. p_yes is the model's prob that the
     # YES side wins; if we picked NO, our side's true prob is 1-p_yes.
     # Filter on the side WE'RE actually betting on.

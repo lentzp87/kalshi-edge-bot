@@ -258,6 +258,40 @@ def _windowed_pnl(closed_trades: list[dict], window_hours: int) -> dict:
     }
 
 
+def _tennis_summary(closed_trades: list[dict]) -> dict:
+    """Combined ATP + WTA P&L tracker. Tennis is the bot's one proven
+    surface, so we isolate it: lifetime + 24h + 72h, split by tour.
+    """
+    from datetime import datetime, timezone, timedelta
+    tennis = [t for t in closed_trades
+              if (t.get("ticker") or "").split("-", 1)[0]
+              in ("KXATPMATCH", "KXWTAMATCH")]
+
+    def _agg(rows: list[dict]) -> dict:
+        n = len(rows)
+        if not n:
+            return {"n": 0, "wins": 0, "losses": 0, "pnl": 0.0, "win_rate": 0.0}
+        pnl = sum(float(r.get("pnl_usd") or 0) for r in rows)
+        w = sum(1 for r in rows if (r.get("pnl_usd") or 0) > 0)
+        return {
+            "n": n, "wins": w, "losses": n - w,
+            "pnl": round(pnl, 2), "win_rate": round(w / n, 3),
+        }
+
+    now = datetime.now(timezone.utc)
+    iso24 = (now - timedelta(hours=24)).isoformat()
+    iso72 = (now - timedelta(hours=72)).isoformat()
+    return {
+        "lifetime": _agg(tennis),
+        "wta": _agg([t for t in tennis
+                     if (t.get("ticker") or "").startswith("KXWTAMATCH")]),
+        "atp": _agg([t for t in tennis
+                     if (t.get("ticker") or "").startswith("KXATPMATCH")]),
+        "last_24h": _agg([t for t in tennis if t.get("closed_ts", "") >= iso24]),
+        "last_72h": _agg([t for t in tennis if t.get("closed_ts", "") >= iso72]),
+    }
+
+
 def _bucket_aggregate(rows: list[dict], key_fn) -> list[dict]:
     """Group rows by key_fn(row) and return [{key, n, wins, pnl, avg_pnl, win_rate}]."""
     bucket: dict = defaultdict(lambda: {"n": 0, "wins": 0, "pnl": 0.0})
@@ -371,6 +405,33 @@ async def golf_3ball(send: bool = False, min_edge_pp: float = 0.04) -> dict:
     }
 
 
+@app.get("/welo")
+def welo(a: str = "", b: str = "", surface: str = "") -> dict:
+    """WElo (Weighted Elo) tennis model inspector. Read-only.
+
+    No args: returns seed status. With ?a=Player&b=Player (&surface=clay)
+    returns WElo's win probability for that matchup — the bot's
+    independent second opinion vs the Pinnacle line.
+    """
+    from .welo import engine
+    status = {
+        "seeded": engine.seeded,
+        "n_matches": engine.n_matches,
+        "n_players": engine.player_count(),
+    }
+    if a and b:
+        p = engine.win_probability(a, b, surface or None)
+        status["query"] = {
+            "player_a": a, "player_b": b,
+            "surface": surface or "overall",
+            "p_a_wins": round(p, 4) if p is not None else None,
+            "note": None if p is not None else (
+                "engine not seeded yet" if not engine.seeded
+                else "no rating history for one or both players"),
+        }
+    return status
+
+
 @app.get("/golf_leader")
 async def golf_leader(send: bool = False, lead_gap: int = 1,
                       min_thru: int = 9, min_edge_pp: float = 0.05) -> dict:
@@ -465,6 +526,7 @@ def stats() -> dict:
             "by_whale_class": [], "by_whale_magnitude": [], "by_whale_side": [],
             "by_side_x_entry": [],
             "windowed_pnl": [], "open_mtm": _open_unrealized_snapshot(_journal.open_positions()),
+            "tennis_summary": _tennis_summary([]),
             "n_clv": 0, "avg_clv_bp": 0.0, "pct_positive_clv": 0.0,
             "by_sport_clv": [],
             "settlement": {
@@ -605,6 +667,8 @@ def stats() -> dict:
             _windowed_pnl(chronological, h) for h in (3, 6, 12, 24)
         ],
         "open_mtm": _open_unrealized_snapshot(_journal.open_positions()),
+        # Tennis P&L tracker — the bot's one proven surface, isolated.
+        "tennis_summary": _tennis_summary(chronological),
         # ---- CLV summary -----------------------------------------------
         # CLV per trade: clv_price - fill_price (>0 if line moved our way).
         # Aggregated across trades with a non-null clv_price.
@@ -921,6 +985,16 @@ tr:last-child td {{ border-bottom: none; }}
       <th></th><th class="num">3h</th><th class="num">6h</th><th class="num">12h</th><th class="num">24h</th>
     </tr></thead>
     <tbody id="tbody-window-pnl"><tr><td colspan="5" class="empty">loading…</td></tr></tbody></table>
+  </div>
+
+  <div class="card" style="margin-bottom: 16px">
+    <div class="card-title"><h3>Tennis P&amp;L</h3>
+      <span class="meta">the bot's proven surface — ATP + WTA isolated</span></div>
+    <table class="window-pnl-table"><thead><tr>
+      <th></th><th class="num">Tennis</th><th class="num">WTA</th><th class="num">ATP</th>
+      <th class="num">24h</th><th class="num">72h</th>
+    </tr></thead>
+    <tbody id="tbody-tennis"><tr><td colspan="6" class="empty">loading…</td></tr></tbody></table>
   </div>
 
   <div class="card" style="margin-bottom: 16px">
@@ -1276,6 +1350,23 @@ function renderClvTable(tbodyId, rows) {{
     <td class="num">${{r.pct_positive.toFixed(0)}}%</td></tr>`).join('');
 }}
 
+function renderTennis(ts) {{
+  const tb = document.getElementById('tbody-tennis');
+  if (!ts || !ts.lifetime) {{
+    tb.innerHTML = '<tr><td colspan="6" class="empty">no tennis trades yet</td></tr>'; return;
+  }}
+  const cols = [ts.lifetime, ts.wta, ts.atp, ts.last_24h, ts.last_72h];
+  const cell = (c, fn) => fn(c);
+  const rows = [
+    {{ label: 'Trades', fn: c => `<span>${{c.n}}</span>` }},
+    {{ label: 'W / L', fn: c => `<span class="muted">${{c.wins}}/${{c.losses}}</span>` }},
+    {{ label: 'Win%', fn: c => `<span>${{(c.win_rate*100).toFixed(0)}}%</span>` }},
+    {{ label: 'P&L', fn: c => `<span class="${{cls(c.pnl)}}">${{fmt$(c.pnl)}}</span>` }},
+  ];
+  tb.innerHTML = rows.map(r => `<tr><td>${{r.label}}</td>` +
+    cols.map(c => `<td class="num">${{r.fn(c)}}</td>`).join('') + `</tr>`).join('');
+}}
+
 function renderWindowedPnl(windows, openMtm) {{
   const tb = document.getElementById('tbody-window-pnl');
   const meta = document.getElementById('window-pnl-meta');
@@ -1529,6 +1620,7 @@ async function refresh() {{
     renderBucketTable('tbody-side-x-entry',    stats.by_side_x_entry);
     renderClvTable('tbody-clv-sport',          stats.by_sport_clv);
     renderWindowedPnl(stats.windowed_pnl, stats.open_mtm);
+    renderTennis(stats.tennis_summary);
     renderBacktest(stats.settlement);
     renderCrossExchange(crossEx);
     renderGolfLeader(golfLeader);

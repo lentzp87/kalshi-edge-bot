@@ -83,6 +83,15 @@ decision:
   min_entry_price: 0.40         # legacy fallback (unused if both _yes/_no set)
   min_entry_price_yes: 0.35
   min_entry_price_no: 0.35
+  # 2026-05-23: upper entry-price caps. by_entry_bucket data + the
+  # Kalshi fee curve (peaks at 0.50) show entries above ~60c are a
+  # net -$300 fee trap. Cap both sides at 0.60.
+  max_entry_price_yes: 0.60
+  max_entry_price_no: 0.60
+  # 2026-05-23: edges above 15pp are suspect (stale line / mismatch /
+  # late news), not opportunity — the 20-25pp edge bucket ran 40% wr,
+  # negative P&L. Hard ceiling.
+  max_edge: 0.15
   min_p_yes: 0.52
   # 2026-05-19: cap the top end. 80%+ confidence trades over N=36 ran
   # 33% wr / -$285 — model is anti-predictive when most certain.

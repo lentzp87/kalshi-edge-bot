@@ -377,6 +377,20 @@ class Executor:
                     self.journal.update_current_mid(
                         ticker=ticker, opened_ts=opened_ts, mid=mid,
                     )
+                    # Instrument-only: snapshot the mid once when the
+                    # position crosses ~75 min old, so the A/B exit
+                    # simulator can backtest a "hard exit at 75 min"
+                    # policy. The journal write is itself write-once
+                    # (mid_at_75min IS NULL guard); the flag here just
+                    # avoids a redundant UPDATE every tick afterward.
+                    if not getattr(pos, "mid75_recorded", False):
+                        age_min = (datetime.now(timezone.utc)
+                                   - pos.opened_at).total_seconds() / 60
+                        if age_min >= 75:
+                            self.journal.update_mid_at_75min(
+                                ticker=ticker, opened_ts=opened_ts, mid=mid,
+                            )
+                            pos.mid75_recorded = True  # type: ignore[attr-defined]
                 # `mid` is already side-adjusted (NO mid for NO bets). So
                 # profit is mid - fill regardless of side. The previous
                 # branching here flipped the sign on every NO position,

@@ -35,7 +35,15 @@ POLICIES = (
     "sl_only_12",
     "time_only",
     "tp_and_sl_20_12",
+    "exit_75min",
 )
+
+# Hard-exit cap (minutes). The "exit_75min" policy keeps take-profit as
+# the bot does today, but additionally closes any position still open
+# at this age. Research (hold-duration analysis) suggests a trade open
+# this long has likely missed its inflection point — but we backtest it
+# from instrumented data rather than flipping the live setting blind.
+HARD_EXIT_MINUTES = 75
 
 
 def _sim_pnl(fill: float, exit_price: float, contracts: float) -> float:
@@ -104,7 +112,37 @@ def simulate_policy(trade: dict, policy: str) -> Optional[float]:
             return _sim_pnl(fill, sl_price, contracts)
         return settlement_val
 
+    if policy == "exit_75min":
+        # "Keep take-profit, but hard-cap any trade still open at 75 min."
+        #  - Trade that closed BEFORE 75 min (hit TP, or its own time
+        #    exit): the 75-min rule never fires — keep actual P&L.
+        #  - Trade open >= 75 min: the rule fires — P&L is the simulated
+        #    exit at the snapshotted mid_at_75min.
+        #  - mid_at_75min NULL (old trade, or never instrumented): can't
+        #    simulate — skip.
+        held = _hold_minutes(trade.get("opened_ts"), trade.get("closed_ts"))
+        if held is not None and held < HARD_EXIT_MINUTES:
+            pnl = trade.get("pnl_usd")
+            return float(pnl) if pnl is not None else None
+        mid75 = trade.get("mid_at_75min")
+        if mid75 is None:
+            return None
+        return _sim_pnl(fill, float(mid75), contracts)
+
     return None
+
+
+def _hold_minutes(opened_ts, closed_ts) -> Optional[float]:
+    """Hold duration in minutes from two ISO timestamps, or None."""
+    if not opened_ts or not closed_ts:
+        return None
+    from datetime import datetime
+    try:
+        o = datetime.fromisoformat(str(opened_ts).replace("Z", "+00:00"))
+        c = datetime.fromisoformat(str(closed_ts).replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    return (c - o).total_seconds() / 60.0
 
 
 def aggregate_exit_policies(trades: list[dict]) -> list[dict]:

@@ -84,6 +84,12 @@ _MIGRATIONS = [
     # have fired" without needing a full price-history table.
     "ALTER TABLE trades ADD COLUMN max_mid_during_hold REAL",
     "ALTER TABLE trades ADD COLUMN min_mid_during_hold REAL",
+    # Mid price snapshotted once when a position crosses ~75 min old.
+    # Lets the A/B exit simulator backtest a "hard exit at 75 min"
+    # policy without a full price-history table. Instrument-only —
+    # the live exit logic is unchanged. NULL for trades that closed
+    # before 75 min or that opened before this column existed.
+    "ALTER TABLE trades ADD COLUMN mid_at_75min REAL",
 ]
 
 
@@ -238,6 +244,18 @@ class Journal:
             "  min_mid_during_hold = MIN(COALESCE(min_mid_during_hold, ?), ?) "
             "WHERE ticker=? AND opened_ts=? AND closed_ts IS NULL",
             (mid, self._now(), mid, mid, mid, mid, ticker, opened_ts),
+        )
+        self.conn.commit()
+
+    def update_mid_at_75min(self, *, ticker: str, opened_ts: str, mid: float) -> None:
+        """Snapshot the mid once, when a position crosses ~75 min old.
+        The `mid_at_75min IS NULL` guard makes this write-once even if
+        the watcher calls it on more than one tick past the threshold.
+        """
+        self.conn.execute(
+            "UPDATE trades SET mid_at_75min=? "
+            "WHERE ticker=? AND opened_ts=? AND mid_at_75min IS NULL",
+            (mid, ticker, opened_ts),
         )
         self.conn.commit()
 

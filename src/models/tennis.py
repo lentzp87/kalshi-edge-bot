@@ -132,6 +132,26 @@ class TennisModel:
 
         p_yes = max(0.02, min(0.98, p_yes))
 
+        # ----- WElo observe-only comparison -----
+        # Independent second opinion (Weighted Elo from match history).
+        # Logged for now, NOT used to size or gate trades — we want to
+        # measure whether WElo agrees/disagrees with Pinnacle and which
+        # is right before trusting it. welo_p is for player_a; flip if
+        # our side is player_b.
+        try:
+            from ..welo import engine as _welo
+            welo_a = _welo.win_probability(a_full, b_full)
+            if welo_a is not None:
+                our_is_a = (name_match(our_name, player_a)
+                            or name_match(our_name, a_full))
+                welo_p = welo_a if our_is_a else (1.0 - welo_a)
+                log.info("welo.compare", ticker=ticker,
+                         pinnacle_p=round(p_yes, 3),
+                         welo_p=round(welo_p, 3),
+                         delta=round(welo_p - p_yes, 3))
+        except Exception:  # noqa: BLE001 - observe-only must never break trading
+            pass
+
         # Tennis books are tighter on majors, looser on Challengers /
         # ITF. Cap confidence at 0.7 — slightly under team sports — so
         # Kelly size stays restrained when the book is thin.

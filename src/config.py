@@ -37,6 +37,14 @@ class DecisionConfig(BaseModel):
     min_entry_price: float = 0.55
     min_entry_price_yes: float | None = None
     min_entry_price_no: float | None = None
+    # Upper bound on entry price — heavy favorites are a fee trap.
+    # None disables the cap for that side.
+    max_entry_price_yes: float | None = None
+    max_entry_price_no: float | None = None
+    # Upper bound on gross edge. Edges above this are treated as
+    # suspect (stale data / mismatch / late news), not as opportunity.
+    # None disables.
+    max_edge: float | None = None
     # Minimum model probability for OUR chosen side. If model thinks our
     # side wins 60%+, fire. If it's a coin flip or worse, skip — even
     # if the edge looks positive, the variance/fee math is unfriendly.

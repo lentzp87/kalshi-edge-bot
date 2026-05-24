@@ -505,9 +505,24 @@ async def amain() -> None:
                     _os.environ.get("GOLF_LEADER_INTERVAL_MINUTES", "10")
                 ),
             ),
+            # WElo seed — one-shot. Downloads recent ATP/WTA match
+            # history and builds independent tennis ratings. Until it
+            # completes, welo.win_probability() returns None and the
+            # tennis model just uses Pinnacle. Observe-only for now.
+            _welo_seed_once(),
         )
     finally:
         await client.aclose()
+
+
+async def _welo_seed_once() -> None:
+    """Build WElo ratings once at startup, then exit. Wrapped so a
+    seed failure can't take down the asyncio.gather group."""
+    try:
+        from . import welo
+        await welo.seed()
+    except Exception:
+        log.exception("welo.seed_wrapper_error")
 
 
 def main() -> None:
