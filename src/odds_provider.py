@@ -249,6 +249,9 @@ PINNACLE_LEAGUE_IDS: dict[str, int] = {
 PINNACLE_SPORT_IDS: dict[str, int] = {
     "tennis":  33,   # ATP / WTA / ITF / Challenger — split per round
     "cricket":  8,   # IPL=720, Test=8896, World Cup L2, etc.
+    "soccer":  29,   # EPL, La Liga, Bundesliga, Serie A, MLS, UCL,
+                     # Europa, friendlies — too many leagues to hardcode,
+                     # we enumerate dynamically per /sports/29/leagues.
 }
 
 # Cache of (active_league_ids) per sport_id, refreshed every 10 min.
@@ -396,6 +399,128 @@ async def _pinnacle_search_two_way(
             a=name_a, matched_a=a_full, fair_a=round(fair_a, 4),
         )
         return fair_a, fair_b, "pinnacle", a_full, b_full
+
+    return None
+
+
+async def _pinnacle_search_three_way_soccer(
+    *, home_name: str, away_name: str,
+) -> tuple[float, float, str, str, str] | None:
+    """Pinnacle 3-way moneyline search for soccer.
+
+    Returns (p_home, p_away, provider, home_full, away_full) on first
+    match. p_home + p_away != 1 here because the draw probability is
+    implicitly held in (1 - p_home - p_away) — the Kalshi-side caller
+    `fair_probability_for_soccer` documents this; the model handles the
+    draw absorption by mapping "no for HOME" to (1 - p_home).
+
+    Uses the same dynamic-league-enumeration pattern as tennis (sport_id
+    33) and cricket (sport_id 8): soccer has too many leagues
+    (EPL/UCL/MLS/La Liga/...) to hardcode, so we list every league with
+    matchupCount>0 and search them all. Cache TTL on the league list is
+    10 min, individual league markets 5 min — same as the other sports.
+    """
+    sport_id = PINNACLE_SPORT_IDS.get("soccer")
+    if not sport_id:
+        return None
+    league_ids = await _fetch_pinnacle_active_leagues(sport_id)
+    if not league_ids:
+        return None
+
+    for lid in league_ids:
+        data = await _fetch_pinnacle_league(lid)
+        if not data:
+            continue
+        matchups = data.get("matchups") or []
+        markets = data.get("markets") or []
+        if not matchups:
+            continue
+
+        # Build matchupId -> (away_name, home_name) lookup
+        mu_by_id: dict[int, tuple[str, str]] = {}
+        for mu in matchups:
+            mid = mu.get("id")
+            if not mid:
+                continue
+            teams = _pinnacle_participants(mu)
+            if teams:
+                mu_by_id[int(mid)] = teams
+
+        # Find matchup matching home/away in either Pinnacle orientation.
+        # Kalshi's "home" might be Pinnacle's "away" depending on which
+        # feed got the venue right, so we try both ways and remember the
+        # actual Pinnacle alignment so the moneyline lookup below stays
+        # aligned with the returned p_home / p_away.
+        target_mu_id = None
+        pin_away = pin_home = None
+        for mid, (a_pin, h_pin) in mu_by_id.items():
+            # forward: Kalshi home == Pinnacle home, Kalshi away == Pinnacle away
+            if name_match(home_name, h_pin) and name_match(away_name, a_pin):
+                target_mu_id = mid
+                pin_away, pin_home = a_pin, h_pin
+                break
+            # reverse: Kalshi home == Pinnacle away (Kalshi got the venue
+            # backwards). Swap so pin_home is genuinely the team we want
+            # p_home to correspond to.
+            if name_match(home_name, a_pin) and name_match(away_name, h_pin):
+                target_mu_id = mid
+                pin_away, pin_home = h_pin, a_pin
+                break
+        if target_mu_id is None:
+            continue
+
+        # Find the full-match 3-way moneyline market for that matchup.
+        # Pinnacle soccer has multiple moneyline markets per matchup
+        # split by `period` (0 = full match, 1 = first half, 2 = second
+        # half, ...). We only want period 0 — Kalshi's soccer markets
+        # resolve on the full match result. Critically we also need to
+        # reset home/away/draw INSIDE the per-market loop so we don't
+        # accidentally compose odds from different period markets when
+        # one has draw and the other doesn't.
+        home_odds = away_odds = draw_odds = None
+        for mk in markets:
+            if mk.get("matchupId") != target_mu_id:
+                continue
+            if (mk.get("type") or "").lower() != "moneyline":
+                continue
+            if mk.get("period") != 0:
+                continue
+            h = a = d = None
+            for price in mk.get("prices") or []:
+                des = (price.get("designation") or "").lower()
+                if des == "home":
+                    h = price.get("price")
+                elif des == "away":
+                    a = price.get("price")
+                elif des == "draw":
+                    d = price.get("price")
+            if h is not None and a is not None and d is not None:
+                home_odds, away_odds, draw_odds = h, a, d
+                break
+
+        if home_odds is None or away_odds is None or draw_odds is None:
+            continue
+        # If Pinnacle and Kalshi disagreed on home/away above we swapped
+        # `pin_home` / `pin_away` to follow Kalshi's convention. But the
+        # `designation == "home"` price ALWAYS refers to Pinnacle's
+        # original home — so if we swapped, the home/away odds also need
+        # to swap before devig.
+        original = mu_by_id.get(target_mu_id)
+        if original and pin_home != original[1]:
+            home_odds, away_odds = away_odds, home_odds
+        triple = await _devig_three_way(home_odds, away_odds, draw_odds)
+        if not triple:
+            continue
+        p_home, p_away, p_draw = triple
+        log.info(
+            "pinnacle.matched.soccer",
+            sport_id=sport_id, league_id=lid,
+            home=pin_home, away=pin_away,
+            p_home=round(p_home, 4),
+            p_away=round(p_away, 4),
+            p_draw=round(p_draw, 4),
+        )
+        return p_home, p_away, f"pinnacle:soccer:{lid}", pin_home, pin_away
 
     return None
 
@@ -1025,12 +1150,33 @@ async def fair_probability_for_soccer(
 ) -> tuple[float, float, str, str, str] | None:
     """Returns (p_home_wins, p_away_wins, provider, home_full, away_full).
 
+    Two-tier price source:
+      Tier 1 — Pinnacle 3-way moneyline (devig home/away/draw). Sharper
+        line, broader league coverage (sport_id 29 enumerates EPL, UCL,
+        MLS, La Liga, Bundesliga, Serie A, ...). Added 2026-05-30 for
+        UEFA Champions League final week — soccer.py would always return
+        None before this because the Odds API tier was the only path
+        and it's been flaky.
+      Tier 2 — The Odds API (existing path). Fallback for leagues
+        Pinnacle doesn't carry.
+
     Note: p_home_wins + p_away_wins != 1 in soccer (because of draws).
     The Kalshi caller maps "yes for HOME" to p_home_wins and "no for HOME"
     to (1 - p_home_wins) which absorbs the draw probability.
     """
+    if not home_name or not away_name:
+        return None
+
+    # Tier 1: Pinnacle 3-way moneyline.
+    pin = await _pinnacle_search_three_way_soccer(
+        home_name=home_name, away_name=away_name,
+    )
+    if pin:
+        return pin
+
+    # Tier 2: The Odds API (existing path).
     sport_keys = await _fetch_active_soccer_sport_keys()
-    if not sport_keys or not home_name or not away_name:
+    if not sport_keys:
         return None
 
     date_window: set[str] | None = None
