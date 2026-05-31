@@ -36,11 +36,36 @@ from .base import ProbabilityEstimate
 log = structlog.get_logger(__name__)
 
 
-# Series prefixes we handle. Add more as the bot logs unknown ones.
-SOCCER_SERIES: set[str] = {
-    "KXSOCCERMATCH", "KXEPLGAME", "KXMLSGAME", "KXCHAMPSGAME",
-    "KXLALIGAGAME", "KXSERIE", "KXBUNDESLIGAGAME",
-}
+# 2026-05-31: SOCCER PAUSED. The Pinnacle 3-way path
+# (_pinnacle_search_three_way_soccer in odds_provider.py) is built,
+# tested live, and ready — but two things made trading now a bad call:
+#
+#   1. Most major leagues are between seasons. Kalshi API query on
+#      2026-05-31 showed 0 open markets for UCL, EPL, MLS, Bundesliga,
+#      Serie A, La Liga. The only active markets were niche South
+#      American leagues (Chile, Peru, Venezuela, Colombia, Spanish
+#      La Liga 2 playoffs) — markets we have zero history on and the
+#      bot's track record on unfamiliar leagues has been mixed
+#      (cricket -$128, WNBA -$131, IPL -$69 all got cut).
+#   2. Kalshi soccer markets are *3-way with explicit -TIE tickers*,
+#      not the 2-way "Will TEAM win? NO absorbs draw" shape this model
+#      currently assumes. The -TIE ticker would need its own
+#      side-mapping branch (p_yes = p_draw). Adding that without a real
+#      market to test against is asking for a silent bug.
+#
+# Reinstate after August when EPL kicks off and KXEPLGAME / KXUCLGAME
+# start posting markets. At that point:
+#   - Restore the series list (real Kalshi tickers confirmed via API):
+#       KXUCLGAME, KXUELGAME, KXUECLGAME, KXUEFAGAME, KXUEFANLGAME,
+#       KXMLSGAME, KXLALIGAGAME, KXLALIGA2GAME, KXSERIEAGAME,
+#       KXBUNDESLIGAGAME, KXBUNDESLIGA2GAME, KXLIGAMXGAME,
+#       KXLIGAPORTUGALGAME, KXBRASILEIROGAME, KXCOPADELREYGAME,
+#       KXCOPADOBRASILGAME, KXCHLLDPGAME, KXPERLIGA1GAME, KXDIMAYORGAME,
+#       KXVENFUTVEGAME, KXECULPGAME, KXSPBGAME, KXDANISHSUPERLIGAGAME
+#   - Add -TIE branch in estimate(): if ticker ends with "-TIE", map
+#     p_yes = p_draw from the 3-way devig.
+#   - Test against a single big-name match before letting it loose.
+SOCCER_SERIES: set[str] = set()
 
 # Trade window (soccer matches are typically scheduled days in advance)
 SOCCER_MAX_MIN = 36 * 60
