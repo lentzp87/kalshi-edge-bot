@@ -50,7 +50,14 @@ log = structlog.get_logger(__name__)
 # series — IPL prop markets like KXIPLFIRST10 / KXIPLSIX / KXIPLFOUR
 # are intentionally excluded (different model entirely).
 CRICKET_SERIES: set[str] = {
-    "KXIPLGAME",
+    # 2026-05-27: KXIPLGAME removed. 12 trades, 50% wr, -$69.40.
+    # Pinnacle has the IPL line but the bot keeps picking the wrong
+    # side — IPL is volatile (T20 single-innings, weather + toss matter
+    # a lot) and our model doesn't ingest any of that. Cost $17 on the
+    # RR-SRH Eliminator after the perplexity-flagged warning. Sit out
+    # the remaining IPL playoffs; reinstate after a cricket-specific
+    # rebuild (toss, ground conditions, recent form).
+    # "KXIPLGAME",
     "KXCRICKETT20IMATCH",
     "KXCRICKETODIMATCH",
     "KXCRICKETTESTMATCH",
