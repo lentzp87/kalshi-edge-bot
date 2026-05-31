@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +23,14 @@ from .decision import TradeSignal
 from .kalshi_client import Market
 
 log = structlog.get_logger(__name__)
+
+# Dedup window for log_shadow_signal. The same (model, ticker, side)
+# can only re-log this often. 1h is plenty — settled_outcome is what we
+# care about, not how many times the same pick was emitted intra-hour.
+SHADOW_DEDUP_SECONDS = 3600
+# Prune entries from the dedup cache every N writes so it can't grow
+# unbounded across a long-running process.
+SHADOW_DEDUP_PRUNE_EVERY = 500
 
 
 SCHEMA = """
@@ -137,6 +146,15 @@ class Journal:
             except sqlite3.OperationalError:
                 pass
         self.conn.commit()
+        # In-memory dedup cache for log_shadow_signal. Maps
+        # (model, ticker, side) -> last-logged unix ts. We skip the
+        # INSERT if the same key was logged within SHADOW_DEDUP_SECONDS.
+        # Without this the table grows ~150k rows/day (every model on
+        # every market on every scan). The cache itself is pruned
+        # opportunistically every PRUNE_EVERY inserts so it can't blow
+        # memory either.
+        self._shadow_dedup: dict[tuple[str, str, str], float] = {}
+        self._shadow_dedup_writes_since_prune = 0
 
     @staticmethod
     def _now() -> str:
@@ -270,7 +288,20 @@ class Journal:
                           prob: float, edge: float, kalshi_price: float,
                           note: str) -> None:
         """Record one observe-only shadow-model pick. Backtested later
-        by joining settled_outcome (filled by the settlement backfill)."""
+        by joining settled_outcome (filled by the settlement backfill).
+
+        Deduped by (model, ticker, side): the same pick within
+        SHADOW_DEDUP_SECONDS is a no-op. Without this the scanner re-logs
+        identical picks every loop iteration — burned 887k rows in 6 days
+        before this was added (2026-05-30 recovery). The win-rate calc
+        only cares about unique picks that settle, so the extra rows
+        had no analytical value, just bloat.
+        """
+        now_ts = time.time()
+        key = (model, ticker, side)
+        last_ts = self._shadow_dedup.get(key)
+        if last_ts is not None and (now_ts - last_ts) < SHADOW_DEDUP_SECONDS:
+            return
         self.conn.execute(
             "INSERT INTO shadow_signals "
             "(ts, model, ticker, side, prob, edge, kalshi_price, note) "
@@ -278,6 +309,16 @@ class Journal:
             (self._now(), model, ticker, side, prob, edge, kalshi_price, note),
         )
         self.conn.commit()
+        self._shadow_dedup[key] = now_ts
+        # Opportunistic prune so the cache itself can't grow unbounded
+        # across a long-running process.
+        self._shadow_dedup_writes_since_prune += 1
+        if self._shadow_dedup_writes_since_prune >= SHADOW_DEDUP_PRUNE_EVERY:
+            cutoff = now_ts - SHADOW_DEDUP_SECONDS
+            self._shadow_dedup = {
+                k: ts for k, ts in self._shadow_dedup.items() if ts >= cutoff
+            }
+            self._shadow_dedup_writes_since_prune = 0
 
     def shadow_summary(self) -> list[dict]:
         """Per-model shadow-signal counts + resolved-pick win rate.
@@ -321,6 +362,44 @@ class Journal:
             (settled_outcome, self._now(), signal_id),
         )
         self.conn.commit()
+
+    def cleanup_old_rows(self, *, shadow_max_age_days: int = 14) -> dict:
+        """Prune the write-only signals table + stale unresolved shadow
+        picks. Returns a dict of {table -> rows_deleted} for logging.
+
+        - `signals` is write-only (nothing reads from it). Truncated
+          every run.
+        - `shadow_signals` resolved picks are KEPT forever — that's the
+          backtest. Only unresolved picks older than
+          `shadow_max_age_days` are dropped: those games are done and
+          won't ever settle.
+        - VACUUM at the end reclaims the freed disk pages. Briefly
+          locks the DB; at our size (<50MB normal) this is <1s.
+
+        Called from src/main.py's journal_cleanup_loop every 7 days.
+        Without this, scanner-side write volume swelled the DB to
+        492MB on 2026-05-30 and pushed the bot over its Render memory
+        cap, causing dashboard reads to silently fail.
+        """
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM signals")
+        signals_before = int(cur.fetchone()[0])
+        cur.execute("DELETE FROM signals")
+        cur.execute(
+            "DELETE FROM shadow_signals "
+            "WHERE settled_outcome IS NULL "
+            "  AND ts < datetime('now', ?)",
+            (f"-{int(shadow_max_age_days)} days",),
+        )
+        shadow_unresolved_deleted = int(cur.rowcount)
+        self.conn.commit()
+        # VACUUM must run outside any transaction. The commit above
+        # closes the implicit one started by DELETE.
+        cur.execute("VACUUM")
+        return {
+            "signals_deleted": signals_before,
+            "shadow_unresolved_deleted": shadow_unresolved_deleted,
+        }
 
     def update_mid_at_75min(self, *, ticker: str, opened_ts: str, mid: float) -> None:
         """Snapshot the mid once, when a position crosses ~75 min old.

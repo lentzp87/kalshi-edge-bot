@@ -211,6 +211,40 @@ async def trading_loop(
         await asyncio.sleep(cfg.scanner.loop_interval_seconds)
 
 
+async def journal_cleanup_loop(
+    journal: Journal, *,
+    interval_seconds: int = 7 * 24 * 3600,
+    shadow_max_age_days: int = 14,
+) -> None:
+    """Periodic prune of journal bloat.
+
+    Every `interval_seconds` (default 7 days):
+      - DELETE FROM signals (write-only table, never read).
+      - DELETE shadow_signals rows that are unresolved AND older than
+        `shadow_max_age_days`. Resolved picks are KEPT — that's the
+        backtest.
+      - VACUUM to reclaim disk pages.
+
+    Without this the journal grew to 492MB / 1.5M signals + 887k
+    shadow_signals on 2026-05-30, blew past the Render starter plan's
+    512MB RAM cap, and silently broke dashboard reads. The dedup added
+    to log_shadow_signal at the same time prevents the underlying
+    growth; this loop is the belt-and-suspenders backstop.
+
+    First run is delayed by `interval_seconds` (not on boot) so a
+    crash-restart loop can't thrash VACUUM.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            stats = journal.cleanup_old_rows(
+                shadow_max_age_days=shadow_max_age_days,
+            )
+            log.info("journal.cleanup.done", **stats)
+        except Exception:
+            log.exception("journal.cleanup.error")
+
+
 async def slack_digest_loop(
     journal: Journal, *, interval_hours: int = 6,
 ) -> None:
@@ -520,6 +554,12 @@ async def amain() -> None:
             # completes, welo.win_probability() returns None and the
             # tennis model just uses Pinnacle. Observe-only for now.
             _welo_seed_once(),
+            # Weekly journal prune. Truncates the write-only signals
+            # table and drops stale unresolved shadow picks, then
+            # VACUUMs. Without this the DB grew to 492MB and blew past
+            # the 512MB RAM cap on 2026-05-30. log_shadow_signal dedup
+            # is the primary defense; this is the backstop.
+            journal_cleanup_loop(journal),
         )
     finally:
         await client.aclose()
