@@ -118,6 +118,24 @@ _MIGRATIONS = [
     # the live exit logic is unchanged. NULL for trades that closed
     # before 75 min or that opened before this column existed.
     "ALTER TABLE trades ADD COLUMN mid_at_75min REAL",
+    # 2026-05-31: TP fillability tracker. Paper mode credits the full
+    # exit at `exit_price` (the mid), but in real life a sell sweep
+    # walks the bid stack and the avg fill is worse than mid. These
+    # columns let the dashboard show paper TP P&L vs realistic TP P&L
+    # so we can see how much of the +$1,696 TP profit survives real
+    # fills. Populated only on take_profit exits.
+    "ALTER TABLE trades ADD COLUMN realistic_exit_price REAL",
+    "ALTER TABLE trades ADD COLUMN exit_book_size INTEGER",
+    # 2026-05-31: CLV sample status codes. Replaces silent skips with
+    # a labeled reason so the skip patterns themselves become signal.
+    # Values: 'valid', 'skipped_empty_book', 'skipped_extreme_mid',
+    # 'skipped_wide_spread', 'skipped_after_start', 'skipped_no_book'.
+    # NULL = pre-existing rows where the sampler hadn't tagged status.
+    "ALTER TABLE trades ADD COLUMN clv_status TEXT",
+    # 2026-05-31: Thesis-decay exit instrumentation. When the watcher
+    # detects the modeled edge has gone away mid-hold, it exits with
+    # reason='thesis_decay' and stamps the revalidated edge at exit.
+    "ALTER TABLE trades ADD COLUMN exit_edge REAL",
 ]
 
 
@@ -196,11 +214,44 @@ class Journal:
         )
         self.conn.commit()
 
-    def log_close(self, *, ticker: str, exit_price: float, pnl_usd: float, fees_usd: float, reason: str) -> None:
+    def log_close(
+        self, *, ticker: str, exit_price: float, pnl_usd: float,
+        fees_usd: float, reason: str,
+        realistic_exit_price: float | None = None,
+        exit_book_size: int | None = None,
+        exit_edge: float | None = None,
+    ) -> None:
+        """Stamp the exit fields on the open row for this ticker.
+
+        `realistic_exit_price` and `exit_book_size` come from the live
+        orderbook sweep at exit time (TP fillability tracker, 2026-05-31).
+        Paper mode books the trade at the optimistic mid; recording the
+        realistic sweep avg lets the dashboard show paper vs realistic.
+        Both NULL when orderbook wasn't available (older trades, etc.).
+
+        `exit_edge` is the revalidated edge at the moment a thesis-decay
+        exit fires — used to show that the decay rule is firing on
+        genuinely-expired edges, not just on random ticks.
+        """
         self.conn.execute(
-            "UPDATE trades SET closed_ts=?, exit_price=?, pnl_usd=?, fees_usd=?, exit_reason=? "
+            "UPDATE trades SET closed_ts=?, exit_price=?, pnl_usd=?, "
+            "  fees_usd=?, exit_reason=?, realistic_exit_price=?, "
+            "  exit_book_size=?, exit_edge=? "
             "WHERE ticker=? AND closed_ts IS NULL",
-            (self._now(), exit_price, pnl_usd, fees_usd, reason, ticker),
+            (self._now(), exit_price, pnl_usd, fees_usd, reason,
+             realistic_exit_price, exit_book_size, exit_edge, ticker),
+        )
+        self.conn.commit()
+
+    def update_clv_status(self, *, ticker: str, opened_ts: str,
+                          status: str) -> None:
+        """Stamp the CLV sample outcome (status code) for a position.
+        Called by _sample_clv whether the sample was valid or skipped —
+        the skip reasons themselves are diagnostic signal."""
+        self.conn.execute(
+            "UPDATE trades SET clv_status=? "
+            "WHERE ticker=? AND opened_ts=?",
+            (status, ticker, opened_ts),
         )
         self.conn.commit()
 

@@ -122,6 +122,7 @@ class Executor:
     def __init__(
         self, client: KalshiClient, risk: RiskEngine, journal: Journal,
         *, whale_tracker=None,
+        revalidate_edge=None,
     ) -> None:
         self.client = client
         self.risk = risk
@@ -132,6 +133,15 @@ class Executor:
         # Optional whale tracker — when an aligned whale signal exists for
         # this ticker, size gets boosted to whale_max_position_size_usd.
         self.whale_tracker = whale_tracker
+        # Optional thesis-decay revalidator. Async callable:
+        #   await revalidate_edge(ticker, side, current_mid) -> float | None
+        # Returns the current net edge (model_p - exit_price - spread
+        # cushion) if it can recompute, or None if the model can't
+        # produce a probability right now (e.g. Pinnacle returned no
+        # match). When it returns a value below cfg.thesis_decay_min_
+        # negative_edge, the watcher exits with reason 'thesis_decay'.
+        # Wiring lives in main.py — None by default = decay disabled.
+        self.revalidate_edge = revalidate_edge
         # Event-level dedup: BOS-yes and TB-no on the same Kalshi event
         # are the same bet (both win if Boston wins). Locking by
         # event_ticker prevents double-exposure across mirror tickers.
@@ -316,33 +326,110 @@ class Executor:
     async def _sample_clv(
         self, ticker: str, side: str, tip_utc: datetime, opened_ts: str,
     ) -> None:
-        """Wait until ~5 min before tipoff, then record Kalshi mid as CLV.
+        """Windowed CLV sampler: capture the LAST VALID Kalshi mid
+        between T-30min and T-2min before tipoff.
 
-        Runs independently of the position lifecycle — even if we exit
-        via TP/SL hours before tip, we still capture the closing-line
-        proxy for that ticker. The journal row is matched by
-        (ticker, opened_ts) so concurrent positions on the same ticker
-        across the session don't collide.
+        Why windowed (and not the old single-point T-5min sample):
+        tennis match start times are notoriously fluid. Matches can
+        start early when prior ones end fast, get delayed by rain, get
+        suspended mid-match, or end in walkovers — any of which means
+        a single T-5min poll hits an empty book, a settled market, or
+        the wrong moment. We poll every 2-3 min through the closing
+        window and keep whichever sample was the LATEST one that
+        passed validity (non-empty book, mid in [0.05, 0.95], spread
+        <= 12¢). The status code we write to the trade row tells the
+        dashboard WHY we accepted or skipped — silent skipping was
+        what hid the 0.5 fallback bug for weeks (see audit 2026-05-31).
         """
-        target = tip_utc - timedelta(minutes=5)
-        wait_seconds = (target - datetime.now(timezone.utc)).total_seconds()
+        # Sleep until the window opens (T-30 min before tip).
+        window_open = tip_utc - timedelta(minutes=30)
+        window_close = tip_utc - timedelta(minutes=2)
+        wait_seconds = (
+            window_open - datetime.now(timezone.utc)
+        ).total_seconds()
         # Cap at 36 hours so a far-future tip doesn't pin the task forever
         wait_seconds = max(0.0, min(wait_seconds, 36 * 3600))
         try:
             await asyncio.sleep(wait_seconds)
         except asyncio.CancelledError:
             return
+        last_valid_mid: float | None = None
+        last_status = "skipped_no_book"
+        poll_interval = 180  # 3 minutes — gives us ~10 samples per window
         try:
-            ob = await self.client.get_orderbook(ticker)
-            mid = self._mid_from_orderbook(ob, side)
-            if 0 < mid < 1:
+            while datetime.now(timezone.utc) < window_close:
+                status, mid = await self._clv_sample_once(ticker, side)
+                if status == "valid" and mid is not None:
+                    last_valid_mid = mid
+                    last_status = "valid"
+                elif last_status != "valid":
+                    # Track the most recent failure reason so the
+                    # dashboard can show why a window produced nothing.
+                    last_status = status
+                try:
+                    await asyncio.sleep(poll_interval)
+                except asyncio.CancelledError:
+                    break
+            # Stamp the outcome — either the last valid mid or the
+            # last failure reason. update_clv_status writes the status
+            # code regardless; update_clv_price only fires on success.
+            if last_valid_mid is not None:
                 self.journal.update_clv_price(
-                    ticker=ticker, opened_ts=opened_ts, clv_price=mid,
+                    ticker=ticker, opened_ts=opened_ts,
+                    clv_price=last_valid_mid,
                 )
-                log.info("clv.recorded", ticker=ticker, side=side,
-                         clv_price=round(mid, 4))
+            self.journal.update_clv_status(
+                ticker=ticker, opened_ts=opened_ts, status=last_status,
+            )
+            log.info("clv.window_done",
+                     ticker=ticker, side=side,
+                     status=last_status,
+                     clv_price=round(last_valid_mid, 4)
+                              if last_valid_mid is not None else None)
         except Exception:
             log.exception("clv.sample_failed", ticker=ticker)
+
+    async def _clv_sample_once(
+        self, ticker: str, side: str,
+    ) -> tuple[str, float | None]:
+        """One CLV poll. Returns (status, mid_or_None).
+
+        Status codes:
+          'valid'                 — book non-empty, spread tight, mid in band
+          'skipped_empty_book'    — yes and no books both empty
+          'skipped_extreme_mid'   — outside [0.05, 0.95] (settled / broken)
+          'skipped_wide_spread'   — spread > 12¢ (untradable book)
+          'skipped_no_book'       — fetch returned nothing
+        """
+        try:
+            ob = await self.client.get_orderbook(ticker)
+        except Exception:
+            log.debug("clv.poll.fetch_error", ticker=ticker)
+            return "skipped_no_book", None
+        if not ob:
+            return "skipped_no_book", None
+        book = ob.get("orderbook_fp") or ob.get("orderbook") or {}
+        yes_book = book.get("yes_dollars") or book.get("yes") or []
+        no_book = book.get("no_dollars") or book.get("no") or []
+        if not yes_book and not no_book:
+            return "skipped_empty_book", None
+        # Compute yes_bid and yes_ask explicitly so we can also gate on
+        # spread. (mid_from_orderbook already does this internally but
+        # we need the bid/ask separately for the spread check.)
+        try:
+            yes_bid = float(yes_book[-1][0]) if yes_book else 0.0
+            no_bid = float(no_book[-1][0]) if no_book else 0.0
+            yes_ask = (1.0 - no_bid) if no_bid > 0 else 0.0
+        except (ValueError, IndexError, TypeError):
+            return "skipped_no_book", None
+        if yes_bid > 0 and yes_ask > 0:
+            spread_cents = abs(yes_ask - yes_bid) * 100.0
+            if spread_cents > 12.0:
+                return "skipped_wide_spread", None
+        mid = self._mid_from_orderbook(ob, side)
+        if not (0.05 < mid < 0.95):
+            return "skipped_extreme_mid", None
+        return "valid", mid
 
     async def _watch(self, ticker: str) -> None:
         pos = self.open.get(ticker)
@@ -410,20 +497,122 @@ class Executor:
                 # making take_profit trigger on losses and vice versa.
                 pnl_pct = (mid - pos.fill_price) / pos.fill_price
                 if pnl_pct >= self.cfg.take_profit_pct:
-                    await self._exit(ticker, mid, reason="take_profit")
+                    await self._exit(ticker, mid, reason="take_profit",
+                                     orderbook=ob)
                     return
                 if pnl_pct <= -self.cfg.stop_loss_pct:
-                    await self._exit(ticker, mid, reason="stop_loss")
+                    await self._exit(ticker, mid, reason="stop_loss",
+                                     orderbook=ob)
                     return
+                # Thesis-decay check (gated by config + age + cadence).
+                # Calls back into the model dispatcher to re-ask: given
+                # the CURRENT Kalshi exit price and the CURRENT Pinnacle
+                # fair, is the edge still there? If the answer is "no,
+                # by more than `thesis_decay_min_negative_edge`", exit.
+                # This replaces blunt clock-based exits with a state-
+                # based one — fixes the "time_exit eats -$8.73/trade"
+                # leak ChatGPT review surfaced 2026-05-31.
+                if (self.cfg.thesis_decay_enabled
+                        and self.revalidate_edge is not None):
+                    age_min = (
+                        datetime.now(timezone.utc) - pos.opened_at
+                    ).total_seconds() / 60
+                    last_check = getattr(pos, "last_decay_check", None)
+                    cadence_ok = (
+                        last_check is None
+                        or (datetime.now(timezone.utc) - last_check)
+                            .total_seconds() / 60
+                            >= self.cfg.thesis_decay_revalidate_minutes
+                    )
+                    if (age_min >= self.cfg.thesis_decay_min_age_minutes
+                            and cadence_ok):
+                        pos.last_decay_check = (  # type: ignore[attr-defined]
+                            datetime.now(timezone.utc)
+                        )
+                        try:
+                            current_edge = await self.revalidate_edge(
+                                ticker, pos.signal.side, mid,
+                            )
+                        except Exception:
+                            log.exception("exec.decay.revalidate_error",
+                                          ticker=ticker)
+                            current_edge = None
+                        if (current_edge is not None
+                                and current_edge
+                                    < self.cfg.thesis_decay_min_negative_edge):
+                            log.info("exec.exit.thesis_decay",
+                                     ticker=ticker, side=pos.signal.side,
+                                     age_min=round(age_min, 1),
+                                     current_edge=round(current_edge, 4))
+                            await self._exit(
+                                ticker, mid, reason="thesis_decay",
+                                orderbook=ob, exit_edge=current_edge,
+                            )
+                            return
                 if datetime.now(timezone.utc) >= deadline:
                     exit_reason = (
                         f"hard_exit_{self.cfg.hard_exit_minutes}m"
                         if hard_capped else "time_exit"
                     )
-                    await self._exit(ticker, mid, reason=exit_reason)
+                    await self._exit(ticker, mid, reason=exit_reason,
+                                     orderbook=ob)
                     return
             except Exception as e:
                 log.exception("exec.watch.error", ticker=ticker, err=str(e))
+
+    @staticmethod
+    def _realistic_fill_from_orderbook(
+        ob: dict, side: str, contracts: int,
+    ) -> tuple[float | None, int]:
+        """Compute the realistic avg fill price for a SELL of `contracts`
+        contracts on `side` by sweeping the relevant bid stack.
+
+        Selling YES = lifting the YES bid stack (we want to hit buyers).
+        Selling NO  = lifting the NO  bid stack (same idea, other side).
+        Each Kalshi book entry is `[price_dollars, size_contracts]` and
+        the array is sorted ASCENDING by price — so the LAST entries
+        are the highest bids, which is what we hit first.
+
+        Returns (avg_fill_price, total_book_size). avg_fill_price is None
+        if the book on our side is empty (no realistic exit liquidity at
+        all — paper P&L is fictional in that case).
+
+        The point of this is the dashboard's "Paper TP vs Realistic TP"
+        panel: paper mode credits the full exit at `mid`, but a real-
+        money sweep would average down through the bid stack and give
+        us strictly worse fills. The gap is our paper-overstatement.
+        """
+        try:
+            book = ob.get("orderbook_fp") or ob.get("orderbook") or {}
+            if side == "yes":
+                stack = book.get("yes_dollars") or book.get("yes") or []
+            else:
+                stack = book.get("no_dollars") or book.get("no") or []
+            if not stack:
+                return None, 0
+            total_size = sum(int(e[1]) for e in stack)
+            needed = max(int(contracts), 1)
+            filled = 0
+            total_value = 0.0
+            # Walk best -> worst: stack is ascending so reverse it.
+            for entry in reversed(stack):
+                try:
+                    price = float(entry[0])
+                    size = int(entry[1])
+                except (ValueError, IndexError, TypeError):
+                    continue
+                take = min(size, needed)
+                total_value += take * price
+                filled += take
+                needed -= take
+                if needed <= 0:
+                    break
+            if filled == 0:
+                return None, total_size
+            return total_value / filled, total_size
+        except Exception:
+            log.exception("exec.realistic_fill_error")
+            return None, 0
 
     @staticmethod
     def _mid_from_orderbook(ob: dict, side: str) -> float:
@@ -460,7 +649,10 @@ class Executor:
             log.exception("exec.orderbook_parse_error")
             return 0.5
 
-    async def _exit(self, ticker: str, exit_price: float, *, reason: str) -> None:
+    async def _exit(
+        self, ticker: str, exit_price: float, *, reason: str,
+        orderbook: dict | None = None, exit_edge: float | None = None,
+    ) -> None:
         pos = self.open.pop(ticker, None)
         if not pos:
             return
@@ -486,6 +678,21 @@ class Executor:
                         ticker=ticker, raw_pnl=pnl_usd, size=pos.signal.size_usd)
             pnl_usd = -pos.signal.size_usd
 
+        # TP fillability: compute the realistic avg fill from the live
+        # orderbook (book-sweep), not the optimistic mid we credited.
+        # Paper mode pretends the full size fills at `exit_price`; in
+        # real life selling 200 contracts walks the bid stack and lands
+        # at a worse average. Recording both lets the dashboard show how
+        # much paper TP profit would survive real fills.
+        realistic_exit_price = None
+        exit_book_size = None
+        if orderbook is not None:
+            realistic_exit_price, exit_book_size = (
+                self._realistic_fill_from_orderbook(
+                    orderbook, pos.signal.side, pos.contracts,
+                )
+            )
+
         self.risk.record_close(size_usd=pos.signal.size_usd, realized_pnl_usd=pnl_usd)
         self.journal.log_close(
             ticker=ticker,
@@ -493,6 +700,9 @@ class Executor:
             pnl_usd=pnl_usd,
             fees_usd=fees_usd,
             reason=reason,
+            realistic_exit_price=realistic_exit_price,
+            exit_book_size=exit_book_size,
+            exit_edge=exit_edge,
         )
         # Slack ping on close. Includes hold duration via pos.opened_at.
         try:

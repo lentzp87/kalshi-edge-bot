@@ -173,6 +173,78 @@ def aggregate_exit_policies(trades: list[dict]) -> list[dict]:
     return out
 
 
+def aggregate_marginal_only(trades: list[dict]) -> dict:
+    """Marginal-only A/B comparison for the 75-min exit policy.
+
+    The original `aggregate_exit_policies` evaluates exit_75min across
+    ALL instrumented trades, including TP winners that closed before
+    75 min (where the rule doesn't fire). That inflates the apparent
+    value of the rule with profits the rule didn't earn — see the
+    2026-05-31 ChatGPT review which correctly diagnosed this.
+
+    This version filters to ONLY the trades the rule would have
+    actually intercepted: trades that reached 75 min still open
+    (i.e. mid_at_75min is recorded). For that marginal cohort we
+    surface three apples-to-apples numbers:
+
+      actual           — what we actually got (the live time_exit /
+                          hard_exit_75m / orphan_settlement outcome)
+      held_to_75min    — what `exit_75min` would have produced
+      held_to_settlement — what holding to game resolution would have
+
+    The cleanest test of the 75-min cap: does `held_to_75min` beat
+    `actual` AND beat `held_to_settlement` on this marginal cohort?
+    If not, the rule has no positive marginal effect.
+    """
+    intercepted = [t for t in trades if t.get("mid_at_75min") is not None]
+    n = len(intercepted)
+    if n == 0:
+        return {
+            "n": 0,
+            "actual_total": 0.0,
+            "held_to_75min_total": 0.0,
+            "held_to_settlement_total": 0.0,
+            "actual_avg": 0.0,
+            "held_to_75min_avg": 0.0,
+            "held_to_settlement_avg": 0.0,
+            "delta_75min_vs_actual": 0.0,
+            "delta_settlement_vs_actual": 0.0,
+        }
+    actual_total = 0.0
+    h75_total = 0.0
+    settle_total = 0.0
+    h75_n = 0
+    settle_n = 0
+    for t in intercepted:
+        actual = t.get("pnl_usd")
+        if actual is not None:
+            actual_total += float(actual)
+        h75 = simulate_policy(t, "exit_75min")
+        if h75 is not None:
+            h75_total += h75
+            h75_n += 1
+        settle = t.get("settlement_pnl_usd")
+        if settle is not None:
+            settle_total += float(settle)
+            settle_n += 1
+    actual_avg = actual_total / n
+    h75_avg = (h75_total / h75_n) if h75_n else 0.0
+    settle_avg = (settle_total / settle_n) if settle_n else 0.0
+    return {
+        "n": n,
+        "actual_total": round(actual_total, 2),
+        "held_to_75min_total": round(h75_total, 2),
+        "held_to_75min_n": h75_n,
+        "held_to_settlement_total": round(settle_total, 2),
+        "held_to_settlement_n": settle_n,
+        "actual_avg": round(actual_avg, 2),
+        "held_to_75min_avg": round(h75_avg, 2),
+        "held_to_settlement_avg": round(settle_avg, 2),
+        "delta_75min_vs_actual": round(h75_total - actual_total, 2),
+        "delta_settlement_vs_actual": round(settle_total - actual_total, 2),
+    }
+
+
 def edge_bucket(gross_edge: Optional[float]) -> str:
     """Bucket a gross_edge value (in pp; e.g. 0.025 = 2.5pp) by absolute magnitude.
 

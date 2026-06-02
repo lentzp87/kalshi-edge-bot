@@ -22,7 +22,9 @@ from fastapi.responses import HTMLResponse
 
 from .config import env_config, file_config
 from . import cross_exchange_state
-from .exit_simulator import aggregate_exit_policies, edge_bucket
+from .exit_simulator import (
+    aggregate_exit_policies, aggregate_marginal_only, edge_bucket,
+)
 from .journal import Journal
 
 app = FastAPI(title="Kalshi Edge Bot")
@@ -643,6 +645,10 @@ def stats() -> dict:
         # A/B exit-policy cohort sim: per-policy P&L if every trade had
         # used a different exit rule (TP-only, SL-only, time-only, etc.).
         "by_exit_policy": aggregate_exit_policies(chronological),
+        # Marginal-only 75-min comparison — only trades that actually
+        # reached 75 min still open, so the hard-exit rule was relevant.
+        # See aggregate_marginal_only docstring for the methodology.
+        "marginal_75min": aggregate_marginal_only(chronological),
         # Edge-magnitude buckets: does bigger predicted edge actually
         # produce bigger realized P&L?
         "by_edge_bucket": _bucket_aggregate(

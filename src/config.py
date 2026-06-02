@@ -85,6 +85,16 @@ class ExecutionConfig(BaseModel):
     # `exit_75min` policy backtested far ahead of the actual exits.
     # Set very high (e.g. 100000) to effectively disable.
     hard_exit_minutes: int = 75
+    # Thesis-decay exit (2026-05-31). When enabled, the watcher
+    # periodically re-asks the model: "is the edge still there?" If
+    # current model p_yes vs current Kalshi exit price no longer
+    # produces a positive edge after spread, force-close.
+    # Default OFF — needs the revalidate_edge hook wired in main.py
+    # before flipping enabled to true.
+    thesis_decay_enabled: bool = False
+    thesis_decay_min_age_minutes: int = 60     # never fire in the first hour
+    thesis_decay_revalidate_minutes: int = 30  # poll cadence after that
+    thesis_decay_min_negative_edge: float = -0.01  # only fire below -1pp
     order_type: Literal["limit", "market"] = "limit"
     scale_in_chunks: int = 2
 
