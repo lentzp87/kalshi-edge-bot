@@ -417,8 +417,11 @@ class Executor:
         # spread. (mid_from_orderbook already does this internally but
         # we need the bid/ask separately for the spread check.)
         try:
-            yes_bid = float(yes_book[-1][0]) if yes_book else 0.0
-            no_bid = float(no_book[-1][0]) if no_book else 0.0
+            # Best bid = MAX price, not "last element". Docs describe the
+            # fp arrays as best-to-worst; old code assumed ascending.
+            # max() is correct under either ordering.
+            yes_bid = max((float(e[0]) for e in yes_book), default=0.0)
+            no_bid = max((float(e[0]) for e in no_book), default=0.0)
             yes_ask = (1.0 - no_bid) if no_bid > 0 else 0.0
         except (ValueError, IndexError, TypeError):
             return "skipped_no_book", None
@@ -590,17 +593,29 @@ class Executor:
                 stack = book.get("no_dollars") or book.get("no") or []
             if not stack:
                 return None, 0
-            total_size = sum(int(e[1]) for e in stack)
+            # Kalshi's orderbook_fp sizes are fixed-point decimal STRINGS
+            # ("100.00") per the official docs — int("100.00") raises
+            # ValueError. The old `sum(int(e[1]) ...)` sat outside the
+            # per-entry try, so one bad entry nuked the whole computation
+            # to (None, 0). That was the bug writing NULL/0 on every exit.
+            # Parse via float() and tolerate malformed entries.
+            parsed: list[tuple[float, int]] = []
+            for e in stack:
+                try:
+                    parsed.append((float(e[0]), int(round(float(e[1])))))
+                except (ValueError, IndexError, TypeError, KeyError):
+                    continue
+            if not parsed:
+                return None, 0
+            total_size = sum(sz for _, sz in parsed)
             needed = max(int(contracts), 1)
             filled = 0
             total_value = 0.0
-            # Walk best -> worst: stack is ascending so reverse it.
-            for entry in reversed(stack):
-                try:
-                    price = float(entry[0])
-                    size = int(entry[1])
-                except (ValueError, IndexError, TypeError):
-                    continue
+            # Walk best -> worst explicitly (sort desc by price) instead
+            # of trusting Kalshi's array ordering, which the docs describe
+            # as "best to worst" while our old code assumed ascending.
+            for price, size in sorted(parsed, key=lambda p: p[0],
+                                      reverse=True):
                 take = min(size, needed)
                 total_value += take * price
                 filled += take
@@ -630,8 +645,11 @@ class Executor:
             yes_book = book.get("yes_dollars") or book.get("yes") or []
             no_book = book.get("no_dollars") or book.get("no") or []
 
-            yes_bid = float(yes_book[-1][0]) if yes_book else 0.0
-            no_bid = float(no_book[-1][0]) if no_book else 0.0
+            # Best bid = MAX price, not "last element". Docs describe the
+            # fp arrays as best-to-worst; old code assumed ascending.
+            # max() is correct under either ordering.
+            yes_bid = max((float(e[0]) for e in yes_book), default=0.0)
+            no_bid = max((float(e[0]) for e in no_book), default=0.0)
             # Best YES ask is implied from best NO bid: 1 - no_bid
             yes_ask = (1.0 - no_bid) if no_bid > 0 else 0.0
 
