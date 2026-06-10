@@ -170,6 +170,39 @@ execution:
   hard_exit_minutes: 100000
   order_type: limit
   scale_in_chunks: 2
+  # ---- live execution knobs (used only when MODE=live) -------------
+  # Entry: poll fills this long, then cancel the unfilled remainder
+  # and journal only real fills. Exit: sell limit at best bid,
+  # repriced every live_exit_reprice_s up to live_exit_max_reprices;
+  # unfilled exits leave the position open and retry after cooldown.
+  live_entry_fill_timeout_s: 120
+  live_fill_poll_s: 5
+  live_exit_reprice_s: 25
+  live_exit_max_reprices: 4
+  live_exit_retry_cooldown_s: 60
+
+# =====================================================================
+# LIVE PROBE CONFIG (2026-06-10) — NOT ACTIVE until you flip MODE=live
+# in the Render env. Purpose is MEASUREMENT, not profit: real fills are
+# ground truth on TP fillability — the question that decides whether
+# the paper P&L is real. Expected result: ~breakeven or small loss.
+#
+# To go live with the probe, change the values above to:
+#
+#   risk:
+#     max_position_size_usd: 2        # 1-2 contracts per trade
+#     max_concurrent_positions: 5
+#     max_daily_loss_usd: 10          # hard kill switch
+#     whale_max_position_size_usd: 2  # disables whale boost
+#
+#   scanner:
+#     series_tickers: ["KXATPMATCH", "KXWTAMATCH"]   # tennis only
+#
+# Then set env MODE=live (and KALSHI_ENV=prod) on Render, fund the
+# account with $50-100, and push. Run 2 weeks or ~50 trades. Compare
+# live fill prices vs the mids that triggered them — that gap is the
+# real-world answer the broken TP tracker was supposed to estimate.
+# =====================================================================
 
 # Per-category enables.
 models:

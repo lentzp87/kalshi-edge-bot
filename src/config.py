@@ -97,6 +97,21 @@ class ExecutionConfig(BaseModel):
     thesis_decay_min_negative_edge: float = -0.01  # only fire below -1pp
     order_type: Literal["limit", "market"] = "limit"
     scale_in_chunks: int = 2
+    # ---- live execution (probe mode) -------------------------------
+    # Entry: after placing buy orders, poll fills for this long, then
+    # cancel any unfilled remainder and journal ONLY what actually
+    # filled (zero fills -> no position recorded).
+    live_entry_fill_timeout_s: int = 120
+    live_fill_poll_s: int = 5
+    # Exit: place a sell limit at the best bid; if unfilled after
+    # live_exit_reprice_s, cancel and re-place at the fresh best bid,
+    # up to live_exit_max_reprices times. If still unfilled the
+    # position STAYS OPEN and the watcher retries after
+    # live_exit_retry_cooldown_s. No fill is journaled that didn't
+    # happen — that's the entire point of the probe.
+    live_exit_reprice_s: int = 25
+    live_exit_max_reprices: int = 4
+    live_exit_retry_cooldown_s: int = 60
 
 
 class ModelToggle(BaseModel):

@@ -193,7 +193,7 @@ class Executor:
         ev = self._event_ticker(market)
         if ev and ev in self.open_events:
             log.info("exec.skip.event_already_open",
-                     ticker=signal.ticker, event=ev)
+                     ticker=signal.ticker, event_ticker=ev)
             return
 
         # 3) Cooldown after a recent close on this event
@@ -201,7 +201,7 @@ class Executor:
         if cd_until and datetime.now(timezone.utc) < cd_until:
             mins_left = (cd_until - datetime.now(timezone.utc)).total_seconds() / 60
             log.info("exec.skip.event_cooldown",
-                     ticker=signal.ticker, event=ev,
+                     ticker=signal.ticker, event_ticker=ev,
                      mins_left=round(mins_left, 1))
             return
 
@@ -254,8 +254,17 @@ class Executor:
             await self._submit_live(signal, market, contracts)
 
     async def _submit_live(self, signal: TradeSignal, market: Market, contracts: int) -> None:
+        """Place real buy orders, then journal ONLY what actually filled.
+
+        The old stub recorded an optimistic fill at the limit price
+        regardless of execution. Now we poll fills until
+        live_entry_fill_timeout_s, cancel any unfilled remainder, and
+        record the position at the actual average fill price for the
+        actual filled count. Zero fills -> no position, no journal row.
+        """
         chunks = max(1, self.cfg.scale_in_chunks)
         per_chunk = max(1, contracts // chunks)
+        order_ids: list[str] = []
         for i in range(chunks):
             client_order_id = f"{signal.ticker}-{uuid.uuid4().hex[:8]}"
             try:
@@ -268,12 +277,105 @@ class Executor:
                     client_order_id=client_order_id,
                 )
                 log.info("exec.live.placed", order=resp)
+                oid = (resp.get("order") or {}).get("order_id")
+                if oid:
+                    order_ids.append(oid)
             except Exception as e:
                 log.exception("exec.live.error", ticker=signal.ticker, err=str(e))
 
-        # In live mode the fill watcher should reconcile actual fills before recording.
-        # Stub: record optimistically so the journal sees the intent.
-        self._record_open(signal, market, signal.price_cents / 100, contracts)
+        if not order_ids:
+            log.warning("exec.live.no_orders_placed", ticker=signal.ticker)
+            return
+
+        filled, avg_price_dollars = await self._reconcile_entry(
+            signal.ticker, signal.side, order_ids,
+        )
+        if filled <= 0 or avg_price_dollars is None:
+            log.info("exec.live.entry_unfilled", ticker=signal.ticker,
+                     orders=len(order_ids))
+            return
+        log.info("exec.live.entry_filled", ticker=signal.ticker,
+                 filled=filled, requested=contracts,
+                 avg_price=round(avg_price_dollars, 4))
+        self._record_open(signal, market, avg_price_dollars, filled)
+
+    async def _reconcile_entry(
+        self, ticker: str, side: str, order_ids: list[str],
+    ) -> tuple[int, float | None]:
+        """Poll order statuses until all are terminal or timeout; cancel
+        leftovers; return (filled_contracts, avg_fill_price_dollars)."""
+        deadline = (datetime.now(timezone.utc)
+                    + timedelta(seconds=self.cfg.live_entry_fill_timeout_s))
+        while datetime.now(timezone.utc) < deadline:
+            await asyncio.sleep(self.cfg.live_fill_poll_s)
+            try:
+                statuses = []
+                for oid in order_ids:
+                    o = (await self.client.get_order(oid)).get("order") or {}
+                    statuses.append(o.get("status", ""))
+                if all(s in ("executed", "canceled") for s in statuses):
+                    break
+            except Exception as e:  # noqa: BLE001
+                log.warning("exec.live.order_poll_error",
+                            ticker=ticker, err=str(e)[:200])
+        # Cancel whatever is still resting. Safe to call on terminal
+        # orders too — Kalshi errors, we swallow and move on.
+        for oid in order_ids:
+            try:
+                await self.client.cancel_order(oid)
+                log.info("exec.live.entry_canceled_remainder",
+                         ticker=ticker, order_id=oid)
+            except Exception:  # noqa: BLE001
+                pass
+        return await self._fills_for_orders(side, order_ids)
+
+    async def _fills_for_orders(
+        self, side: str, order_ids: list[str],
+    ) -> tuple[int, float | None]:
+        """Sum executed contracts + average price across orders' fills."""
+        total = 0
+        value = 0.0
+        for oid in order_ids:
+            try:
+                fills = (await self.client.get_fills(order_id=oid)
+                         ).get("fills") or []
+            except Exception as e:  # noqa: BLE001
+                log.warning("exec.live.fills_error", order_id=oid,
+                            err=str(e)[:200])
+                continue
+            for f in fills:
+                price = self._fill_price_dollars(f, side)
+                try:
+                    count = int(round(float(f.get("count", 0))))
+                except (ValueError, TypeError):
+                    continue
+                if price is None or count <= 0:
+                    continue
+                total += count
+                value += count * price
+        if total <= 0:
+            return 0, None
+        return total, value / total
+
+    @staticmethod
+    def _fill_price_dollars(fill: dict, side: str) -> float | None:
+        """Extract our side's fill price in dollars. The v2 API reports
+        cents in `yes_price` / `no_price`; some payloads carry
+        `*_price_dollars` / `*_price_fp` (already dollars) instead."""
+        v = fill.get(f"{side}_price")
+        if v is not None:
+            try:
+                return float(v) / 100.0
+            except (ValueError, TypeError):
+                pass
+        for key in (f"{side}_price_dollars", f"{side}_price_fp"):
+            v = fill.get(key)
+            if v is not None:
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    pass
+        return None
 
     def _record_open(self, signal: TradeSignal, market: Market, fill_price: float, contracts: int) -> None:
         pos = OpenPosition(
@@ -500,13 +602,17 @@ class Executor:
                 # making take_profit trigger on losses and vice versa.
                 pnl_pct = (mid - pos.fill_price) / pos.fill_price
                 if pnl_pct >= self.cfg.take_profit_pct:
-                    await self._exit(ticker, mid, reason="take_profit",
-                                     orderbook=ob)
-                    return
+                    # Live mode: _exit returns False if the sell didn't
+                    # fill — keep watching and retry next tick.
+                    if await self._exit(ticker, mid, reason="take_profit",
+                                        orderbook=ob):
+                        return
+                    continue
                 if pnl_pct <= -self.cfg.stop_loss_pct:
-                    await self._exit(ticker, mid, reason="stop_loss",
-                                     orderbook=ob)
-                    return
+                    if await self._exit(ticker, mid, reason="stop_loss",
+                                        orderbook=ob):
+                        return
+                    continue
                 # Thesis-decay check (gated by config + age + cadence).
                 # Calls back into the model dispatcher to re-ask: given
                 # the CURRENT Kalshi exit price and the CURRENT Pinnacle
@@ -547,19 +653,21 @@ class Executor:
                                      ticker=ticker, side=pos.signal.side,
                                      age_min=round(age_min, 1),
                                      current_edge=round(current_edge, 4))
-                            await self._exit(
+                            if await self._exit(
                                 ticker, mid, reason="thesis_decay",
                                 orderbook=ob, exit_edge=current_edge,
-                            )
-                            return
+                            ):
+                                return
+                            continue
                 if datetime.now(timezone.utc) >= deadline:
                     exit_reason = (
                         f"hard_exit_{self.cfg.hard_exit_minutes}m"
                         if hard_capped else "time_exit"
                     )
-                    await self._exit(ticker, mid, reason=exit_reason,
-                                     orderbook=ob)
-                    return
+                    if await self._exit(ticker, mid, reason=exit_reason,
+                                        orderbook=ob):
+                        return
+                    continue
             except Exception as e:
                 log.exception("exec.watch.error", ticker=ticker, err=str(e))
 
@@ -670,10 +778,133 @@ class Executor:
     async def _exit(
         self, ticker: str, exit_price: float, *, reason: str,
         orderbook: dict | None = None, exit_edge: float | None = None,
-    ) -> None:
-        pos = self.open.pop(ticker, None)
+    ) -> bool:
+        """Close a position. Returns True if the position is closed
+        (journal written), False if it remains open — live mode only,
+        when the sell couldn't fill. Callers in the watcher must keep
+        watching on False instead of abandoning the position.
+
+        Paper mode: instant close at `exit_price` (the optimistic mid),
+        unchanged behavior. Live mode: a real sell order must fill
+        first, and the journal records the ACTUAL average fill price,
+        not the mid that triggered the exit.
+        """
+        pos = self.open.get(ticker)
         if not pos:
-            return
+            return True
+        if self.mode != "paper":
+            # Throttle retry storms: a failed exit leaves the position
+            # open and the watcher will call us again next tick.
+            last = getattr(pos, "last_exit_attempt", None)
+            now = datetime.now(timezone.utc)
+            if last and (now - last).total_seconds() < \
+                    self.cfg.live_exit_retry_cooldown_s:
+                return False
+            pos.last_exit_attempt = now  # type: ignore[attr-defined]
+            avg = await self._sell_live(pos, ticker)
+            if avg is None:
+                log.warning("exec.live.exit_unfilled", ticker=ticker,
+                            reason=reason,
+                            sold=getattr(pos, "sold_contracts", 0),
+                            total=pos.contracts)
+                return False
+            exit_price = avg  # the real average fill, in dollars
+        self.open.pop(ticker, None)
+        self._finalize_close(ticker, pos, exit_price, reason=reason,
+                             orderbook=orderbook, exit_edge=exit_edge)
+        return True
+
+    async def _sell_live(self, pos, ticker: str) -> float | None:
+        """Sell the position's remaining contracts with limit orders at
+        the live best bid, repricing on a cadence. Accumulates partial
+        fills across calls on the position object. Returns the average
+        fill price in dollars across ALL sold contracts once the
+        position is fully closed, else None (remainder stays open).
+        """
+        side = pos.signal.side
+        sold = getattr(pos, "sold_contracts", 0)
+        sold_value = getattr(pos, "sold_value", 0.0)  # dollars
+        remaining = pos.contracts - sold
+        for _attempt in range(self.cfg.live_exit_max_reprices + 1):
+            if remaining <= 0:
+                break
+            try:
+                ob = await self.client.get_orderbook(ticker)
+            except Exception as e:  # noqa: BLE001
+                log.warning("exec.live.exit_ob_error", ticker=ticker,
+                            err=str(e)[:200])
+                break
+            bid = self._best_bid(ob, side)
+            if bid is None or bid <= 0:
+                # Empty bid stack on our side — the ghost-liquidity
+                # scenario, observed for real this time. Nothing to hit.
+                log.warning("exec.live.exit_no_bids", ticker=ticker,
+                            side=side)
+                break
+            bid_cents = max(1, min(99, int(round(bid * 100))))
+            client_order_id = f"X{ticker[:24]}-{uuid.uuid4().hex[:8]}"
+            try:
+                resp = await self.client.place_order(
+                    ticker=ticker, side=side, action="sell",
+                    count=remaining, price_cents=bid_cents,
+                    client_order_id=client_order_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.exception("exec.live.exit_order_error",
+                              ticker=ticker, err=str(e))
+                break
+            oid = (resp.get("order") or {}).get("order_id")
+            if not oid:
+                break
+            # Give the order live_exit_reprice_s to fill, polling.
+            window_end = (datetime.now(timezone.utc)
+                          + timedelta(seconds=self.cfg.live_exit_reprice_s))
+            while datetime.now(timezone.utc) < window_end:
+                await asyncio.sleep(self.cfg.live_fill_poll_s)
+                try:
+                    o = (await self.client.get_order(oid)).get("order") or {}
+                    if o.get("status") in ("executed", "canceled"):
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                await self.client.cancel_order(oid)
+            except Exception:  # noqa: BLE001
+                pass
+            n, avg = await self._fills_for_orders(side, [oid])
+            if n > 0 and avg is not None:
+                sold += n
+                sold_value += n * avg
+                remaining = pos.contracts - sold
+                log.info("exec.live.exit_partial_fill", ticker=ticker,
+                         n=n, avg=round(avg, 4), remaining=remaining)
+        pos.sold_contracts = sold  # type: ignore[attr-defined]
+        pos.sold_value = sold_value  # type: ignore[attr-defined]
+        if sold >= pos.contracts and sold > 0:
+            return sold_value / sold
+        return None
+
+    @staticmethod
+    def _best_bid(ob: dict, side: str) -> float | None:
+        """Best bid in dollars on `side` from a Kalshi orderbook payload."""
+        try:
+            book = ob.get("orderbook_fp") or ob.get("orderbook") or {}
+            if side == "yes":
+                stack = book.get("yes_dollars") or book.get("yes") or []
+            else:
+                stack = book.get("no_dollars") or book.get("no") or []
+            best = max((float(e[0]) for e in stack), default=None)
+            if best is None:
+                return None
+            # Legacy integer-cents payloads: values > 1 are cents.
+            return best / 100.0 if best > 1.0 else best
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _finalize_close(
+        self, ticker: str, pos, exit_price: float, *, reason: str,
+        orderbook: dict | None = None, exit_edge: float | None = None,
+    ) -> None:
         # P&L per contract is the price move in dollars. `exit_price` is
         # already side-adjusted (NO mid for NO bets, YES mid for YES bets),
         # and `fill_price` is in the same units (the side we bought).
@@ -742,5 +973,8 @@ class Executor:
             self.cooldown_until[ev] = (
                 datetime.now(timezone.utc) + timedelta(minutes=self._COOLDOWN_MINUTES)
             )
+        # NOTE: kwarg renamed from `event=` — structlog >=25 reserves
+        # `event` for the log message and raises TypeError, which would
+        # crash every exit after an unpinned structlog upgrade.
         log.info("exec.exit", ticker=ticker, reason=reason, pnl=round(pnl_usd, 2),
-                 event=ev)
+                 event_ticker=ev)

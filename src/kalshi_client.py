@@ -379,5 +379,28 @@ def _category_from_event_ticker(event_ticker: str) -> str:
             "DELETE", f"/trade-api/v2/portfolio/orders/{order_id}"
         )
 
+    async def get_order(self, order_id: str) -> dict:
+        """Single order status: {'order': {..., 'status', 'remaining_count'}}."""
+        return await self._request(
+            "GET", f"/trade-api/v2/portfolio/orders/{order_id}"
+        )
+
+    async def get_fills(
+        self, *, order_id: str | None = None, ticker: str | None = None,
+        limit: int = 100,
+    ) -> dict:
+        """Fills (executions): {'fills': [{'order_id', 'count', 'side',
+        'action', 'yes_price', 'no_price', ...}]}. Prices in CENTS per
+        the v2 API; some payloads also carry *_dollars / *_fp variants —
+        callers should prefer the cents fields and fall back."""
+        params: dict = {"limit": limit}
+        if order_id:
+            params["order_id"] = order_id
+        if ticker:
+            params["ticker"] = ticker
+        return await self._request(
+            "GET", "/trade-api/v2/portfolio/fills", params=params
+        )
+
     async def aclose(self) -> None:
         await self._client.aclose()
