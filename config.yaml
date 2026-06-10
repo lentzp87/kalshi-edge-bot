@@ -1,6 +1,8 @@
 # All knobs in one place. Do not edit while a position is open.
 
 bankroll_usd: 2000
+# Probe funding — used INSTEAD of bankroll_usd when MODE=live.
+live_bankroll_usd: 200
 
 scanner:
   loop_interval_seconds: 30
@@ -26,6 +28,14 @@ scanner:
     - Climate and Weather
   # Optional: if set, skip the broad pagination and only fetch these
   # series directly. Use Kalshi series_ticker prefixes. Empty = scan all.
+  # LIVE-ONLY scope (probe): when MODE=live, main.py intersects the
+  # dynamically discovered sports series against this allowlist.
+  # Tennis + MLB = every sport with positive lifetime P&L and n>50.
+  # Ignored entirely in paper mode.
+  live_series_allowlist:
+    - KXATPMATCH
+    - KXWTAMATCH
+    - KXMLBGAME
   # Targeted scan: fetch ONLY these specific Kalshi series instead of
   # walking the full 40k+ market catalog. Each call returns ~10-20 markets
   # so total scan completes in 2-5 seconds.
@@ -134,6 +144,15 @@ risk:
   # trade downside at $50 keeps whale boosting alive without letting
   # a single mistake nuke a week.
   whale_max_position_size_usd: 50
+  # ---- LIVE PROBE OVERRIDES (only read when MODE=live) -------------
+  # Agreed 2026-06-10: $200 funding, $2/trade, 5 concurrent, $50 daily
+  # kill, whale boost disabled. Note: at $2/trade the $50 daily kill is
+  # nearly unreachable (~25 consecutive full losses); the binding
+  # constraint is max 5 x $2 = $10 open exposure at any moment.
+  live_max_position_size_usd: 2
+  live_max_concurrent_positions: 5
+  live_max_daily_loss_usd: 50
+  live_whale_max_position_size_usd: 2
 
 execution:
   # 2026-05-11 SL DISABLED. Settlement backtest panel after the v4 DB
@@ -182,26 +201,29 @@ execution:
   live_exit_retry_cooldown_s: 60
 
 # =====================================================================
-# LIVE PROBE CONFIG (2026-06-10) — NOT ACTIVE until you flip MODE=live
-# in the Render env. Purpose is MEASUREMENT, not profit: real fills are
-# ground truth on TP fillability — the question that decides whether
-# the paper P&L is real. Expected result: ~breakeven or small loss.
+# LIVE PROBE (2026-06-10) — armed, not active. Everything needed is
+# already in this file via the live_* values (bankroll $200, $2/trade,
+# 5 concurrent, $50 daily kill, ATP+WTA+MLB allowlist). Paper mode
+# ignores all of it. main.py applies the overrides at startup when
+# MODE=live.
 #
-# To go live with the probe, change the values above to:
+# Purpose is MEASUREMENT, not profit: real fills are ground truth on
+# TP fillability — the question that decides whether the paper P&L is
+# real. Expected result: ~breakeven or small loss.
 #
-#   risk:
-#     max_position_size_usd: 2        # 1-2 contracts per trade
-#     max_concurrent_positions: 5
-#     max_daily_loss_usd: 10          # hard kill switch
-#     whale_max_position_size_usd: 2  # disables whale boost
+# To activate:
+#   1. (Recommended) Render env: MODE=live, KALSHI_ENV=demo — watch one
+#      full order lifecycle in logs with fake money first.
+#   2. Render env: MODE=live, KALSHI_ENV=prod. Fund account with $200.
 #
-#   scanner:
-#     series_tickers: ["KXATPMATCH", "KXWTAMATCH"]   # tennis only
-#
-# Then set env MODE=live (and KALSHI_ENV=prod) on Render, fund the
-# account with $50-100, and push. Run 2 weeks or ~50 trades. Compare
-# live fill prices vs the mids that triggered them — that gap is the
-# real-world answer the broken TP tracker was supposed to estimate.
+# Run: 2 weeks or ~50 closed live trades, whichever first.
+# Stop early if: probe cumulative P&L < -$30, OR 5 consecutive exits
+# log exec.live.exit_unfilled / exit_no_bids (= ghost liquidity
+# confirmed, edge likely fictional).
+# Verdict: compare journaled live fill prices vs the trigger mids.
+#   gap < ~1c/side  -> edge real, scale to $200 ATP plan
+#   gap 2c+/side    -> paper P&L inflated, re-run economics first
+#   frequent no-fill-> edge fictional, shut it down, answer cost <$30
 # =====================================================================
 
 # Per-category enables.

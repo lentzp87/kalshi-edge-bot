@@ -489,6 +489,39 @@ async def amain() -> None:
     if discovered:
         cfg.scanner.series_tickers = discovered
 
+    # ---- LIVE PROBE OVERRIDES (2026-06-10) ---------------------------
+    # When MODE=live, swap to probe posture WITHOUT touching the paper
+    # tuning: scope the scanner to the allowlisted series and tighten
+    # the risk caps from the live_* yaml values. Paper mode skips all
+    # of this, so the broad paper experiment keeps running unchanged.
+    # See the probe block at the bottom of config.yaml.
+    if env.mode == "live":
+        allow = set(cfg.scanner.live_series_allowlist)
+        if allow:
+            before = len(cfg.scanner.series_tickers)
+            cfg.scanner.series_tickers = [
+                s for s in cfg.scanner.series_tickers if s in allow
+            ]
+            log.info("live.series_allowlist", before=before,
+                     after=len(cfg.scanner.series_tickers),
+                     series=cfg.scanner.series_tickers)
+        r = cfg.risk
+        if r.live_max_position_size_usd is not None:
+            r.max_position_size_usd = r.live_max_position_size_usd
+        if r.live_max_concurrent_positions is not None:
+            r.max_concurrent_positions = r.live_max_concurrent_positions
+        if r.live_max_daily_loss_usd is not None:
+            r.max_daily_loss_usd = r.live_max_daily_loss_usd
+        if r.live_whale_max_position_size_usd is not None:
+            r.whale_max_position_size_usd = r.live_whale_max_position_size_usd
+        if cfg.live_bankroll_usd is not None:
+            cfg.bankroll_usd = cfg.live_bankroll_usd
+        log.info("live.probe_overrides", bankroll=cfg.bankroll_usd,
+                 max_pos=r.max_position_size_usd,
+                 max_concurrent=r.max_concurrent_positions,
+                 daily_kill=r.max_daily_loss_usd,
+                 whale_cap=r.whale_max_position_size_usd)
+
     journal = Journal()
     risk = RiskEngine()
     scanner = Scanner(client)

@@ -22,6 +22,11 @@ class ScannerConfig(BaseModel):
     min_minutes_to_expiry: int = 30
     series_tickers: list[str] = Field(default_factory=list)
     allowed_categories: list[str] = Field(default_factory=list)
+    # LIVE-ONLY series allowlist. main.py's dynamic discovery OVERWRITES
+    # series_tickers at startup, so a yaml edit there can't scope live
+    # trading. When MODE=live and this list is non-empty, main.py
+    # intersects the discovered series against it. Ignored in paper.
+    live_series_allowlist: list[str] = Field(default_factory=list)
 
 
 class DecisionConfig(BaseModel):
@@ -73,6 +78,14 @@ class RiskConfig(BaseModel):
     # (price jumped in our direction, big volume burst, etc.). Set
     # equal to max_position_size_usd to disable the boost.
     whale_max_position_size_usd: float = 40
+    # ---- live-mode overrides (probe posture) -----------------------
+    # Applied by main.py at startup ONLY when MODE=live. None = keep
+    # the base value. Paper mode never reads these, so the paper
+    # experiment keeps its own tuning.
+    live_max_position_size_usd: float | None = None
+    live_max_concurrent_positions: int | None = None
+    live_max_daily_loss_usd: float | None = None
+    live_whale_max_position_size_usd: float | None = None
 
 
 class ExecutionConfig(BaseModel):
@@ -129,6 +142,8 @@ class ModelsConfig(BaseModel):
 
 class FileConfig(BaseModel):
     bankroll_usd: float = 2000
+    # Live-mode bankroll override (probe funding). None = bankroll_usd.
+    live_bankroll_usd: float | None = None
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
     decision: DecisionConfig = Field(default_factory=DecisionConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
